@@ -26,6 +26,7 @@ type Subscriber struct {
 	conf    SubscriberConfig
 	ch      consumeChannel
 	guard   *ackGuard
+	retry   *retrier
 	release func()
 }
 
@@ -62,7 +63,7 @@ func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 				}
 				return errDeliveriesClosed
 			}
-			d := newDelivery(msg, s.guard)
+			d := newDelivery(msg, s.guard, s.retry)
 			err := runner.Run(ctx, func() {
 				state.Handler(ctx, d)
 			})
@@ -82,7 +83,11 @@ func (s *Subscriber) Close() error {
 	if s.release != nil {
 		s.release()
 	}
-	return s.ch.Close()
+	err := s.ch.Close()
+	if s.retry != nil {
+		err = errors.Join(err, s.retry.pub.Close())
+	}
+	return err
 }
 
 // prefetch returns the prefetch count for a subscriber: configured when positive, the worker's

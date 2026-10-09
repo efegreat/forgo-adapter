@@ -97,6 +97,17 @@ func TestConfigValidate(t *testing.T) {
 			queue:   QueueConfig{Name: "q", Args: map[string]any{deadLetterRoutingKeyArg: "x"}, DeadLetter: DeadLetterConfig{Enabled: true}},
 			wantErr: deadLetterRoutingKeyArg,
 		},
+		{name: "retry", queue: QueueConfig{Name: "q", Retry: RetryConfig{Initial: time.Second, Max: time.Minute}}},
+		{name: "retry unnamed queue", queue: QueueConfig{Retry: RetryConfig{Initial: time.Second}}, wantErr: errRetryUnnamedQueue.Error()},
+		{name: "retry negative", queue: QueueConfig{Name: "q", Retry: RetryConfig{Max: -1}}, wantErr: "cannot be negative"},
+		{name: "retry under a millisecond", queue: QueueConfig{Name: "q", Retry: RetryConfig{Initial: time.Microsecond}}, wantErr: "at least 1ms"},
+		{name: "retry max under initial", queue: QueueConfig{Name: "q", Retry: RetryConfig{Initial: time.Minute, Max: time.Second}}, wantErr: "shorter than Retry.Initial"},
+		{name: "retry max too long", queue: QueueConfig{Name: "q", Retry: RetryConfig{Initial: time.Second, Max: 50 * 24 * time.Hour}}, wantErr: "cannot exceed"},
+		{
+			name:    "retry ttl in args",
+			queue:   QueueConfig{Name: "q", Retry: RetryConfig{Initial: time.Second, Args: map[string]any{messageTTLArg: 5}}},
+			wantErr: messageTTLArg,
+		},
 	}
 
 	for _, tt := range tests {
@@ -170,6 +181,22 @@ func TestDeclare(t *testing.T) {
 				"queue orders.dead durable=true args=map[x-message-ttl:86400000]",
 				"bind orders.dead dead o",
 				"queue orders durable=false args=map[x-dead-letter-exchange:dead x-dead-letter-routing-key:o]",
+			},
+		},
+		{
+			name: "with retry",
+			queue: QueueConfig{
+				Name: "orders", Durable: true,
+				Bindings: []BindingConfig{{Exchange: "shop", RoutingKey: "order.*"}},
+				Retry:    RetryConfig{Initial: time.Second, Max: 3 * time.Second, Args: userArgs},
+			},
+			want: []string{
+				"exchange shop topic durable=true args=map[]",
+				"queue orders durable=true args=map[]",
+				"bind orders shop order.*",
+				"queue orders.retry.1s durable=true args=map[x-dead-letter-exchange: x-dead-letter-routing-key:orders x-message-ttl:1000 x-queue-type:quorum]",
+				"queue orders.retry.2s durable=true args=map[x-dead-letter-exchange: x-dead-letter-routing-key:orders x-message-ttl:2000 x-queue-type:quorum]",
+				"queue orders.retry.3s durable=true args=map[x-dead-letter-exchange: x-dead-letter-routing-key:orders x-message-ttl:3000 x-queue-type:quorum]",
 			},
 		},
 	}
