@@ -1,0 +1,39 @@
+# Editors
+.idea/
+.vscode/
+
+# Go build and test output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.coverprofile
+profile.cov
+coverage.*
+
+# Go workspace file
+go.work
+go.work.sum
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Icon files
+Icon\r
+
+# Thumbnails and filesystem metadata
+._*
+.Spotlight-V100
+.Trashes
+
+# Log files
+*.log
+log/*
+
+# Environment files
+.env
