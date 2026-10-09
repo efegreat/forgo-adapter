@@ -4,7 +4,7 @@ Guide for coding agents and contributors working **on forgo-adapter itself**. Fo
 
 ## What forgo-adapter is
 
-The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ) and providers (inbox/outbox storages, a Redis locker, a Redis rate limiter) that implement forgo's interfaces. Module path: `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)). Go 1.27. Both repositories are private and untagged before the first release, so `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with `../forgo`: a sibling forgo checkout is required to build. At release, require a tagged forgo version and remove the `replace` directive.
+The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ) and providers (a SQL transactor, inbox/outbox storages, a Redis locker, a Redis rate limiter) that implement forgo's interfaces. Module path: `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)). Go 1.27. Both repositories are private and untagged before the first release, so `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with `../forgo`: a sibling forgo checkout is required to build. At release, require a tagged forgo version and remove the `replace` directive.
 
 The dependency points one way. **Adapters import forgo; forgo never imports adapters.** Anything a server needs from an adapter is an interface declared in forgo. When a forgo contract changes (`worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `http.IRateLimiter`, …), update the adapters here in the same change set.
 
@@ -25,9 +25,10 @@ forgo's four goals carry over:
 | --- | --- |
 | `resource/sqldb/` | `Config` → `*sql.DB`. Applies pool limits, pings with `ConnectTimeout`, closes the pool if the ping fails. |
 | `resource/redisdb/` | `Config` → `*redis.Client`. Pings with `ConnectTimeout`, closes the client if the ping fails. |
-| `resource/broker/rabbitmq/` | `Config` → `worker.IBroker`. `config.go`: config, `Sanitize`, `validate`, `DeadLetterConfig`, queue args. `broker.go`: connection, `declare` (topology through the `declarer` interface), publisher and subscriber factories. `publisher.go`: `Message` → `amqp.Publishing` with identity headers. `subscriber.go`: `Consume` over a `process.ConcurrentRunner`. `delivery.go`: `amqp.Delivery` → `worker.IDelivery`. |
+| `resource/broker/rabbitmq/` | `Config` → `worker.IBroker`. `config.go`: config, `Sanitize`, `validate`, `RecoveryConfig`, `DeadLetterConfig`, queue args. `broker.go`: connection, owned channels, `declare` (topology through the `declarer` interface), publisher and subscriber factories. `recovery.go`: `ackGuard` and the `recoveryHooks` around the client's connection recovery. `publisher.go`: confirm-mode publishing, mandatory returns, `Message` → `amqp.Publishing` with identity headers. `subscriber.go`: prefetch, `Consume` over a `process.ConcurrentRunner`. `delivery.go`: `amqp.Delivery` → `worker.IDelivery` with guarded acknowledgements. |
+| `provider/sqltx/` | `operation.Transactor` on `*sql.DB`. `Run`, `From`, `Executor`: transactions carried in the context, keyed by database. |
 | `provider/inbox/` | `worker.InboxStorage` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`). `ErrNotWaiting`. |
-| `provider/outbox/` | `worker.OutboxStorage` for PostgreSQL and MySQL 8. |
+| `provider/outbox/` | `worker.OutboxStorage` for PostgreSQL and MySQL 8. `outbox.go`: the shared row scan. |
 | `provider/locker/` | `operation.ILocker` on Redis. Token-guarded unlock script, `ErrNotHeld`. |
 | `provider/ratelimit/` | `http.IRateLimiter` on Redis. GCRA Lua script on the server clock, `KeyPrefix`. |
 
@@ -53,10 +54,15 @@ Do not break these without an explicit decision from the maintainer.
 - Published messages carry `worker.MessageIDHeader`, `MessageNameHeader` and `MessageTimestampHeader`, written from the `Message` fields over any user header of the same name. The consumer inbox depends on a stable ID across redeliveries.
 - `Delivery`: `Complete` = ack, `Retry` = nack with requeue, `Reject` = reject without requeue. The dead-letter feature relies on `Reject` never requeueing.
 - `declare` declares a queue's dead-letter exchange and queue **before** the queue. Dead-letter exchanges are durable direct exchanges and dead-letter queues are durable. Conflicts between `DeadLetter` and `x-dead-letter-*` in `Args` are rejected in `validate`.
-- `Consume` waits for every handler it started (`runner.Wait`) before returning. It returns `nil` when `ctx` ends and an error when the broker closes the delivery channel.
+- `Consume` waits for every handler it started (`runner.Wait`) before returning. It returns `nil` when `ctx` ends and an error when the delivery channel closes.
+- Recovery is the client's (amqp091-go `Config.Recovery`), wrapped by `recoveryHooks`. The hooks recover only channels in `Broker.owned`. They also advance the `ackGuard` of a subscriber channel before the client reopens it, and the guard's read lock spans every acknowledgement. Never acknowledge a delivery around the guard: delivery tags restart on a recovered channel, so a stale tag settles another message.
+- The topology channel stays open for the broker's lifetime, because the client forgets the topology recorded on a closed channel.
+- `NewSubscriber` checks the queue with a passive declare **before** the channel is owned, so the channel the broker closes on a missing queue is not recovered. Prefetch (`basic.qos`) must precede `basic.consume`, which is why consuming starts in `Consume`, where the worker's concurrency is known.
+- Publisher channels are in confirm mode. `Publish` holds the publisher's mutex from publish to confirm, so one message is in flight per channel and a mandatory return can be matched to it by message ID.
 
 ### SQL storages
 
+- Every statement goes through `sqltx.From(ctx, db)`, and every multi-statement operation through `sqltx.Run`, so storages join the transaction of `sqltx.Transactor.Do`. The worker relies on it: `MarkCompleted` must commit or roll back with the handler.
 - Each storage implements the contract and the comments in forgo's `server/worker/storage.go` exactly. The table schemas are documented in forgo's REFERENCE.md ("Storage contracts").
 - Claims use `FOR UPDATE SKIP LOCKED`. Status transitions only leave `InboxWaiting`, and repeating a transition into the current state succeeds.
 - Each dialect lives in its own file. Placeholders differ (`$n` and `?`): keep the helpers local to the file that uses them.
@@ -72,7 +78,7 @@ Do not break these without an explicit decision from the maintainer.
 - Errors: prefix with the package (`sqldb:`, `redisdb:`, `rabbitmq:`, `inbox:`, `outbox:`, `locker:`, `ratelimit:`), wrap with `%w`, and declare sentinels as package-level `var`s.
 - Doc comments on exported identifiers explain the contract and the why. Match the surrounding code.
 - Dependencies: forgo, `github.com/rabbitmq/amqp091-go`, `github.com/redis/go-redis/v9`. Test-only: `github.com/alicebob/miniredis/v2`, `github.com/DATA-DOG/go-sqlmock`. A new adapter may add the client library it wraps, and nothing else without a strong reason.
-- Tests must not need running infrastructure. Use miniredis for Redis (it runs Lua and `TIME`, and `SetTime`/`FastForward` control the clock), sqlmock for SQL (`sqlmock.NewWithDSN` plus `sql.Open("sqlmock", dsn)` exercises `sqldb.New`), and a fake of a narrow interface for AMQP (the `declarer` recorder in `rabbitmq_test.go`). Table-driven where possible, passing under `-race`.
+- Tests must not need running infrastructure. Use miniredis for Redis (it runs Lua and `TIME`, and `SetTime`/`FastForward` control the clock), sqlmock for SQL (`sqlmock.NewWithDSN` plus `sql.Open("sqlmock", dsn)` exercises `sqldb.New`; storage tests set `SetMaxOpenConns(1)`, so a statement that bypasses an open transaction blocks and fails on the test's deadline), and fakes of narrow interfaces for AMQP (`declarer`, `consumeChannel`, `publishChannel`, `confirmation` and `amqp.Acknowledger`). Table-driven where possible, passing under `-race`.
 
 ## Workflow
 
@@ -113,10 +119,7 @@ When you change behavior:
 
 When you find one, verify it against the code and add it here with a `file:line` reference. Delete it in the change that fixes it.
 
-- The RabbitMQ broker never reconnects. A dropped connection stops every subscriber with `errDeliveriesClosed` and fails every publish until restart (`resource/broker/rabbitmq/subscriber.go:35`, `resource/broker/rabbitmq/broker.go:107`).
-- Subscribers set no prefetch (`basic.qos`), so RabbitMQ pushes a queue's whole backlog to one consumer (`resource/broker/rabbitmq/broker.go:64`).
-- Publishes do not use publisher confirms, so the outbox marks a message processed once it is written to the socket, not once the broker has it (`resource/broker/rabbitmq/publisher.go:19`).
-- Non-string AMQP header values are dropped on consume (`resource/broker/rabbitmq/delivery.go:23`).
-- There is no SQL `operation.Transactor`, and the inbox storages run on `*sql.DB` instead of the transaction in the context. forgo's consumer expects `MarkCompleted` to join the handler's transaction, but here it commits separately (`provider/inbox/postgres.go:107`, `provider/inbox/mysql.go:168`).
-- The PostgreSQL outbox stamps `processing_at` with the database clock but compares it with `ExpiredBefore` from the application clock, so clock skew shifts `ClaimTTL` (`provider/outbox/postgres.go:55`).
-- The inbox and outbox storages have no tests.
+- The RabbitMQ adapter is tested against fakes of the client only. Recovery, confirms and dead-lettering have not run against a live broker in this repository's tests.
+- A consumer whose re-subscription fails during recovery is skipped by the client's default `OnTopologyEntityError`, so its subscriber stays connected without receiving messages (`resource/broker/rabbitmq/recovery.go:85`).
+- Non-string AMQP header values are dropped on consume (`resource/broker/rabbitmq/delivery.go:26`).
+- The PostgreSQL outbox stamps `processing_at` with the database clock but compares it with `ExpiredBefore` from the application clock, so clock skew shifts `ClaimTTL` (`provider/outbox/postgres.go:54`).
