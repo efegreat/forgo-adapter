@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/efegreat/forgo/server/worker"
+
+	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
 // Postgres is a worker.InboxStorage on the inbox_events table of a PostgreSQL database.
@@ -27,7 +29,7 @@ func (p *Postgres) Status(
 ) (worker.InboxStatus, bool, error) {
 	var status worker.InboxStatus
 
-	err := p.db.QueryRowContext(
+	err := sqltx.From(ctx, p.db).QueryRowContext(
 		ctx,
 		`
 		SELECT status
@@ -60,7 +62,7 @@ func (p *Postgres) IncrementAttempt(
 ) (int, error) {
 	var attempts int
 
-	err := p.db.QueryRowContext(
+	err := sqltx.From(ctx, p.db).QueryRowContext(
 		ctx,
 		`
 		INSERT INTO inbox_events (
@@ -152,7 +154,7 @@ func (p *Postgres) markStatus(
 ) error {
 	var status worker.InboxStatus
 
-	err := p.db.QueryRowContext(
+	err := sqltx.From(ctx, p.db).QueryRowContext(
 		ctx,
 		`
 		UPDATE inbox_events
@@ -211,7 +213,7 @@ func (p *Postgres) DeleteBefore(
 	before time.Time,
 	limit int,
 ) (int64, error) {
-	result, err := p.db.ExecContext(
+	result, err := sqltx.From(ctx, p.db).ExecContext(
 		ctx,
 		`
 		WITH candidates AS (
