@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/efegreat/forgo/server/worker"
+
+	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
 // Mysql is a worker.InboxStorage on the inbox_events table of a MySQL 8 database.
@@ -27,7 +29,7 @@ func (m *Mysql) Status(
 ) (worker.InboxStatus, bool, error) {
 	var status worker.InboxStatus
 
-	err := m.db.QueryRowContext(
+	err := sqltx.From(ctx, m.db).QueryRowContext(
 		ctx,
 		`
 		SELECT status
@@ -58,109 +60,95 @@ func (m *Mysql) IncrementAttempt(
 	messageID string,
 	subscriberName string,
 ) (int, error) {
-	tx, err := m.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf(
-			"inbox: begin increment attempt transaction: %w",
-			err,
-		)
-	}
+	var attempts int
 
-	defer func() {
-		_ = tx.Rollback()
-	}()
+	err := sqltx.Run(ctx, m.db, func(ctx context.Context) error {
+		tx := sqltx.From(ctx, m.db)
 
-	var (
-		status   worker.InboxStatus
-		attempts int
-	)
-
-	err = tx.QueryRowContext(
-		ctx,
-		`
-		SELECT
-			status,
-			attempts
-		FROM inbox_events
-		WHERE message_id = ?
-		  AND subscriber_name = ?
-		FOR UPDATE
-		`,
-		messageID,
-		subscriberName,
-	).Scan(
-		&status,
-		&attempts,
-	)
-
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		attempts = 1
-
-		_, err = tx.ExecContext(
+		var status worker.InboxStatus
+		err := tx.QueryRowContext(
 			ctx,
 			`
-			INSERT INTO inbox_events (
-				message_id,
-				subscriber_name,
+			SELECT
 				status,
-				attempts,
-				created_at,
-				updated_at
-			)
-			VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))
-			`,
-			messageID,
-			subscriberName,
-			worker.InboxWaiting,
-			attempts,
-		)
-		if err != nil {
-			return 0, fmt.Errorf(
-				"inbox: create attempt: %w",
-				err,
-			)
-		}
-
-	case err != nil:
-		return 0, fmt.Errorf(
-			"inbox: lock attempt row: %w",
-			err,
-		)
-
-	case status != worker.InboxWaiting:
-		return 0, ErrNotWaiting
-
-	default:
-		attempts++
-
-		_, err = tx.ExecContext(
-			ctx,
-			`
-			UPDATE inbox_events
-			SET
-				attempts = ?,
-				updated_at = CURRENT_TIMESTAMP(6)
+				attempts
+			FROM inbox_events
 			WHERE message_id = ?
 			  AND subscriber_name = ?
+			FOR UPDATE
 			`,
-			attempts,
 			messageID,
 			subscriberName,
+		).Scan(
+			&status,
+			&attempts,
 		)
-		if err != nil {
-			return 0, fmt.Errorf(
-				"inbox: increment attempt: %w",
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			attempts = 1
+
+			if _, err := tx.ExecContext(
+				ctx,
+				`
+				INSERT INTO inbox_events (
+					message_id,
+					subscriber_name,
+					status,
+					attempts,
+					created_at,
+					updated_at
+				)
+				VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))
+				`,
+				messageID,
+				subscriberName,
+				worker.InboxWaiting,
+				attempts,
+			); err != nil {
+				return fmt.Errorf(
+					"inbox: create attempt: %w",
+					err,
+				)
+			}
+
+		case err != nil:
+			return fmt.Errorf(
+				"inbox: lock attempt row: %w",
 				err,
 			)
-		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf(
-			"inbox: commit attempt transaction: %w",
-			err,
-		)
+		case status != worker.InboxWaiting:
+			return ErrNotWaiting
+
+		default:
+			attempts++
+
+			if _, err := tx.ExecContext(
+				ctx,
+				`
+				UPDATE inbox_events
+				SET
+					attempts = ?,
+					updated_at = CURRENT_TIMESTAMP(6)
+				WHERE message_id = ?
+				  AND subscriber_name = ?
+				`,
+				attempts,
+				messageID,
+				subscriberName,
+			); err != nil {
+				return fmt.Errorf(
+					"inbox: increment attempt: %w",
+					err,
+				)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 
 	return attempts, nil
@@ -176,6 +164,7 @@ func (m *Mysql) MarkCompleted(
 		messageID,
 		subscriberName,
 		worker.InboxCompleted,
+		false,
 	)
 }
 
@@ -189,6 +178,7 @@ func (m *Mysql) MarkFailed(
 		messageID,
 		subscriberName,
 		worker.InboxFailed,
+		true,
 	)
 }
 
@@ -202,6 +192,7 @@ func (m *Mysql) MarkRejected(
 		messageID,
 		subscriberName,
 		worker.InboxRejected,
+		true,
 	)
 }
 
@@ -210,8 +201,9 @@ func (m *Mysql) markStatus(
 	messageID string,
 	subscriberName string,
 	target worker.InboxStatus,
+	repeatable bool,
 ) error {
-	result, err := m.db.ExecContext(
+	result, err := sqltx.From(ctx, m.db).ExecContext(
 		ctx,
 		`
 		UPDATE inbox_events
@@ -247,8 +239,7 @@ func (m *Mysql) markStatus(
 		return nil
 	}
 
-	// Allow the operation to be repeated safely if it was already moved
-	// into the requested terminal state.
+	// The Waiting -> target transition did not happen.
 	current, exists, err := m.Status(
 		ctx,
 		messageID,
@@ -258,15 +249,7 @@ func (m *Mysql) markStatus(
 		return err
 	}
 
-	if !exists {
-		return sql.ErrNoRows
-	}
-
-	if current == target {
-		return nil
-	}
-
-	return ErrNotWaiting
+	return unmoved(current, exists, target, repeatable)
 }
 
 func (m *Mysql) DeleteBefore(
@@ -274,7 +257,7 @@ func (m *Mysql) DeleteBefore(
 	before time.Time,
 	limit int,
 ) (int64, error) {
-	result, err := m.db.ExecContext(
+	result, err := sqltx.From(ctx, m.db).ExecContext(
 		ctx,
 		`
 		DELETE FROM inbox_events

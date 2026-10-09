@@ -24,10 +24,11 @@ app := forgo.NewApp(
 		},
 	),
 	forgo.WithProviders(
-		inbox.NewPostgres,  // worker.InboxStorage
-		outbox.NewPostgres, // worker.OutboxStorage
-		locker.NewRedis,    // operation.ILocker
-		ratelimit.NewRedis, // http.IRateLimiter
+		sqltx.NewTransactor, // operation.Transactor: handlers and their inbox updates commit together
+		inbox.NewPostgres,   // worker.InboxStorage
+		outbox.NewPostgres,  // worker.OutboxStorage
+		locker.NewRedis,     // operation.ILocker
+		ratelimit.NewRedis,  // http.IRateLimiter
 	),
 	forgo.WithServers(config.Consumer, config.Producer),
 )
@@ -40,7 +41,8 @@ app.Run()
 | --- | --- | --- | --- |
 | `resource/sqldb` | resource | `*sql.DB` | any `database/sql` driver |
 | `resource/redisdb` | resource | `*redis.Client` | go-redis v9 |
-| `resource/broker/rabbitmq` | resource | `worker.IBroker` | amqp091-go, with optional dead-letter queues |
+| `resource/broker/rabbitmq` | resource | `worker.IBroker` | amqp091-go, with automatic recovery, publisher confirms, prefetch and optional dead-letter queues |
+| `provider/sqltx` | provider | `operation.Transactor` | `database/sql`, transactions carried in the context |
 | `provider/inbox` | provider | `worker.InboxStorage` | PostgreSQL, MySQL 8 |
 | `provider/outbox` | provider | `worker.OutboxStorage` | PostgreSQL, MySQL 8 |
 | `provider/locker` | provider | `operation.ILocker` | Redis |
@@ -48,6 +50,7 @@ app.Run()
 
 - **Configure, don't wire.** Every resource is a plain config value whose zero fields mean "use the default". Every provider is a constructor that the bootstrap calls with the resources it needs.
 - **Fail at startup.** Resources connect and verify the connection in `New`. RabbitMQ declares its whole topology there too, so a bad DSN or a conflicting queue stops the app before it serves anything.
+- **Nothing is lost quietly.** Handlers and their inbox updates commit in one transaction. Publishes wait for the broker's confirm before the outbox marks them sent. RabbitMQ reconnects on its own, and acknowledgements never cross a reconnect onto the wrong message.
 - **Shared state is atomic.** The Redis locker and rate limiter run each check as a single Lua script, and the rate limiter uses the Redis server's clock, so every instance of your app enforces the same lock or limit.
 - **Replaceable.** Each adapter implements a forgo interface. Swap one out by giving the bootstrap your own resource or provider.
 

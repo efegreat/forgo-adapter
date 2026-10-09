@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/efegreat/forgo/server/worker"
+
+	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
 // Postgres is a worker.InboxStorage on the inbox_events table of a PostgreSQL database.
@@ -27,7 +29,7 @@ func (p *Postgres) Status(
 ) (worker.InboxStatus, bool, error) {
 	var status worker.InboxStatus
 
-	err := p.db.QueryRowContext(
+	err := sqltx.From(ctx, p.db).QueryRowContext(
 		ctx,
 		`
 		SELECT status
@@ -60,7 +62,7 @@ func (p *Postgres) IncrementAttempt(
 ) (int, error) {
 	var attempts int
 
-	err := p.db.QueryRowContext(
+	err := sqltx.From(ctx, p.db).QueryRowContext(
 		ctx,
 		`
 		INSERT INTO inbox_events (
@@ -115,6 +117,7 @@ func (p *Postgres) MarkCompleted(
 		messageID,
 		subscriberName,
 		worker.InboxCompleted,
+		false,
 	)
 }
 
@@ -128,6 +131,7 @@ func (p *Postgres) MarkFailed(
 		messageID,
 		subscriberName,
 		worker.InboxFailed,
+		true,
 	)
 }
 
@@ -141,6 +145,7 @@ func (p *Postgres) MarkRejected(
 		messageID,
 		subscriberName,
 		worker.InboxRejected,
+		true,
 	)
 }
 
@@ -149,10 +154,11 @@ func (p *Postgres) markStatus(
 	messageID string,
 	subscriberName string,
 	target worker.InboxStatus,
+	repeatable bool,
 ) error {
 	var status worker.InboxStatus
 
-	err := p.db.QueryRowContext(
+	err := sqltx.From(ctx, p.db).QueryRowContext(
 		ctx,
 		`
 		UPDATE inbox_events
@@ -183,9 +189,6 @@ func (p *Postgres) markStatus(
 	}
 
 	// The Waiting -> target transition did not happen.
-	//
-	// Check whether this is simply an idempotent repeat of the same
-	// terminal transition.
 	current, exists, err := p.Status(
 		ctx,
 		messageID,
@@ -195,15 +198,7 @@ func (p *Postgres) markStatus(
 		return err
 	}
 
-	if !exists {
-		return sql.ErrNoRows
-	}
-
-	if current == target {
-		return nil
-	}
-
-	return ErrNotWaiting
+	return unmoved(current, exists, target, repeatable)
 }
 
 func (p *Postgres) DeleteBefore(
@@ -211,7 +206,7 @@ func (p *Postgres) DeleteBefore(
 	before time.Time,
 	limit int,
 ) (int64, error) {
-	result, err := p.db.ExecContext(
+	result, err := sqltx.From(ctx, p.db).ExecContext(
 		ctx,
 		`
 		WITH candidates AS (

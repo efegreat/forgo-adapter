@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
+
+	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
 // Postgres is a worker.OutboxStorage on the outbox_events table of a PostgreSQL database.
+// Statements join the transaction a sqltx.Transactor put in the context.
 type Postgres struct {
 	db *sql.DB
 }
@@ -22,105 +24,58 @@ func NewPostgres(db *sql.DB) *Postgres {
 	return &Postgres{db: db}
 }
 
+// Claim claims the messages in one UPDATE … RETURNING. It runs in a transaction so a failure while
+// reading the claimed rows releases them right away instead of after ClaimTTL.
 func (p *Postgres) Claim(
 	ctx context.Context,
 	claim worker.Claim,
 ) ([]worker.Message, error) {
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("outbox: begin claim transaction: %w", err)
-	}
+	var messages []worker.Message
 
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	rows, err := tx.QueryContext(
-		ctx,
-		`
-		WITH claimed AS (
-			SELECT id
-			FROM outbox_events
-			WHERE processed_at IS NULL
-			  AND (
-				  processing_at IS NULL
-				  OR processing_at < $1
-			  )
-			ORDER BY id
-			LIMIT $2
-			FOR UPDATE SKIP LOCKED
-		)
-		UPDATE outbox_events AS o
-		SET
-			processing_id = $3,
-			processing_at = CURRENT_TIMESTAMP
-		FROM claimed
-		WHERE o.id = claimed.id
-		RETURNING
-			o.id,
-			o.name,
-			o.payload,
-			o.headers,
-			o.created_at,
-			o.message_key,
-			o.destination
-		`,
-		claim.ExpiredBefore,
-		claim.Limit,
-		claim.ID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("outbox: claim messages: %w", err)
-	}
-
-	messages := make([]worker.Message, 0, claim.Limit)
-
-	for rows.Next() {
-		message := worker.Message{
-			Headers: types.NewJSONMap[string](),
-		}
-
-		if err := rows.Scan(
-			&message.ID,
-			&message.Name,
-			&message.Payload,
-			message.Headers,
-			&message.CreatedAt,
-			&message.Key,
-			&message.Destination,
-		); err != nil {
-			_ = rows.Close()
-
-			return nil, fmt.Errorf(
-				"outbox: scan claimed message: %w",
-				err,
+	err := sqltx.Run(ctx, p.db, func(ctx context.Context) error {
+		rows, err := sqltx.From(ctx, p.db).QueryContext(
+			ctx,
+			`
+			WITH claimed AS (
+				SELECT id
+				FROM outbox_events
+				WHERE processed_at IS NULL
+				  AND (
+					  processing_at IS NULL
+					  OR processing_at < $1
+				  )
+				ORDER BY id
+				LIMIT $2
+				FOR UPDATE SKIP LOCKED
 			)
+			UPDATE outbox_events AS o
+			SET
+				processing_id = $3,
+				processing_at = CURRENT_TIMESTAMP
+			FROM claimed
+			WHERE o.id = claimed.id
+			RETURNING
+				o.id,
+				o.name,
+				o.payload,
+				o.headers,
+				o.created_at,
+				o.message_key,
+				o.destination
+			`,
+			claim.ExpiredBefore,
+			claim.Limit,
+			claim.ID,
+		)
+		if err != nil {
+			return fmt.Errorf("outbox: claim messages: %w", err)
 		}
 
-		messages = append(messages, message)
-	}
-
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-
-		return nil, fmt.Errorf(
-			"outbox: iterate claimed messages: %w",
-			err,
-		)
-	}
-
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf(
-			"outbox: close claimed messages: %w",
-			err,
-		)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf(
-			"outbox: commit claim transaction: %w",
-			err,
-		)
+		messages, err = scanMessages(rows, claim.Limit)
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return messages, nil
@@ -131,80 +86,65 @@ func (p *Postgres) Complete(
 	claimID string,
 	successfulIDs []string,
 ) error {
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf(
-			"outbox: begin complete transaction: %w",
-			err,
-		)
-	}
+	return sqltx.Run(ctx, p.db, func(ctx context.Context) error {
+		tx := sqltx.From(ctx, p.db)
 
-	defer func() {
-		_ = tx.Rollback()
-	}()
+		if len(successfulIDs) > 0 {
+			args := make([]any, 0, len(successfulIDs)+1)
+			args = append(args, claimID)
 
-	if len(successfulIDs) > 0 {
-		args := make([]any, 0, len(successfulIDs)+1)
-		args = append(args, claimID)
+			for _, id := range successfulIDs {
+				args = append(args, id)
+			}
 
-		for _, id := range successfulIDs {
-			args = append(args, id)
+			query := `
+				UPDATE outbox_events
+				SET
+					processed_at = CURRENT_TIMESTAMP,
+					processing_id = NULL,
+					processing_at = NULL
+				WHERE processing_id = $1
+				  AND processed_at IS NULL
+				  AND id IN (` +
+				postgresPlaceholders(2, len(successfulIDs)) +
+				`)`
+
+			if _, err := tx.ExecContext(
+				ctx,
+				query,
+				args...,
+			); err != nil {
+				return fmt.Errorf(
+					"outbox: mark messages processed: %w",
+					err,
+				)
+			}
 		}
 
-		query := `
+		// Anything still carrying this claim failed to publish.
+		//
+		// Successful messages already had processing_id cleared by the query
+		// above, therefore this only releases the remaining messages.
+		if _, err := tx.ExecContext(
+			ctx,
+			`
 			UPDATE outbox_events
 			SET
-				processed_at = CURRENT_TIMESTAMP,
 				processing_id = NULL,
 				processing_at = NULL
 			WHERE processing_id = $1
 			  AND processed_at IS NULL
-			  AND id IN (` +
-			postgresPlaceholders(2, len(successfulIDs)) +
-			`)`
-
-		if _, err := tx.ExecContext(
-			ctx,
-			query,
-			args...,
+			`,
+			claimID,
 		); err != nil {
 			return fmt.Errorf(
-				"outbox: mark messages processed: %w",
+				"outbox: release unprocessed messages: %w",
 				err,
 			)
 		}
-	}
 
-	// Anything still carrying this claim failed to publish.
-	//
-	// Successful messages already had processing_id cleared by the query
-	// above, therefore this only releases the remaining messages.
-	if _, err := tx.ExecContext(
-		ctx,
-		`
-		UPDATE outbox_events
-		SET
-			processing_id = NULL,
-			processing_at = NULL
-		WHERE processing_id = $1
-		  AND processed_at IS NULL
-		`,
-		claimID,
-	); err != nil {
-		return fmt.Errorf(
-			"outbox: release unprocessed messages: %w",
-			err,
-		)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf(
-			"outbox: commit complete transaction: %w",
-			err,
-		)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 func (p *Postgres) DeleteProcessedBefore(
@@ -217,7 +157,7 @@ func (p *Postgres) DeleteProcessedBefore(
 	//
 	// SKIP LOCKED also means multiple outbox instances may perform cleanup
 	// without waiting on one another.
-	result, err := p.db.ExecContext(
+	result, err := sqltx.From(ctx, p.db).ExecContext(
 		ctx,
 		`
 		WITH deleted AS (

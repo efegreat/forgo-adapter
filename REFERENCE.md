@@ -11,6 +11,7 @@ The complete guide to the forgo adapter library. New here? Start with the [READM
   - [redisdb](#redisdb)
   - [rabbitmq](#rabbitmq)
 - [Providers](#providers)
+  - [sqltx](#sqltx)
   - [inbox and outbox](#inbox-and-outbox)
   - [locker](#locker)
   - [ratelimit](#ratelimit)
@@ -33,6 +34,7 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `sqldb` | `github.com/efegreat/forgo-adapter/resource/sqldb` | resource | `*sql.DB` | a `database/sql` driver |
 | `redisdb` | `github.com/efegreat/forgo-adapter/resource/redisdb` | resource | `*redis.Client` | |
 | `rabbitmq` | `github.com/efegreat/forgo-adapter/resource/broker/rabbitmq` | resource | `worker.IBroker` | |
+| `sqltx` | `github.com/efegreat/forgo-adapter/provider/sqltx` | provider | `*Transactor` → `operation.Transactor` | `*sql.DB` |
 | `inbox` | `github.com/efegreat/forgo-adapter/provider/inbox` | provider | `*Postgres`, `*Mysql` → `worker.InboxStorage` | `*sql.DB` |
 | `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*Mysql` → `worker.OutboxStorage` | `*sql.DB` |
 | `locker` | `github.com/efegreat/forgo-adapter/provider/locker` | provider | `*Redis` → `operation.ILocker` | `redis.UniversalClient` |
@@ -166,7 +168,7 @@ var Broker = rabbitmq.Config{
 		{Name: "order.placed"}, // persistent by default
 	},
 	Subscribers: []rabbitmq.SubscriberConfig{
-		{Name: "billing", Queue: "billing"},
+		{Name: "billing", Queue: "billing"}, // prefetch defaults to the worker's Concurrency
 	},
 }
 ```
@@ -180,12 +182,13 @@ var Broker = rabbitmq.Config{
 | `Port` | `5672` | Broker port. |
 | `Username`, `Password` | client default (`guest`) | PLAIN credentials. They are passed to the client directly, so special characters need no escaping. |
 | `VHost` | `/` | Virtual host. |
+| `Recovery` | enabled, unlimited retries every 5s | Automatic reconnection, see [Recovery](#recovery). |
 | `Exchanges` | | Exchanges to declare: `Name`, `Kind`, `Durable`, `AutoDelete`, `Internal`, `NoWait`, `Args`. |
 | `Queues` | | Queues to declare: `Name`, `Durable`, `AutoDelete`, `Exclusive`, `NoWait`, `Args`, `Bindings` and `DeadLetter`. |
 | `Publishers` | | Named publishers, see below. |
 | `Subscribers` | | Named subscribers, see below. |
 
-`New` connects, then declares every exchange, then every queue with its bindings. A queue's dead-letter exchange and queue are declared just before the queue itself. Any failure closes the connection and fails the bootstrap. Declarations are idempotent, but redeclaring an existing exchange or queue with different properties or arguments is refused by RabbitMQ with `PRECONDITION_FAILED`.
+`New` connects, then declares every exchange, then every queue with its bindings. A queue's dead-letter exchange and queue are declared just before the queue itself. Any failure closes the connection and fails the bootstrap. The channel the topology was declared on stays open, because the client only redeclares the topology recorded on open channels after a reconnect. Declarations are idempotent, but redeclaring an existing exchange or queue with different properties or arguments is refused by RabbitMQ with `PRECONDITION_FAILED`.
 
 #### Publishers and subscribers
 
@@ -194,18 +197,27 @@ The names match forgo's worker configs:
 - `worker.ProducerConfig.Publishers[i].Name` → `IBroker.NewPublisher(name)` → the `PublisherConfig` with that `Name`. The producer's default publisher uses `NewDefaultPublisher`, which publishes persistent messages and needs no config.
 - `worker.SubscriberConfig.Name` → `IBroker.NewSubscriber(name)` → the `SubscriberConfig` with that `Name`, which consumes `Queue`.
 
-An unknown name fails the server at startup.
+An unknown name, or a subscriber whose `Queue` does not exist, fails the server at startup.
 
 | `PublisherConfig` field | Default | Description |
 | --- | --- | --- |
 | `Name` | | Matches `worker.PublisherConfig.Name`. |
-| `Mandatory`, `Immediate` | `false` | AMQP publish flags. |
+| `Mandatory` | `false` | Fail the publish when no queue is bound to receive the message. Without it, RabbitMQ drops unroutable messages and the publish succeeds. |
 | `DeliveryMode` | `amqp.Persistent` | `amqp.Transient` for messages that may be lost on a broker restart. |
+
+Every publisher channel is in confirm mode. `Publish` waits, up to the worker's `PublisherConfig.Timeout`, until the broker confirms it has taken responsibility for the message, which for a persistent message on a durable queue means it is written to disk. Only then does the outbox mark the message processed. A publish fails, and the message stays in the outbox for the next cycle, when:
+
+- the broker nacks it (`rabbitmq: broker nacked the message`), for example because a queue with `x-overflow: reject-publish` is full,
+- no confirm arrives in time, or the channel is lost meanwhile,
+- `Mandatory` is set and no queue receives it (`rabbitmq: mandatory message is unroutable`).
+
+A publisher sends one message at a time and waits for its confirm. Raise the worker publisher's `Concurrency` for throughput: each unit is its own channel.
 
 | `SubscriberConfig` field | Default | Description |
 | --- | --- | --- |
 | `Name` | | Matches `worker.SubscriberConfig.Name`. |
-| `Queue` | | The queue to consume. |
+| `Queue` | | The queue to consume. It must exist when the server starts. |
+| `Prefetch` | the worker subscriber's `Concurrency` | How many unacknowledged messages RabbitMQ sends this consumer. The default keeps every handler slot busy and leaves the rest of the backlog in the queue for other instances. Raise it a little to hide network latency. A negative value removes the limit. At most 65535. |
 | `AutoAck` | `false` | Leave it off: the worker acknowledges every message itself. |
 | `Exclusive`, `NoLocal`, `NoWait`, `Args` | | AMQP consume options. |
 
@@ -232,6 +244,8 @@ The worker acknowledges each delivery:
 | `Complete` | `basic.ack` | The message is removed. |
 | `Retry` | `basic.nack`, requeue | The message goes back to the queue and is delivered again. |
 | `Reject` | `basic.reject`, no requeue | The message is dropped, or dead-lettered when the queue has `DeadLetter`. |
+
+An acknowledgement for a message whose channel was lost since it was delivered is not sent. It fails with `rabbitmq: delivery belongs to a lost channel`, because the broker already requeued the message and will deliver it again (see [Recovery](#recovery)).
 
 #### Dead-letter queues
 
@@ -269,15 +283,66 @@ Dead letters keep their body, properties and headers. RabbitMQ adds an `x-death`
 
 **Existing queues.** Queue arguments cannot change after a queue is declared. Enabling `DeadLetter` on a queue that already exists without it fails with `PRECONDITION_FAILED`. Either delete and recreate the queue, or leave `DeadLetter` off and set the dead-letter exchange through a RabbitMQ policy.
 
-#### Limits
+#### Recovery
 
-- The broker does not reconnect. When the connection drops, subscribers stop with `rabbitmq: delivery channel closed by the broker` and publishers fail until the app restarts. Run the worker under a supervisor that restarts it.
-- No prefetch limit is set, so RabbitMQ pushes every ready message of a queue to its consumer. Set a `x-max-length` on the queue or a consumer prefetch policy if a backlog must not be buffered in one process.
-- Publishes do not wait for publisher confirms. A message is marked processed in the outbox once the client has written it to the connection.
+The broker uses the automatic recovery of amqp091-go. When the connection or a channel is lost, the client reconnects and reopens every channel with its prefetch and confirm mode. It then redeclares the exchanges, queues, bindings and dead-letter queues, and resubscribes the consumers. Subscribers keep consuming from the same delivery channel, so the worker does not notice beyond a pause.
+
+```go
+rabbitmq.Config{
+	Recovery: rabbitmq.RecoveryConfig{MaxRetries: 60, RetryInterval: 2 * time.Second},
+}
+```
+
+| `RecoveryConfig` field | Default | Description |
+| --- | --- | --- |
+| `Disabled` | `false` | Turns recovery off. A lost connection then stops every subscriber and fails every publish until the app restarts. |
+| `MaxRetries` | unlimited | Reconnection attempts before giving up. Once they are exhausted, the connection closes and subscribers stop with `rabbitmq: delivery channel closed by the broker`. |
+| `RetryInterval` | `5s` | Wait before each attempt, plus up to 500ms of jitter. |
+
+While the connection is down:
+
+- **Publishes fail fast.** The outbox keeps the messages and retries them on its next cycle.
+- **Unacknowledged deliveries are requeued by the broker.** Delivery tags start over on a recovered channel, so a late acknowledgement from a handler that was still running would settle a different message. The broker marks those deliveries stale before the channel is reopened, and their acknowledgements fail instead (`rabbitmq: delivery belongs to a lost channel`). The message is delivered again, and the inbox recognizes it by its `x-msg-id`. If the handler had completed it, the redelivery is acknowledged and skipped.
+- **Unconfirmed publishes fail.** The client settles pending confirms as nacks when it reopens the channel, so the outbox retries them. A message the broker had already stored is then published twice, and the consumer inbox drops the duplicate.
+
+The client logs its recovery through `amqp.Logger`, which discards everything by default. Call `amqp.SetLogger` in `main` to see reconnects.
 
 ---
 
 ## Providers
+
+### sqltx
+
+`sqltx.Transactor` is the `operation.Transactor` the worker consumer runs message handlers through. `sqltx` carries the transaction in the context, so every storage of this library and every repository of yours that runs its statements through `sqltx.From` joins it.
+
+```go
+import "github.com/efegreat/forgo-adapter/provider/sqltx"
+
+forgo.WithProviders(
+	sqltx.NewTransactor, // operation.Transactor on the *sql.DB
+	inbox.NewPostgres,
+	postgresrepo.NewOrderRepository,
+)
+```
+
+```go
+func (r *OrderRepository) Insert(ctx context.Context, o order.Order) error {
+	_, err := sqltx.From(ctx, r.db).ExecContext(ctx, `INSERT INTO orders (id, total) VALUES ($1, $2)`, o.ID, o.Total)
+	return err
+}
+```
+
+| API | Behavior |
+| --- | --- |
+| `NewTransactor(db) *Transactor` | Provider. `Do(ctx, fn)` is `Run(ctx, db, fn)`. |
+| `Run(ctx, db, fn) error` | Begins a transaction on `db` and calls `fn` with a context carrying it. Commits when `fn` returns nil. Rolls back when `fn` returns an error, which `Run` returns unchanged, or panics, after which the panic continues. |
+| `From(ctx, db) Executor` | The transaction on `db` that `ctx` carries, or `db` itself outside a transaction. `Executor` has `ExecContext`, `QueryContext` and `QueryRowContext`. |
+
+**Nesting.** A `Run` or `Do` inside another on the same database joins the outer transaction instead of starting one, and the outermost call commits or rolls back everything. Transactions are keyed by `*sql.DB`, so contexts can carry transactions on several databases at once, and `From` never hands one database's transaction to another.
+
+**In the worker.** For each message, the consumer runs your handler and the inbox's `MarkCompleted` inside `Transactor.Do`. With `sqltx` and the SQL inbox, your writes and the completion commit together. A handler that fails rolls back both, and the message is retried. A crash after the commit leads to a redelivery that the inbox skips. A concurrent duplicate of the message rolls back, because `MarkCompleted` fails for the delivery that completes second.
+
+**In your services.** Write outbox rows with `sqltx.From` inside the same `Do` as the business change, as in forgo's [producer example](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#producer-outbox-relay). The row is then published only if the change commits.
 
 ### inbox and outbox
 
@@ -302,9 +367,9 @@ forgo.WithProviders(
 | `outbox.NewPostgres(*sql.DB)` | PostgreSQL | Claims with `FOR UPDATE SKIP LOCKED` and stamps `processing_at` with the database clock. |
 | `outbox.NewMysql(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED` and stamps `processing_at` with the application clock. |
 
-Status changes are idempotent. Moving a message into the state it is already in succeeds. Moving it out of a terminal state fails with `inbox.ErrNotWaiting`. Several producer instances can run against one outbox, because a claim skips the rows another claim has locked.
+A message only leaves *waiting*. Moving it out of another terminal state fails with `inbox.ErrNotWaiting`. Repeating `MarkFailed` or `MarkRejected` on a message already in that state succeeds. `MarkCompleted` is strict: it succeeds only when it moves the message out of *waiting* itself. When two deliveries of one message run at once, for example after a channel was lost while a handler ran, the one that completes second fails with `inbox.ErrNotWaiting`. Its transaction then rolls back its handler's writes instead of committing them a second time, and its redelivery is skipped as completed. Several producer instances can run against one outbox, because a claim skips the rows another claim has locked.
 
-The storages run their statements on the `*sql.DB`. They do not take part in a transaction started by an `operation.Transactor`.
+Every statement runs through `sqltx.From`, so a storage called inside `sqltx.Transactor.Do` joins that transaction. The operations that need several statements (MySQL `IncrementAttempt`, both `Claim`s and `Complete`s) run in `sqltx.Run`, which starts a transaction of their own or joins the caller's.
 
 ### locker
 
@@ -373,6 +438,7 @@ var (
 	}
 
 	Adapters = []any{
+		sqltx.NewTransactor,
 		inbox.NewPostgres,
 		outbox.NewPostgres,
 		locker.NewRedis,
@@ -384,10 +450,9 @@ var (
 			Concurrency: 8,
 			MaxAttempt:  5, // then rejected → billing.dlq
 			Handlers: []worker.HandlerConfig{{
-				Name:                "order.placed",
-				TransactionDisabled: true,
-				Lock:                operation.Lock{Key: "order-placed", Ttl: time.Minute}, // locker.Redis
-				Handler:             worker.HandlerFor((*billing.Service).OnOrderPlaced),
+				Name:    "order.placed", // runs in a sqltx transaction with its inbox completion
+				Lock:    operation.Lock{Key: "order-placed", Ttl: time.Minute}, // locker.Redis
+				Handler: worker.HandlerFor((*billing.Service).OnOrderPlaced),
 			}},
 		}},
 	}
@@ -410,8 +475,6 @@ func main() {
 }
 ```
 
-Handlers that run in a transaction need an `operation.Transactor` provider, which this library does not ship yet. Provide your own or set `TransactionDisabled`.
-
 ---
 
 ## Errors
@@ -422,7 +485,8 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | --- | --- |
 | `sqldb:` | Opening or pinging the database. |
 | `redisdb:` | Pinging Redis. |
-| `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names, a closed delivery channel. |
+| `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names and missing queues, a closed delivery channel, nacked and unroutable publishes, acknowledgements of deliveries from a lost channel. |
+| `sqltx:` | Beginning, committing or rolling back a transaction. Errors returned by your function pass through unchanged. |
 | `inbox:` | Inbox queries. `inbox.ErrNotWaiting` when a message left the waiting status. |
 | `outbox:` | Outbox queries. |
 | `locker:` | Redis errors. `locker.ErrNotHeld` from `Unlock`. |

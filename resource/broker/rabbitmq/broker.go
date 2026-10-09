@@ -4,19 +4,32 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/efegreat/forgo/server/worker"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-const defaultPublisherName = "default"
+const (
+	defaultPublisherName = "default"
+	// returnBuffer holds the returns of unroutable mandatory messages until Publish reads them.
+	// The client stalls the connection while a return listener is full.
+	returnBuffer = 16
+)
 
 type Broker struct {
 	conf        Config
 	subscribers map[string]SubscriberConfig
 	publishers  map[string]PublisherConfig
 	conn        *amqp.Connection
+	// topology is the channel the exchanges, queues and bindings were declared on. The client
+	// recovers the topology recorded on open channels only, so it stays open until Close.
+	topology *amqp.Channel
+
+	mu sync.Mutex
+	// owned holds the channels to recover, with the ack guard of subscriber channels.
+	owned map[*amqp.Channel]*ackGuard
 }
 
 func (r *Broker) Name() string {
@@ -24,15 +37,7 @@ func (r *Broker) Name() string {
 }
 
 func (r *Broker) NewDefaultPublisher() (worker.IPublisher, error) {
-	ch, err := r.conn.Channel()
-	if err != nil {
-		return nil, fmt.Errorf("rabbitmq: open publisher channel: %w", err)
-	}
-
-	return &Publisher{
-		conf: PublisherConfig{Name: defaultPublisherName}.Sanitize(),
-		ch:   ch,
-	}, nil
+	return r.newPublisher(PublisherConfig{Name: defaultPublisherName}.Sanitize())
 }
 
 func (r *Broker) NewPublisher(name string) (worker.IPublisher, error) {
@@ -40,17 +45,30 @@ func (r *Broker) NewPublisher(name string) (worker.IPublisher, error) {
 	if !ok {
 		return nil, fmt.Errorf("rabbitmq: publisher config not found for name: %s", name)
 	}
+	return r.newPublisher(conf)
+}
+
+// newPublisher opens a channel in confirm mode, so Publish returns once the broker has the message.
+func (r *Broker) newPublisher(conf PublisherConfig) (*Publisher, error) {
 	ch, err := r.conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq: open publisher channel: %w", err)
 	}
+	if err := ch.Confirm(false); err != nil {
+		return nil, errors.Join(fmt.Errorf("rabbitmq: enable publisher confirms: %w", err), ch.Close())
+	}
 
-	return &Publisher{
-		conf: conf,
-		ch:   ch,
-	}, nil
+	p := &Publisher{conf: conf, ch: ch}
+	if conf.Mandatory {
+		p.returns = ch.NotifyReturn(make(chan amqp.Return, returnBuffer))
+	}
+	r.own(ch, nil)
+	p.release = func() { r.disown(ch) }
+	return p, nil
 }
 
+// NewSubscriber opens the subscriber's channel and checks that its queue exists. Consumption
+// starts in Consume, once the worker's concurrency sets the default prefetch.
 func (r *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	conf, ok := r.subscribers[name]
 	if !ok {
@@ -61,25 +79,19 @@ func (r *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 		return nil, fmt.Errorf("rabbitmq: open subscriber channel: %w", err)
 	}
 
-	msgs, err := ch.Consume(
-		conf.Queue,
-		"",
-		conf.AutoAck,
-		conf.Exclusive,
-		conf.NoLocal,
-		conf.NoWait,
-		conf.Args,
-	)
-	if err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("rabbitmq: consume queue %s: %w", conf.Queue, err),
-			ch.Close(),
-		)
+	// A missing queue makes the broker close the channel. It is not owned yet, so it is not recovered.
+	if _, err := ch.QueueDeclarePassive(conf.Queue, false, false, false, false, nil); err != nil {
+		_ = ch.Close()
+		return nil, fmt.Errorf("rabbitmq: subscriber %s: queue %s: %w", name, conf.Queue, err)
 	}
 
+	guard := &ackGuard{}
+	r.own(ch, guard)
 	return &Subscriber{
-		msgs: msgs,
-		ch:   ch,
+		conf:    conf,
+		ch:      ch,
+		guard:   guard,
+		release: func() { r.disown(ch) },
 	}, nil
 }
 
@@ -87,14 +99,49 @@ func (r *Broker) Value() any {
 	return worker.IBroker(r)
 }
 
+// Close closes the connection and with it every channel. It also stops a recovery in progress.
 func (r *Broker) Close() error {
 	return r.conn.Close()
+}
+
+func (r *Broker) own(ch *amqp.Channel, guard *ackGuard) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.owned[ch] = guard
+}
+
+func (r *Broker) disown(ch *amqp.Channel) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.owned, ch)
+}
+
+func (r *Broker) owner(ch *amqp.Channel) (*ackGuard, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	guard, ok := r.owned[ch]
+	return guard, ok
+}
+
+// invalidateAll marks the deliveries of every subscriber channel as stale.
+func (r *Broker) invalidateAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, guard := range r.owned {
+		if guard != nil {
+			guard.invalidate()
+		}
+	}
 }
 
 func (r *Broker) init() (err error) {
 	cfg := amqp.Config{
 		Vhost:      r.conf.VHost,
 		Properties: amqp.NewConnectionProperties(),
+		Recovery: r.conf.Recovery.amqpRecovery(&recoveryHooks{
+			broker: r,
+			next:   &amqp.DefaultConnectionRecovery{},
+		}),
 	}
 	if r.conf.Username != "" {
 		cfg.SASL = []amqp.Authentication{&amqp.PlainAuth{Username: r.conf.Username, Password: r.conf.Password}}
@@ -119,11 +166,12 @@ func (r *Broker) init() (err error) {
 	if err != nil {
 		return fmt.Errorf("rabbitmq: open topology channel: %w", err)
 	}
-	defer ch.Close()
+	r.topology = ch
 
 	if err := declare(ch, r.conf); err != nil {
 		return err
 	}
+	r.own(ch, nil)
 
 	for _, s := range r.conf.Subscribers {
 		r.subscribers[s.Name] = s
