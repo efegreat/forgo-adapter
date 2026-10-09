@@ -3,6 +3,8 @@ package rabbitmq
 import (
 	"errors"
 	"fmt"
+	"math"
+	"time"
 
 	"github.com/efegreat/forgo"
 
@@ -16,6 +18,9 @@ const (
 
 	deadLetterExchangeArg   = "x-dead-letter-exchange"
 	deadLetterRoutingKeyArg = "x-dead-letter-routing-key"
+
+	defaultRetryInterval = 5 * time.Second
+	maxPrefetch          = math.MaxUint16
 )
 
 var errDeadLetterUnnamedQueue = errors.New("rabbitmq: a queue with DeadLetter enabled needs a Name")
@@ -34,7 +39,9 @@ type Config struct {
 	Username string
 	Password string
 	// VHost is the virtual host. Default: /.
-	VHost       string
+	VHost string
+	// Recovery reconnects after the connection or a channel is lost. Enabled by default.
+	Recovery    RecoveryConfig
 	Exchanges   []ExchangeConfig
 	Queues      []QueueConfig
 	Publishers  []PublisherConfig
@@ -52,6 +59,7 @@ func (c Config) Sanitize() Config {
 	if c.VHost == "" {
 		c.VHost = defaultVHost
 	}
+	c.Recovery = c.Recovery.Sanitize()
 
 	queues := make([]QueueConfig, len(c.Queues))
 	for i, q := range c.Queues {
@@ -78,6 +86,7 @@ func (c Config) New() (forgo.Resource, error) {
 		conf:        cfg,
 		subscribers: make(map[string]SubscriberConfig, len(cfg.Subscribers)),
 		publishers:  make(map[string]PublisherConfig, len(cfg.Publishers)),
+		owned:       make(map[*amqp.Channel]*ackGuard),
 	}
 	if err := broker.init(); err != nil {
 		return nil, err
@@ -88,6 +97,14 @@ func (c Config) New() (forgo.Resource, error) {
 
 // validate rejects configurations that would otherwise only fail once the broker is reached.
 func (c Config) validate() error {
+	if c.Recovery.MaxRetries < 0 || c.Recovery.RetryInterval < 0 {
+		return errors.New("rabbitmq: Recovery.MaxRetries and Recovery.RetryInterval cannot be negative")
+	}
+	for _, s := range c.Subscribers {
+		if s.Prefetch > maxPrefetch {
+			return fmt.Errorf("rabbitmq: subscriber %q: Prefetch cannot exceed %d", s.Name, maxPrefetch)
+		}
+	}
 	for _, q := range c.Queues {
 		if !q.DeadLetter.Enabled {
 			continue
@@ -102,6 +119,33 @@ func (c Config) validate() error {
 		}
 	}
 	return nil
+}
+
+// RecoveryConfig configures the automatic recovery of the client (amqp091-go). After the connection
+// or a channel is lost, it reconnects, reopens every channel with its prefetch and confirm mode,
+// redeclares the exchanges, queues and bindings, and resubscribes the consumers.
+//
+// Messages that were delivered but not yet acknowledged when the connection was lost are
+// redelivered by the broker. Their late acknowledgements are dropped with errStaleDelivery
+// instead of reaching the recovered channel, whose delivery tags start over.
+type RecoveryConfig struct {
+	// Disabled turns recovery off: a lost connection stops every subscriber and fails every
+	// publish until the application restarts.
+	Disabled bool
+	// MaxRetries is the number of reconnection attempts before giving up. Default: unlimited.
+	MaxRetries int
+	// RetryInterval is the wait before each attempt, plus up to 500ms of jitter. Default: 5 seconds.
+	RetryInterval time.Duration
+}
+
+func (r RecoveryConfig) Sanitize() RecoveryConfig {
+	if r.MaxRetries == 0 {
+		r.MaxRetries = math.MaxInt
+	}
+	if r.RetryInterval == 0 {
+		r.RetryInterval = defaultRetryInterval
+	}
+	return r
 }
 
 type ExchangeConfig struct {
@@ -197,9 +241,10 @@ type BindingConfig struct {
 
 type PublisherConfig struct {
 	// Name matches worker.PublisherConfig.Name.
-	Name      string
+	Name string
+	// Mandatory makes a publish fail when no queue is bound to receive the message. Otherwise
+	// RabbitMQ drops unroutable messages and the publish succeeds.
 	Mandatory bool
-	Immediate bool
 	// DeliveryMode is amqp.Persistent or amqp.Transient. Default: amqp.Persistent.
 	DeliveryMode uint8
 }
@@ -213,8 +258,12 @@ func (p PublisherConfig) Sanitize() PublisherConfig {
 
 type SubscriberConfig struct {
 	// Name matches worker.SubscriberConfig.Name.
-	Name      string
-	Queue     string
+	Name  string
+	Queue string
+	// Prefetch is how many messages RabbitMQ delivers before they are acknowledged. Default: the
+	// Concurrency of the worker subscriber, so every handler slot has a message and the rest of
+	// the backlog stays in the queue for other instances. A negative value removes the limit.
+	Prefetch  int
 	AutoAck   bool
 	Exclusive bool
 	NoLocal   bool
