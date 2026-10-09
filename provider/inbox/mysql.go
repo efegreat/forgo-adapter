@@ -164,6 +164,7 @@ func (m *Mysql) MarkCompleted(
 		messageID,
 		subscriberName,
 		worker.InboxCompleted,
+		false,
 	)
 }
 
@@ -177,6 +178,7 @@ func (m *Mysql) MarkFailed(
 		messageID,
 		subscriberName,
 		worker.InboxFailed,
+		true,
 	)
 }
 
@@ -190,6 +192,7 @@ func (m *Mysql) MarkRejected(
 		messageID,
 		subscriberName,
 		worker.InboxRejected,
+		true,
 	)
 }
 
@@ -198,6 +201,7 @@ func (m *Mysql) markStatus(
 	messageID string,
 	subscriberName string,
 	target worker.InboxStatus,
+	repeatable bool,
 ) error {
 	result, err := sqltx.From(ctx, m.db).ExecContext(
 		ctx,
@@ -235,8 +239,7 @@ func (m *Mysql) markStatus(
 		return nil
 	}
 
-	// Allow the operation to be repeated safely if it was already moved
-	// into the requested terminal state.
+	// The Waiting -> target transition did not happen.
 	current, exists, err := m.Status(
 		ctx,
 		messageID,
@@ -246,15 +249,7 @@ func (m *Mysql) markStatus(
 		return err
 	}
 
-	if !exists {
-		return sql.ErrNoRows
-	}
-
-	if current == target {
-		return nil
-	}
-
-	return ErrNotWaiting
+	return unmoved(current, exists, target, repeatable)
 }
 
 func (m *Mysql) DeleteBefore(

@@ -117,6 +117,7 @@ func (p *Postgres) MarkCompleted(
 		messageID,
 		subscriberName,
 		worker.InboxCompleted,
+		false,
 	)
 }
 
@@ -130,6 +131,7 @@ func (p *Postgres) MarkFailed(
 		messageID,
 		subscriberName,
 		worker.InboxFailed,
+		true,
 	)
 }
 
@@ -143,6 +145,7 @@ func (p *Postgres) MarkRejected(
 		messageID,
 		subscriberName,
 		worker.InboxRejected,
+		true,
 	)
 }
 
@@ -151,6 +154,7 @@ func (p *Postgres) markStatus(
 	messageID string,
 	subscriberName string,
 	target worker.InboxStatus,
+	repeatable bool,
 ) error {
 	var status worker.InboxStatus
 
@@ -185,9 +189,6 @@ func (p *Postgres) markStatus(
 	}
 
 	// The Waiting -> target transition did not happen.
-	//
-	// Check whether this is simply an idempotent repeat of the same
-	// terminal transition.
 	current, exists, err := p.Status(
 		ctx,
 		messageID,
@@ -197,15 +198,7 @@ func (p *Postgres) markStatus(
 		return err
 	}
 
-	if !exists {
-		return sql.ErrNoRows
-	}
-
-	if current == target {
-		return nil
-	}
-
-	return ErrNotWaiting
+	return unmoved(current, exists, target, repeatable)
 }
 
 func (p *Postgres) DeleteBefore(

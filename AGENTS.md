@@ -64,7 +64,7 @@ Do not break these without an explicit decision from the maintainer.
 
 - Every statement goes through `sqltx.From(ctx, db)`, and every multi-statement operation through `sqltx.Run`, so storages join the transaction of `sqltx.Transactor.Do`. The worker relies on it: `MarkCompleted` must commit or roll back with the handler.
 - Each storage implements the contract and the comments in forgo's `server/worker/storage.go` exactly. The table schemas are documented in forgo's REFERENCE.md ("Storage contracts").
-- Claims use `FOR UPDATE SKIP LOCKED`. Status transitions only leave `InboxWaiting`, and repeating a transition into the current state succeeds.
+- Claims use `FOR UPDATE SKIP LOCKED`. Status transitions only leave `InboxWaiting`. Repeating `MarkFailed` or `MarkRejected` succeeds, but `MarkCompleted` must succeed only when it moved the row itself (`unmoved` in `provider/inbox/inbox.go`): it runs in the handler's transaction, and a success for a concurrent duplicate would commit the handler's writes twice.
 - Each dialect lives in its own file. Placeholders differ (`$n` and `?`): keep the helpers local to the file that uses them.
 
 ### Redis

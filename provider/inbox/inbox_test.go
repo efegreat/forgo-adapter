@@ -120,10 +120,12 @@ func TestMarkStatus(t *testing.T) {
 		name   string
 		target worker.InboxStatus
 		mark   func(worker.InboxStorage, context.Context) error
+		// repeatErr is the result of moving a message into the status it already has.
+		repeatErr error
 	}{
-		{"completed", worker.InboxCompleted, func(s worker.InboxStorage, ctx context.Context) error { return s.MarkCompleted(ctx, msgID, sub) }},
-		{"failed", worker.InboxFailed, func(s worker.InboxStorage, ctx context.Context) error { return s.MarkFailed(ctx, msgID, sub) }},
-		{"rejected", worker.InboxRejected, func(s worker.InboxStorage, ctx context.Context) error { return s.MarkRejected(ctx, msgID, sub) }},
+		{"completed", worker.InboxCompleted, func(s worker.InboxStorage, ctx context.Context) error { return s.MarkCompleted(ctx, msgID, sub) }, ErrNotWaiting},
+		{"failed", worker.InboxFailed, func(s worker.InboxStorage, ctx context.Context) error { return s.MarkFailed(ctx, msgID, sub) }, nil},
+		{"rejected", worker.InboxRejected, func(s worker.InboxStorage, ctx context.Context) error { return s.MarkRejected(ctx, msgID, sub) }, nil},
 	}
 	cases := []struct {
 		name  string
@@ -134,7 +136,7 @@ func TestMarkStatus(t *testing.T) {
 	}{
 		{name: "moves a waiting message", moved: true},
 		{
-			name:  "repeating the transition succeeds",
+			name:  "already in the target status",
 			found: func(target worker.InboxStatus) []worker.InboxStatus { return []worker.InboxStatus{target} },
 		},
 		{
@@ -164,9 +166,13 @@ func TestMarkStatus(t *testing.T) {
 						mock.ExpectQuery(selectStatus).WithArgs(msgID, sub).WillReturnRows(statusRows(c.found(m.target)...))
 					}
 
+					wantErr := c.wantErr
+					if c.name == "already in the target status" {
+						wantErr = m.repeatErr
+					}
 					err := m.mark(d.storage(db), context.Background())
-					if !errors.Is(err, c.wantErr) || (c.wantErr == nil && err != nil) {
-						t.Fatalf("err = %v, want %v", err, c.wantErr)
+					if !errors.Is(err, wantErr) || (wantErr == nil && err != nil) {
+						t.Fatalf("err = %v, want %v", err, wantErr)
 					}
 				})
 			}
@@ -208,6 +214,34 @@ func TestMarkCompletedJoinsTheHandlerTransaction(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestMarkCompletedRollsBackADuplicateDelivery(t *testing.T) {
+	// Two deliveries of one message ran at once and the other one completed it first: this
+	// transaction must not commit its handler's writes a second time.
+	for _, d := range dialects {
+		t.Run(d.name, func(t *testing.T) {
+			db, mock := newMock(t)
+			mock.ExpectBegin()
+			mock.ExpectExec(`INSERT INTO invoices`).WillReturnResult(sqlmock.NewResult(1, 1))
+			d.expectMark(mock, worker.InboxCompleted, false)
+			mock.ExpectQuery(selectStatus).WillReturnRows(statusRows(worker.InboxCompleted))
+			mock.ExpectRollback()
+
+			s := d.storage(db)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := sqltx.NewTransactor(db).Do(ctx, func(ctx context.Context) error {
+				if _, err := sqltx.From(ctx, db).ExecContext(ctx, "INSERT INTO invoices VALUES (1)"); err != nil {
+					return err
+				}
+				return s.MarkCompleted(ctx, msgID, sub)
+			})
+			if !errors.Is(err, ErrNotWaiting) || !strings.Contains(err.Error(), "another delivery completed it first") {
+				t.Fatalf("Do = %v, want the duplicate's MarkCompleted to fail", err)
+			}
+		})
 	}
 }
 

@@ -340,7 +340,7 @@ func (r *OrderRepository) Insert(ctx context.Context, o order.Order) error {
 
 **Nesting.** A `Run` or `Do` inside another on the same database joins the outer transaction instead of starting one, and the outermost call commits or rolls back everything. Transactions are keyed by `*sql.DB`, so contexts can carry transactions on several databases at once, and `From` never hands one database's transaction to another.
 
-**In the worker.** For each message, the consumer runs your handler and the inbox's `MarkCompleted` inside `Transactor.Do`. With `sqltx` and the SQL inbox, your writes and the completion commit together. A handler that fails rolls back both, and the message is retried. A crash after the commit leads to a redelivery that the inbox skips.
+**In the worker.** For each message, the consumer runs your handler and the inbox's `MarkCompleted` inside `Transactor.Do`. With `sqltx` and the SQL inbox, your writes and the completion commit together. A handler that fails rolls back both, and the message is retried. A crash after the commit leads to a redelivery that the inbox skips. A concurrent duplicate of the message rolls back, because `MarkCompleted` fails for the delivery that completes second.
 
 **In your services.** Write outbox rows with `sqltx.From` inside the same `Do` as the business change, as in forgo's [producer example](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#producer-outbox-relay). The row is then published only if the change commits.
 
@@ -367,7 +367,7 @@ forgo.WithProviders(
 | `outbox.NewPostgres(*sql.DB)` | PostgreSQL | Claims with `FOR UPDATE SKIP LOCKED` and stamps `processing_at` with the database clock. |
 | `outbox.NewMysql(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED` and stamps `processing_at` with the application clock. |
 
-Status changes are idempotent. Moving a message into the state it is already in succeeds. Moving it out of a terminal state fails with `inbox.ErrNotWaiting`. Several producer instances can run against one outbox, because a claim skips the rows another claim has locked.
+A message only leaves *waiting*. Moving it out of another terminal state fails with `inbox.ErrNotWaiting`. Repeating `MarkFailed` or `MarkRejected` on a message already in that state succeeds. `MarkCompleted` is strict: it succeeds only when it moves the message out of *waiting* itself. When two deliveries of one message run at once, for example after a channel was lost while a handler ran, the one that completes second fails with `inbox.ErrNotWaiting`. Its transaction then rolls back its handler's writes instead of committing them a second time, and its redelivery is skipped as completed. Several producer instances can run against one outbox, because a claim skips the rows another claim has locked.
 
 Every statement runs through `sqltx.From`, so a storage called inside `sqltx.Transactor.Do` joins that transaction. The operations that need several statements (MySQL `IncrementAttempt`, both `Claim`s and `Complete`s) run in `sqltx.Run`, which starts a transaction of their own or joins the caller's.
 
