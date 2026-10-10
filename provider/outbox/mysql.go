@@ -23,6 +23,9 @@ func NewMysql(db *sql.DB) *Mysql {
 	return &Mysql{db: db}
 }
 
+// Claim selects the messages and stamps them in one transaction. Claims are stamped and expired on
+// the database clock (see claimAge), in UTC so that neither the session time zone nor its daylight
+// saving changes move them.
 func (m *Mysql) Claim(
 	ctx context.Context,
 	claim worker.Claim,
@@ -47,13 +50,13 @@ func (m *Mysql) Claim(
 			WHERE processed_at IS NULL
 			  AND (
 				  processing_at IS NULL
-				  OR processing_at < ?
+				  OR processing_at < UTC_TIMESTAMP(6) - INTERVAL ? MICROSECOND
 			  )
 			ORDER BY id
 			LIMIT ?
 			FOR UPDATE SKIP LOCKED
 			`,
-			claim.ExpiredBefore,
+			claimAge(claim).Microseconds(),
 			claim.Limit,
 		)
 		if err != nil {
@@ -68,13 +71,9 @@ func (m *Mysql) Claim(
 			return err
 		}
 
-		args := make([]any, 0, len(messages)+2)
+		args := make([]any, 0, len(messages)+1)
 
-		args = append(
-			args,
-			claim.ID,
-			time.Now().UTC(),
-		)
+		args = append(args, claim.ID)
 
 		for i := range messages {
 			args = append(args, messages[i].ID)
@@ -86,7 +85,7 @@ func (m *Mysql) Claim(
 			UPDATE outbox_events
 			SET
 				processing_id = ?,
-				processing_at = ?
+				processing_at = UTC_TIMESTAMP(6)
 			WHERE processed_at IS NULL
 			  AND id IN (`+placeholders(len(messages))+`)
 			`,

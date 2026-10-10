@@ -404,8 +404,10 @@ forgo.WithProviders(
 | --- | --- | --- |
 | `inbox.NewPostgres(*sql.DB)` | PostgreSQL | `INSERT … ON CONFLICT` increments attempts in one statement. |
 | `inbox.NewMysql(*sql.DB)` | MySQL 8 | Locks the row with `SELECT … FOR UPDATE`. Timestamps are `CURRENT_TIMESTAMP(6)`, so use `DATETIME(6)` columns. |
-| `outbox.NewPostgres(*sql.DB)` | PostgreSQL | Claims with `FOR UPDATE SKIP LOCKED` and stamps `processing_at` with the database clock. |
-| `outbox.NewMysql(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED` and stamps `processing_at` with the application clock. |
+| `outbox.NewPostgres(*sql.DB)` | PostgreSQL | Claims with `FOR UPDATE SKIP LOCKED`. Stamps and expires claims with `CURRENT_TIMESTAMP`. |
+| `outbox.NewMysql(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED`. Stamps and expires claims with `UTC_TIMESTAMP(6)`, so `processing_at` holds UTC, unaffected by the session time zone. |
+
+Both outboxes time claims on the database clock alone: a claim expires once its `processing_at` is `ClaimTTL` older than the database's current time. Clock skew between producer instances, or between them and the database, does not change `ClaimTTL`.
 
 A message only leaves *waiting*. Moving it out of another terminal state fails with `inbox.ErrNotWaiting`. Repeating `MarkFailed` or `MarkRejected` on a message already in that state succeeds. `MarkCompleted` is strict: it succeeds only when it moves the message out of *waiting* itself. When two deliveries of one message run at once, for example after a channel was lost while a handler ran, the one that completes second fails with `inbox.ErrNotWaiting`. Its transaction then rolls back its handler's writes instead of committing them a second time, and its redelivery is skipped as completed. Several producer instances can run against one outbox, because a claim skips the rows another claim has locked.
 

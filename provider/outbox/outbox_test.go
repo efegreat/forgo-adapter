@@ -3,6 +3,7 @@ package outbox
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"strings"
 	"testing"
@@ -22,8 +23,41 @@ var (
 
 var (
 	created = time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
-	claim   = worker.Claim{ID: "claim-1", ExpiredBefore: created.Add(-time.Minute), Limit: 50}
+	claim   = worker.Claim{ID: "claim-1", Limit: 50}
 )
+
+// claimFor returns claim as the producer builds it for ttl, on the application clock.
+func claimFor(ttl time.Duration) worker.Claim {
+	c := claim
+	c.ExpiredBefore = time.Now().Add(-ttl)
+	return c
+}
+
+// argFunc adapts a function to sqlmock.Argument.
+type argFunc func(driver.Value) bool
+
+func (f argFunc) Match(v driver.Value) bool { return f(v) }
+
+// aged reports whether a claim age is want, allowing for the time the test took to reach the query.
+func aged(age, want time.Duration) bool {
+	return age >= want && age < want+5*time.Second
+}
+
+// secondsAge matches the claim age PostgreSQL takes, in seconds.
+func secondsAge(want time.Duration) argFunc {
+	return func(v driver.Value) bool {
+		s, ok := v.(float64)
+		return ok && aged(time.Duration(s*float64(time.Second)), want)
+	}
+}
+
+// microsecondsAge matches the claim age MySQL takes, in microseconds.
+func microsecondsAge(want time.Duration) argFunc {
+	return func(v driver.Value) bool {
+		us, ok := v.(int64)
+		return ok && aged(time.Duration(us)*time.Microsecond, want)
+	}
+}
 
 var messageColumns = []string{"id", "name", "payload", "headers", "created_at", "message_key", "destination"}
 
@@ -73,19 +107,22 @@ func assertClaimed(t *testing.T, got []worker.Message) {
 }
 
 const (
-	pgClaim    = `WITH claimed AS .+FOR UPDATE SKIP LOCKED.+UPDATE outbox_events AS o.+RETURNING`
-	mysqlClaim = `SELECT\s+id,.+FROM outbox_events.+FOR UPDATE SKIP LOCKED`
-	mysqlMark  = `UPDATE outbox_events\s+SET\s+processing_id = \?,\s+processing_at = \?\s+WHERE processed_at IS NULL\s+AND id IN \(\?,\?\)`
+	// Claims are stamped and expired on the database clock: the queries compare processing_at with
+	// the database's time minus the claim age, never with a time from the application.
+	pgClaim = `WITH claimed AS .+processing_at < CURRENT_TIMESTAMP - make_interval\(secs => \$1\).+` +
+		`FOR UPDATE SKIP LOCKED.+UPDATE outbox_events AS o\s+SET\s+processing_id = \$3,\s+processing_at = CURRENT_TIMESTAMP\s+.+RETURNING`
+	mysqlClaim = `SELECT\s+id,.+FROM outbox_events.+processing_at < UTC_TIMESTAMP\(6\) - INTERVAL \? MICROSECOND.+FOR UPDATE SKIP LOCKED`
+	mysqlMark  = `UPDATE outbox_events\s+SET\s+processing_id = \?,\s+processing_at = UTC_TIMESTAMP\(6\)\s+WHERE processed_at IS NULL\s+AND id IN \(\?,\?\)`
 	release    = `UPDATE outbox_events\s+SET\s+processing_id = NULL,\s+processing_at = NULL\s+WHERE processing_id = (\$1|\?)`
 )
 
 func TestPostgresClaim(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
-	mock.ExpectQuery(pgClaim).WithArgs(claim.ExpiredBefore, claim.Limit, claim.ID).WillReturnRows(claimedRows())
+	mock.ExpectQuery(pgClaim).WithArgs(secondsAge(time.Minute), claim.Limit, claim.ID).WillReturnRows(claimedRows())
 	mock.ExpectCommit()
 
-	got, err := NewPostgres(db).Claim(context.Background(), claim)
+	got, err := NewPostgres(db).Claim(context.Background(), claimFor(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,11 +132,11 @@ func TestPostgresClaim(t *testing.T) {
 func TestMysqlClaim(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
-	mock.ExpectQuery(mysqlClaim).WithArgs(claim.ExpiredBefore, claim.Limit).WillReturnRows(claimedRows())
-	mock.ExpectExec(mysqlMark).WithArgs(claim.ID, sqlmock.AnyArg(), "m1", "m2").WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectQuery(mysqlClaim).WithArgs(microsecondsAge(time.Minute), claim.Limit).WillReturnRows(claimedRows())
+	mock.ExpectExec(mysqlMark).WithArgs(claim.ID, "m1", "m2").WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
 
-	got, err := NewMysql(db).Claim(context.Background(), claim)
+	got, err := NewMysql(db).Claim(context.Background(), claimFor(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
