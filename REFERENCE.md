@@ -236,7 +236,7 @@ A `worker.Message` is published to the exchange `Message.Destination` with the r
 | `timestamp` property, `x-msg-timestamp` header (Unix nanoseconds) | `Message.CreatedAt`, when set |
 | headers | `Message.Headers` |
 
-Consuming reverses the mapping with `worker.NewMessageFromDelivery`: `Key` is the routing key and `Destination` the exchange the message was published to. Messages from other producers keep their identity when they set the `message_id` and `type` properties instead of the `x-msg-*` headers. Without either, the ID is generated on every delivery, so the consumer inbox cannot recognize a redelivery. Only string header values are kept.
+Consuming reverses the mapping with `worker.NewMessageFromDelivery`: `Key` is the routing key and `Destination` the exchange the message was published to. Messages from other producers keep their identity when they set the `message_id` and `type` properties instead of the `x-msg-*` headers. Without either, the ID is generated on every delivery, so the consumer inbox cannot recognize a redelivery. Header values that are not strings are converted, so no header is lost: numbers and booleans take their text form (`2`, `true`), decimals their decimal notation, timestamps RFC 3339 in UTC, byte arrays their bytes and void an empty string. Tables and arrays, such as the `x-death` header RabbitMQ adds to dead-lettered and retried messages, are encoded as JSON, for example `[{"count":1,"queue":"orders.retry.1s","reason":"expired",…}]`. Retry copies keep the original AMQP values.
 
 The worker acknowledges each delivery:
 
