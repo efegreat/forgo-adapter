@@ -174,6 +174,75 @@ func TestRecoveryHooks(t *testing.T) {
 	}
 }
 
+// reported tells whether a loss was reported, without waiting.
+func reported(l *consumerLoss) bool {
+	select {
+	case <-l.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestRecoveryReportsLostConsumer(t *testing.T) {
+	b := &Broker{consumers: make(map[string]*consumerLoss)}
+	hooks := &recoveryHooks{broker: b}
+	tag, lost := b.addConsumer("billing")
+	otherTag, other := b.addConsumer("billing")
+	if tag == otherTag {
+		t.Fatalf("two subscribers share the consumer tag %q", tag)
+	}
+
+	refused := &amqp.Error{Code: amqp.AccessRefused, Reason: "queue 'billing' in exclusive use"}
+	skipped := []amqp.TopologyRecoveryEntity{
+		// Only consumers are matched by tag: a queue may have any name.
+		{EntityType: amqp.TopologyEntityQueue, EntityName: tag, Err: refused},
+		{EntityType: amqp.TopologyEntityConsumer, EntityName: "ctag-elsewhere-1", Err: refused},
+	}
+	for _, e := range skipped {
+		if !hooks.OnTopologyEntityError(nil, e) {
+			t.Fatalf("%v aborted the recovery", e)
+		}
+	}
+	if reported(lost) || reported(other) {
+		t.Fatal("a subscriber was told about another entity")
+	}
+
+	if !hooks.OnTopologyEntityError(nil, amqp.TopologyRecoveryEntity{EntityType: amqp.TopologyEntityConsumer, EntityName: tag, Err: refused}) {
+		t.Fatal("a lost consumer aborted the recovery of the rest of the topology")
+	}
+	if !reported(lost) || !errors.Is(lost.err, errConsumerLost) || !errors.Is(lost.err, refused) || !strings.Contains(lost.err.Error(), tag) {
+		t.Fatalf("lost consumer: reported %v, err %v", reported(lost), lost.err)
+	}
+	if reported(other) {
+		t.Fatal("another subscriber was told its consumer was lost")
+	}
+
+	// A later recovery that fails again keeps the first error.
+	hooks.OnTopologyEntityError(nil, amqp.TopologyRecoveryEntity{EntityType: amqp.TopologyEntityConsumer, EntityName: tag, Err: amqp.ErrClosed})
+	if errors.Is(lost.err, amqp.ErrClosed) {
+		t.Fatalf("second report replaced the first: %v", lost.err)
+	}
+
+	b.removeConsumer(otherTag)
+	hooks.OnTopologyEntityError(nil, amqp.TopologyRecoveryEntity{EntityType: amqp.TopologyEntityConsumer, EntityName: otherTag, Err: refused})
+	if reported(other) {
+		t.Fatal("a closed subscriber was told its consumer was lost")
+	}
+}
+
+func TestConsumerTag(t *testing.T) {
+	if got := consumerTag("billing", 3); got != "forgo-billing-3" {
+		t.Fatalf("consumerTag = %q", got)
+	}
+	if got := consumerTag(strings.Repeat("n", 250), 3); got != "forgo-3" {
+		t.Fatalf("consumerTag of a long name = %q, want forgo-3", got)
+	}
+	if got := consumerTag(strings.Repeat("n", 247), 3); len(got) != maxConsumerTag {
+		t.Fatalf("consumerTag at the limit = %d bytes, want %d", len(got), maxConsumerTag)
+	}
+}
+
 func TestRecoveryConfig(t *testing.T) {
 	got := Config{}.Sanitize().Recovery
 	if got.MaxRetries != math.MaxInt || got.RetryInterval != 5*time.Second || got.Disabled {
@@ -183,7 +252,8 @@ func TestRecoveryConfig(t *testing.T) {
 	hooks := &recoveryHooks{}
 	r := RecoveryConfig{MaxRetries: 3, RetryInterval: time.Second}.Sanitize().amqpRecovery(hooks)
 	if r == nil || r.ReconnectionConfig.MaxRetryCount != 3 || r.ReconnectionConfig.RetryInterval != time.Second ||
-		r.ConnectionRecovery != hooks || r.TopologyRecovery == nil || r.TopologyRecoveryMode != amqp.TopologyRecoveryAllEnabled {
+		r.ConnectionRecovery != hooks || r.TopologyRecovery == nil || r.TopologyRecoveryMode != amqp.TopologyRecoveryAllEnabled ||
+		r.OnTopologyEntityError == nil {
 		t.Fatalf("amqpRecovery = %+v", r)
 	}
 

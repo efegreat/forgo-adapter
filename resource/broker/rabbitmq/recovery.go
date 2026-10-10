@@ -2,14 +2,20 @@ package rabbitmq
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// errStaleDelivery is returned when a delivery is settled after the channel that delivered it was
-// lost. The broker requeued the message when the channel closed and delivers it again.
-var errStaleDelivery = errors.New("rabbitmq: delivery belongs to a lost channel; the broker redelivers it")
+var (
+	// errStaleDelivery is returned when a delivery is settled after the channel that delivered it
+	// was lost. The broker requeued the message when the channel closed and delivers it again.
+	errStaleDelivery = errors.New("rabbitmq: delivery belongs to a lost channel; the broker redelivers it")
+	// errConsumerLost is returned by Consume when the recovery could not re-subscribe the
+	// subscriber's consumer. Its channel is open again but delivers nothing.
+	errConsumerLost = errors.New("rabbitmq: recovery could not re-subscribe the consumer")
+)
 
 // ackGuard keeps acknowledgements of deliveries from a lost channel off its recovered successor.
 //
@@ -46,6 +52,25 @@ func (g *ackGuard) settle(gen uint64, ack func() error) error {
 	return ack()
 }
 
+// consumerLoss hands the first failure to re-subscribe a subscriber's consumer to its Consume.
+type consumerLoss struct {
+	once sync.Once
+	done chan struct{}
+	err  error
+}
+
+func newConsumerLoss() *consumerLoss {
+	return &consumerLoss{done: make(chan struct{})}
+}
+
+// report records err and closes done. Later reports are ignored.
+func (l *consumerLoss) report(err error) {
+	l.once.Do(func() {
+		l.err = fmt.Errorf("%w: %w", errConsumerLost, err)
+		close(l.done)
+	})
+}
+
 // recoveryHooks wraps the client's connection recovery. It runs on the client's close watchers,
 // after the lost channel is closed and before next reopens it.
 type recoveryHooks struct {
@@ -71,8 +96,22 @@ func (h *recoveryHooks) OnChannelClose(ch *amqp.Channel, err *amqp.Error) {
 	h.next.OnChannelClose(ch, err)
 }
 
+// OnTopologyEntityError skips an entity the recovery fails to restore, as the client does by
+// default, so the rest of the topology still recovers. Aborting instead would make the client
+// reconnect again and again while every publisher and subscriber waits, without end when the
+// failure is permanent, such as a deleted queue.
+//
+// A skipped consumer leaves its delivery channel open with nothing behind it, so its subscriber
+// is told, and its Consume fails instead of waiting forever.
+func (h *recoveryHooks) OnTopologyEntityError(_ *amqp.Connection, e amqp.TopologyRecoveryEntity) bool {
+	if e.EntityType == amqp.TopologyEntityConsumer {
+		h.broker.consumerLost(e.EntityName, e)
+	}
+	return true
+}
+
 // amqpRecovery returns the client recovery configuration, or nil when recovery is disabled.
-func (r RecoveryConfig) amqpRecovery(hooks amqp.ConnectionRecovery) *amqp.Recovery {
+func (r RecoveryConfig) amqpRecovery(hooks *recoveryHooks) *amqp.Recovery {
 	if r.Disabled {
 		return nil
 	}
@@ -81,7 +120,8 @@ func (r RecoveryConfig) amqpRecovery(hooks amqp.ConnectionRecovery) *amqp.Recove
 			MaxRetryCount: r.MaxRetries,
 			RetryInterval: r.RetryInterval,
 		},
-		ConnectionRecovery: hooks,
-		TopologyRecovery:   &amqp.DefaultTopologyRecovery{},
+		ConnectionRecovery:    hooks,
+		TopologyRecovery:      &amqp.DefaultTopologyRecovery{},
+		OnTopologyEntityError: hooks.OnTopologyEntityError,
 	}
 }
