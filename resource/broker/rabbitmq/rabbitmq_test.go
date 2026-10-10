@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -308,10 +309,86 @@ func TestNewDeliveryFallsBackToProperties(t *testing.T) {
 	if got.ID != "external-id" || got.Name != "invoice.paid" {
 		t.Fatalf("message = %+v, want ID and name from the AMQP properties", got)
 	}
-	if _, ok := got.Headers.Get("retries"); ok {
-		t.Fatal("non-string header kept")
+	if v, _ := got.Headers.Get("retries"); v != "2" {
+		t.Fatalf("retries header = %q, want the integer as text", v)
 	}
 	if v, _ := got.Headers.Get("source"); v != "erp" {
 		t.Fatalf("source header = %q", v)
+	}
+}
+
+func TestNewDeliveryConvertsHeaderValues(t *testing.T) {
+	created := time.Unix(1_700_000_000, 5)
+	got := NewDelivery(amqp.Delivery{
+		MessageId: "property-id",
+		Headers: amqp.Table{
+			worker.MessageIDHeader:        int64(42),
+			worker.MessageTimestampHeader: created.UnixNano(),
+			"x-death": []any{amqp.Table{
+				"count":        int64(2),
+				"queue":        "orders.retry.1s",
+				"reason":       "expired",
+				"routing-keys": []any{"orders"},
+				"time":         time.Unix(1_700_000_000, 0),
+			}},
+		},
+	}).Message()
+
+	if got.ID != "42" || !got.CreatedAt.Equal(created) {
+		t.Fatalf("message = %+v, want the identity from the converted headers", got)
+	}
+	want := `[{"count":2,"queue":"orders.retry.1s","reason":"expired","routing-keys":["orders"],"time":"2023-11-14T22:13:20Z"}]`
+	if v, _ := got.Headers.Get("x-death"); v != want {
+		t.Fatalf("x-death header = %s, want %s", v, want)
+	}
+}
+
+func TestHeaderValue(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{"string", "erp", "erp"},
+		{"byte array", []byte("raw"), "raw"},
+		{"void", nil, ""},
+		{"bool", true, "true"},
+		{"int8", int8(-8), "-8"},
+		{"int16", int16(-16), "-16"},
+		{"int32", int32(-32), "-32"},
+		{"int64", int64(-64), "-64"},
+		{"uint8", uint8(8), "8"},
+		{"uint16", uint16(16), "16"},
+		{"uint32", uint32(32), "32"},
+		{"float32", float32(0.1), "0.1"},
+		{"float64", 2.5, "2.5"},
+		{"large float", 1e21, "1e+21"},
+		{"NaN", math.NaN(), "NaN"},
+		{"decimal", amqp.Decimal{Scale: 2, Value: 12345}, "123.45"},
+		{"small decimal", amqp.Decimal{Scale: 3, Value: 5}, "0.005"},
+		{"negative decimal", amqp.Decimal{Scale: 1, Value: -5}, "-0.5"},
+		{"negative decimal with an integer part", amqp.Decimal{Scale: 2, Value: -12345}, "-123.45"},
+		{"zero decimal", amqp.Decimal{Scale: 2}, "0.00"},
+		{"unscaled decimal", amqp.Decimal{Value: 7}, "7"},
+		{"timestamp", time.Date(2026, 10, 10, 13, 0, 0, 0, time.FixedZone("TRT", 3*60*60)), "2026-10-10T10:00:00Z"},
+		{"empty table", amqp.Table{}, "{}"},
+		{"empty array", []any{}, "[]"},
+		{
+			"table",
+			amqp.Table{
+				"b": true, "n": nil, "i": int32(1), "u": uint8(2), "go int": 3, "f": float32(0.1),
+				"d": amqp.Decimal{Scale: 1, Value: 15}, "s": `say "hi"`, "x": []byte("raw"),
+				"inf": math.Inf(-1), "t": time.Unix(0, 0), "nested": amqp.Table{"a": []any{int64(1), "two"}},
+			},
+			`{"b":true,"d":1.5,"f":0.1,"go int":3,"i":1,"inf":"-Inf","n":null,"nested":{"a":[1,"two"]},"s":"say \"hi\"","t":"1970-01-01T00:00:00Z","u":2,"x":"raw"}`,
+		},
+		{"unknown type", uint64(64), "64"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := headerValue(tt.value); got != tt.want {
+				t.Fatalf("headerValue(%#v) = %s, want %s", tt.value, got, tt.want)
+			}
+		})
 	}
 }

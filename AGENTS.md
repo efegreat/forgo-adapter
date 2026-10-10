@@ -25,7 +25,7 @@ forgo's four goals carry over:
 | --- | --- |
 | `resource/sqldb/` | `Config` → `*sql.DB`. Applies pool limits, pings with `ConnectTimeout`, closes the pool if the ping fails. |
 | `resource/redisdb/` | `Config` → `*redis.Client`. Pings with `ConnectTimeout`, closes the client if the ping fails. |
-| `resource/broker/rabbitmq/` | `Config` → `worker.IBroker`. `config.go`: config, `Sanitize`, `validate`, `RecoveryConfig`, `DeadLetterConfig`, queue args. `broker.go`: connection, owned channels, `declare` (topology through the `declarer` interface), publisher and subscriber factories. `recovery.go`: `ackGuard`, `consumerLoss` and the `recoveryHooks` around the client's connection and topology recovery. `publisher.go`: confirm-mode publishing, mandatory returns, `Message` → `amqp.Publishing` with identity headers. `subscriber.go`: prefetch, `Consume` over a `process.ConcurrentRunner`. `delivery.go`: `amqp.Delivery` → `worker.IDelivery` with guarded acknowledgements. |
+| `resource/broker/rabbitmq/` | `Config` → `worker.IBroker`. `config.go`: config, `Sanitize`, `validate`, `RecoveryConfig`, `DeadLetterConfig`, queue args. `broker.go`: connection, owned channels, `declare` (topology through the `declarer` interface), publisher and subscriber factories. `recovery.go`: `ackGuard`, `consumerLoss` and the `recoveryHooks` around the client's connection and topology recovery. `publisher.go`: confirm-mode publishing, mandatory returns, `Message` → `amqp.Publishing` with identity headers. `subscriber.go`: prefetch, `Consume` over a `process.ConcurrentRunner`. `delivery.go`: `amqp.Delivery` → `worker.IDelivery` with guarded acknowledgements, and AMQP header values → strings (`headerValue`). |
 | `provider/sqltx/` | `operation.Transactor` on `*sql.DB`. `Run`, `From`, `Executor`: transactions carried in the context, keyed by database. |
 | `provider/inbox/` | `worker.InboxStorage` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`). `ErrNotWaiting`. |
 | `provider/outbox/` | `worker.OutboxStorage` for PostgreSQL and MySQL 8. `outbox.go`: the shared row scan. |
@@ -52,6 +52,7 @@ Do not break these without an explicit decision from the maintainer.
 ### RabbitMQ
 
 - Published messages carry `worker.MessageIDHeader`, `MessageNameHeader` and `MessageTimestampHeader`, written from the `Message` fields over any user header of the same name. The consumer inbox depends on a stable ID across redeliveries.
+- `NewDelivery` keeps every header. `headerValue` converts values that are not strings to text, and tables and arrays to JSON, because `Message.Headers` holds strings only. Retry copies are built from the raw `amqp.Delivery` headers, never from `Message.Headers`, so they keep the AMQP types.
 - `Delivery`: `Complete` = ack, `Retry` = nack with requeue, `Reject` = reject without requeue. The dead-letter feature relies on `Reject` never requeueing. When the queue has `Retry`, `Retry` instead publishes a confirmed copy to the retry queue for its attempt and then acks through the `ackGuard`. It checks staleness before publishing, so a stale delivery is not duplicated, and it falls back to nack with requeue when the publish fails, so the message is never held or lost. The retry publisher is behind the `confirmedPublisher` interface for tests.
 - `declare` declares a queue's retry queues **after** the queue. They are durable, and dead-letter through the default exchange (`x-dead-letter-exchange: ""`) with the queue's name as routing key, so an expired retry returns to that queue only. Their names derive from the delays, so changing `Retry` declares new ones and never redeclares an existing queue with other arguments.
 - `declare` declares a queue's dead-letter exchange and queue **before** the queue. Dead-letter exchanges are durable direct exchanges and dead-letter queues are durable. Conflicts between `DeadLetter` and `x-dead-letter-*` in `Args` are rejected in `validate`.
@@ -122,5 +123,4 @@ When you change behavior:
 When you find one, verify it against the code and add it here with a `file:line` reference. Delete it in the change that fixes it.
 
 - The RabbitMQ adapter is tested against fakes of the client only. Recovery, confirms and dead-lettering have not run against a live broker in this repository's tests.
-- Non-string AMQP header values are dropped on consume (`resource/broker/rabbitmq/delivery.go:26`).
 - The PostgreSQL outbox stamps `processing_at` with the database clock but compares it with `ExpiredBefore` from the application clock, so clock skew shifts `ClaimTTL` (`provider/outbox/postgres.go:54`).
