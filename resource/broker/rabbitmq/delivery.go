@@ -15,6 +15,8 @@ type Delivery struct {
 	// guard and gen drop acknowledgements once the channel that delivered the message was lost.
 	guard *ackGuard
 	gen   uint64
+	// retry delays retries through the retry queues of the delivery's queue. Nil requeues at once.
+	retry *retrier
 }
 
 // NewDelivery wraps an AMQP delivery. Only string headers are kept. Messages published without
@@ -40,11 +42,13 @@ func NewDelivery(delivery amqp.Delivery) *Delivery {
 	}
 }
 
-// newDelivery is NewDelivery for a subscriber channel guarded against recovery.
-func newDelivery(delivery amqp.Delivery, guard *ackGuard) *Delivery {
+// newDelivery is NewDelivery for a subscriber channel guarded against recovery, whose queue has the
+// retry queues of retry, if any.
+func newDelivery(delivery amqp.Delivery, guard *ackGuard, retry *retrier) *Delivery {
 	d := NewDelivery(delivery)
 	d.guard = guard
 	d.gen = guard.generation()
+	d.retry = retry
 	return d
 }
 
@@ -56,14 +60,28 @@ func (d *Delivery) Complete(context.Context) error {
 	return d.settle(func() error { return d.delivery.Ack(false) })
 }
 
-// Retry requeues the message.
-func (d *Delivery) Retry(context.Context) error {
+// Retry redelivers the message after the delay of the retry queue for attempt when its queue has
+// Retry, and at once otherwise.
+func (d *Delivery) Retry(ctx context.Context, attempt int) error {
+	if d.retry == nil {
+		return d.requeue()
+	}
+	return d.retry.retry(ctx, d, attempt)
+}
+
+// requeue returns the message to its queue, which redelivers it at once.
+func (d *Delivery) requeue() error {
 	return d.settle(func() error { return d.delivery.Nack(false, true) })
 }
 
 // Reject discards the message, or dead-letters it when its queue has DeadLetter enabled.
 func (d *Delivery) Reject(context.Context) error {
 	return d.settle(func() error { return d.delivery.Reject(false) })
+}
+
+// stale reports whether the channel that delivered the message was lost since it arrived.
+func (d *Delivery) stale() bool {
+	return d.guard != nil && d.guard.generation() != d.gen
 }
 
 // settle sends an acknowledgement unless the delivery's channel was lost since it arrived.

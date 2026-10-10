@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"time"
 
@@ -18,12 +19,20 @@ const (
 
 	deadLetterExchangeArg   = "x-dead-letter-exchange"
 	deadLetterRoutingKeyArg = "x-dead-letter-routing-key"
+	messageTTLArg           = "x-message-ttl"
+
+	defaultRetryMax = 10 * time.Minute
+	// maxRetryDelay is the longest x-message-ttl RabbitMQ accepts.
+	maxRetryDelay = math.MaxUint32 * time.Millisecond
 
 	defaultRetryInterval = 5 * time.Second
 	maxPrefetch          = math.MaxUint16
 )
 
-var errDeadLetterUnnamedQueue = errors.New("rabbitmq: a queue with DeadLetter enabled needs a Name")
+var (
+	errDeadLetterUnnamedQueue = errors.New("rabbitmq: a queue with DeadLetter enabled needs a Name")
+	errRetryUnnamedQueue      = errors.New("rabbitmq: a queue with Retry enabled needs a Name")
+)
 
 // Config is a RabbitMQ broker resource. Its Value is the worker.IBroker the worker servers resolve.
 //
@@ -106,6 +115,9 @@ func (c Config) validate() error {
 		}
 	}
 	for _, q := range c.Queues {
+		if err := q.Retry.validate(q.Name); err != nil {
+			return err
+		}
 		if !q.DeadLetter.Enabled {
 			continue
 		}
@@ -169,11 +181,15 @@ type QueueConfig struct {
 	// DeadLetter routes the messages this queue dead-letters to a dead-letter queue instead of
 	// dropping them. Disabled by default.
 	DeadLetter DeadLetterConfig
+	// Retry delays the redelivery of the messages the worker retries. Disabled by default: a
+	// retried message is requeued and redelivered at once.
+	Retry RetryConfig
 }
 
-// Sanitize returns a copy of q with the dead-letter defaults applied.
+// Sanitize returns a copy of q with the dead-letter and retry defaults applied.
 func (q QueueConfig) Sanitize() QueueConfig {
 	q.DeadLetter = q.DeadLetter.sanitize(q.Name)
+	q.Retry = q.Retry.sanitize()
 	return q
 }
 
@@ -197,8 +213,8 @@ func (q QueueConfig) args() amqp.Table {
 //
 // RabbitMQ dead-letters the messages the worker rejects: messages whose attempts reached
 // MaxAttempt, messages that cannot be bound and messages no handler is registered for. Messages
-// that expire or overflow the queue are dead-lettered as well. Retried messages are requeued, not
-// dead-lettered.
+// that expire or overflow the queue are dead-lettered as well. Retried messages are not
+// dead-lettered: they are requeued, or go through the retry queues of Retry.
 //
 // The exchange is a durable direct exchange and the queue is durable, so dead letters survive a
 // broker restart.
@@ -230,6 +246,94 @@ func (d DeadLetterConfig) sanitize(queue string) DeadLetterConfig {
 		d.RoutingKey = queue
 	}
 	return d
+}
+
+// RetryConfig declares retry queues that delay the redelivery of the messages the worker retries,
+// without plugins.
+//
+// The delay doubles with every failed attempt, from Initial up to Max. Each delay has its own
+// durable queue, "<queue>.retry.<delay>" (such as orders.retry.2s), whose x-message-ttl is the
+// delay and which dead-letters expired messages back to the queue through the default exchange,
+// so no other queue bound to the original exchange receives them again. To retry, the subscriber
+// publishes a copy of the delivery to the retry queue of the failed attempt, waits for the
+// broker's confirm and acknowledges the delivery. A waiting message holds no prefetch slot.
+//
+// Retried messages fall behind newer ones, and come back with the routing key of their queue.
+// Changing Initial or Max declares new retry queues; the old ones still return what they hold,
+// and can be deleted once empty.
+type RetryConfig struct {
+	// Initial is the delay after the first failed attempt, at least 1ms. Zero disables the retry
+	// queues.
+	Initial time.Duration
+	// Max is the longest delay. Default: 10 minutes, or Initial when it is longer.
+	Max time.Duration
+	// Args are the arguments of every retry queue, such as x-queue-type. RabbitMQ does not confirm
+	// its own dead-lettering, so a node failure can lose a message on its way back. Quorum retry
+	// queues with x-dead-letter-strategy: at-least-once and x-overflow: reject-publish prevent that.
+	Args map[string]any
+}
+
+func (r RetryConfig) enabled() bool {
+	return r.Initial > 0
+}
+
+func (r RetryConfig) sanitize() RetryConfig {
+	if r.enabled() && r.Max == 0 {
+		r.Max = max(defaultRetryMax, r.Initial)
+	}
+	return r
+}
+
+func (r RetryConfig) validate(queue string) error {
+	if r.Initial < 0 || r.Max < 0 {
+		return fmt.Errorf("rabbitmq: queue %q: Retry.Initial and Retry.Max cannot be negative", queue)
+	}
+	if !r.enabled() {
+		return nil
+	}
+	switch {
+	case queue == "":
+		return errRetryUnnamedQueue
+	case r.Initial < time.Millisecond:
+		return fmt.Errorf("rabbitmq: queue %q: Retry.Initial must be at least 1ms", queue)
+	case r.Max < r.Initial:
+		return fmt.Errorf("rabbitmq: queue %q: Retry.Max cannot be shorter than Retry.Initial", queue)
+	case r.Max > maxRetryDelay:
+		return fmt.Errorf("rabbitmq: queue %q: Retry.Max cannot exceed %s", queue, maxRetryDelay)
+	}
+	for _, arg := range []string{messageTTLArg, deadLetterExchangeArg, deadLetterRoutingKeyArg} {
+		if _, ok := r.Args[arg]; ok {
+			return fmt.Errorf("rabbitmq: queue %q: Retry.Args cannot set %s, which Retry sets", queue, arg)
+		}
+	}
+	return nil
+}
+
+// retryQueue holds retried messages for delay, then returns them to its queue.
+type retryQueue struct {
+	name  string
+	delay time.Duration
+	args  amqp.Table
+}
+
+// queues returns the retry queues of queue by increasing delay, or none when Retry is disabled.
+func (r RetryConfig) queues(queue string) []retryQueue {
+	if !r.enabled() {
+		return nil
+	}
+	var queues []retryQueue
+	for delay := r.Initial; ; delay *= 2 {
+		delay = min(delay, r.Max)
+		args := make(amqp.Table, len(r.Args)+3)
+		maps.Copy(args, r.Args)
+		args[messageTTLArg] = delay.Milliseconds()
+		args[deadLetterExchangeArg] = ""
+		args[deadLetterRoutingKeyArg] = queue
+		queues = append(queues, retryQueue{name: fmt.Sprintf("%s.retry.%s", queue, delay), delay: delay, args: args})
+		if delay == r.Max {
+			return queues
+		}
+	}
 }
 
 type BindingConfig struct {

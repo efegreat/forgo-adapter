@@ -51,25 +51,23 @@ type Publisher struct {
 // Publish sends msg to the exchange msg.Destination with the routing key msg.Key and waits for
 // the broker's confirm until ctx ends.
 func (p *Publisher) Publish(ctx context.Context, msg worker.Message) error {
+	return p.publish(ctx, msg.Destination, msg.Key, publishing(msg, p.conf.DeliveryMode), msg.ID)
+}
+
+// publish sends msg, whose message ID is id, and waits for the broker's confirm until ctx ends.
+func (p *Publisher) publish(ctx context.Context, exchange, key string, msg amqp.Publishing, id string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.dropReturns()
-	dc, err := p.ch.PublishWithDeferredConfirmWithContext(
-		ctx,
-		msg.Destination,
-		msg.Key,
-		p.conf.Mandatory,
-		false,
-		publishing(msg, p.conf.DeliveryMode),
-	)
+	dc, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, p.conf.Mandatory, false, msg)
 	if err != nil {
-		return fmt.Errorf("rabbitmq: publish %s: %w", msg.ID, err)
+		return fmt.Errorf("rabbitmq: publish %s: %w", id, err)
 	}
 	if dc == nil {
-		return fmt.Errorf("%w: %s", errNotConfirming, msg.ID)
+		return fmt.Errorf("%w: %s", errNotConfirming, id)
 	}
-	return p.await(ctx, dc, msg.ID)
+	return p.await(ctx, dc, id)
 }
 
 // await waits for the confirm of the message with the given ID.

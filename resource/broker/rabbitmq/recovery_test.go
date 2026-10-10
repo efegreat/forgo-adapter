@@ -111,7 +111,7 @@ func TestDeliveryAcknowledgements(t *testing.T) {
 		want   string
 	}{
 		{name: "complete", settle: func(d *Delivery) error { return d.Complete(context.Background()) }, want: "ack 7 multiple=false"},
-		{name: "retry", settle: func(d *Delivery) error { return d.Retry(context.Background()) }, want: "nack 7 multiple=false requeue=true"},
+		{name: "retry", settle: func(d *Delivery) error { return d.Retry(context.Background(), 1) }, want: "nack 7 multiple=false requeue=true"},
 		{name: "reject", settle: func(d *Delivery) error { return d.Reject(context.Background()) }, want: "reject 7 requeue=false"},
 	}
 
@@ -120,7 +120,7 @@ func TestDeliveryAcknowledgements(t *testing.T) {
 			ack := &fakeAcknowledger{}
 			guard := &ackGuard{}
 
-			d := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard)
+			d := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, nil)
 			if err := tt.settle(d); err != nil {
 				t.Fatal(err)
 			}
@@ -128,7 +128,7 @@ func TestDeliveryAcknowledgements(t *testing.T) {
 				t.Fatalf("acknowledgements = %q, want %q", ack.calls, tt.want)
 			}
 
-			stale := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard)
+			stale := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, nil)
 			guard.invalidate()
 			if err := tt.settle(stale); !errors.Is(err, errStaleDelivery) {
 				t.Fatalf("settle after recovery = %v, want errStaleDelivery", err)

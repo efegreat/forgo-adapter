@@ -87,12 +87,43 @@ func (r *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 
 	guard := &ackGuard{}
 	r.own(ch, guard)
+	retry, err := r.newRetrier(conf.Queue)
+	if err != nil {
+		r.disown(ch)
+		return nil, errors.Join(fmt.Errorf("rabbitmq: subscriber %s: %w", name, err), ch.Close())
+	}
 	return &Subscriber{
 		conf:    conf,
 		ch:      ch,
 		guard:   guard,
+		retry:   retry,
 		release: func() { r.disown(ch) },
 	}, nil
+}
+
+// newRetrier returns the retrier of a queue that has Retry, with a publisher of its own, or nil.
+func (r *Broker) newRetrier(queue string) (*retrier, error) {
+	queues := retryQueues(r.conf, queue)
+	if len(queues) == 0 {
+		return nil, nil
+	}
+	// Mandatory: a retry queue deleted behind the broker's back fails the retry instead of losing
+	// the copy, and the delivery is requeued at once.
+	pub, err := r.newPublisher(PublisherConfig{Name: "retry", Mandatory: true, DeliveryMode: amqp.Persistent})
+	if err != nil {
+		return nil, err
+	}
+	return &retrier{pub: pub, queues: queues}, nil
+}
+
+// retryQueues returns the retry queues of the configured queue named queue, or none.
+func retryQueues(cfg Config, queue string) []retryQueue {
+	for _, q := range cfg.Queues {
+		if q.Name == queue {
+			return q.Retry.queues(q.Name)
+		}
+	}
+	return nil
 }
 
 func (r *Broker) Value() any {
@@ -191,7 +222,7 @@ type declarer interface {
 }
 
 // declare declares the exchanges, then every queue after its dead-letter exchange and queue, so a
-// queue never points at a dead-letter exchange that does not exist yet.
+// queue never points at a dead-letter exchange that does not exist yet, and before its retry queues.
 func declare(ch declarer, cfg Config) error {
 	for _, e := range cfg.Exchanges {
 		if err := ch.ExchangeDeclare(e.Name, e.Kind, e.Durable, e.AutoDelete, e.Internal, e.NoWait, e.Args); err != nil {
@@ -219,6 +250,12 @@ func declare(ch declarer, cfg Config) error {
 		for _, b := range q.Bindings {
 			if err := ch.QueueBind(q.Name, b.RoutingKey, b.Exchange, b.NoWait, b.Args); err != nil {
 				return fmt.Errorf("rabbitmq: bind queue %s to exchange %s with routing key %s: %w", q.Name, b.Exchange, b.RoutingKey, err)
+			}
+		}
+
+		for _, rq := range q.Retry.queues(q.Name) {
+			if _, err := ch.QueueDeclare(rq.name, true, false, false, false, rq.args); err != nil {
+				return fmt.Errorf("rabbitmq: declare retry queue %s: %w", rq.name, err)
 			}
 		}
 	}
