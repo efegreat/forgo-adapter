@@ -68,6 +68,7 @@ Do not break these without an explicit decision from the maintainer.
 - Every statement goes through `sqltx.From(ctx, db)`, and every multi-statement operation through `sqltx.Run`, so storages join the transaction of `sqltx.Transactor.Do`. The worker relies on it: `MarkCompleted` must commit or roll back with the handler.
 - Each storage implements the contract and the comments in forgo's `server/worker/storage.go` exactly. The table schemas are documented in forgo's REFERENCE.md ("Storage contracts").
 - Claims use `FOR UPDATE SKIP LOCKED`. Status transitions only leave `InboxWaiting`. Repeating `MarkFailed` or `MarkRejected` succeeds, but `MarkCompleted` must succeed only when it moved the row itself (`unmoved` in `provider/inbox/inbox.go`): it runs in the handler's transaction, and a success for a concurrent duplicate would commit the handler's writes twice.
+- Outbox claims are stamped and expired on the database clock only. `Claim` turns `ExpiredBefore` into an age (`claimAge` in `provider/outbox/outbox.go`) and compares `processing_at` with the database time minus that age, so skew between app instances and the database never shifts `ClaimTTL`. Never compare `processing_at` with a time from the app. MySQL uses `UTC_TIMESTAMP(6)`, because `CURRENT_TIMESTAMP` in a `DATETIME` column follows the session time zone and its daylight saving changes.
 - Each dialect lives in its own file. Placeholders differ (`$n` and `?`): keep the helpers local to the file that uses them.
 
 ### Redis
@@ -123,4 +124,3 @@ When you change behavior:
 When you find one, verify it against the code and add it here with a `file:line` reference. Delete it in the change that fixes it.
 
 - The RabbitMQ adapter is tested against fakes of the client only. Recovery, confirms and dead-lettering have not run against a live broker in this repository's tests.
-- The PostgreSQL outbox stamps `processing_at` with the database clock but compares it with `ExpiredBefore` from the application clock, so clock skew shifts `ClaimTTL` (`provider/outbox/postgres.go:54`).

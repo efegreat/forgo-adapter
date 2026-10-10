@@ -25,7 +25,8 @@ func NewPostgres(db *sql.DB) *Postgres {
 }
 
 // Claim claims the messages in one UPDATE … RETURNING. It runs in a transaction so a failure while
-// reading the claimed rows releases them right away instead of after ClaimTTL.
+// reading the claimed rows releases them right away instead of after ClaimTTL. Claims are stamped
+// and expired on the database clock (see claimAge).
 func (p *Postgres) Claim(
 	ctx context.Context,
 	claim worker.Claim,
@@ -42,7 +43,7 @@ func (p *Postgres) Claim(
 				WHERE processed_at IS NULL
 				  AND (
 					  processing_at IS NULL
-					  OR processing_at < $1
+					  OR processing_at < CURRENT_TIMESTAMP - make_interval(secs => $1)
 				  )
 				ORDER BY id
 				LIMIT $2
@@ -63,7 +64,7 @@ func (p *Postgres) Claim(
 				o.message_key,
 				o.destination
 			`,
-			claim.ExpiredBefore,
+			claimAge(claim).Seconds(),
 			claim.Limit,
 			claim.ID,
 		)
