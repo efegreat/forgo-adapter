@@ -23,22 +23,27 @@ type consumeChannel interface {
 }
 
 type Subscriber struct {
-	conf    SubscriberConfig
-	ch      consumeChannel
+	conf SubscriberConfig
+	ch   consumeChannel
+	// tag is the consumer tag, under which the recovery reports a failed re-subscription to lost.
+	tag     string
 	guard   *ackGuard
+	lost    *consumerLoss
 	retry   *retrier
 	release func()
 }
 
 // Consume sets the prefetch, subscribes to the queue and hands every delivery to state.Handler,
-// with at most state.Concurrency in flight. It returns once ctx ends and every handler finished.
+// with at most state.Concurrency in flight. It returns once ctx ends and every handler finished,
+// or with an error once the consumer is gone: the delivery channel closed, or the recovery could
+// not re-subscribe the consumer.
 func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
 	if err := s.ch.Qos(prefetch(s.conf.Prefetch, state.Concurrency), 0, false); err != nil {
 		return fmt.Errorf("rabbitmq: subscriber %s: set prefetch: %w", s.conf.Name, err)
 	}
 	msgs, err := s.ch.Consume(
 		s.conf.Queue,
-		"",
+		s.tag,
 		s.conf.AutoAck,
 		s.conf.Exclusive,
 		s.conf.NoLocal,
@@ -56,6 +61,8 @@ func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-s.lost.done:
+			return s.lost.err
 		case msg, ok := <-msgs:
 			if !ok {
 				if ctx.Err() != nil {

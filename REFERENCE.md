@@ -222,7 +222,7 @@ A publisher sends one message at a time and waits for its confirm. Raise the wor
 | `AutoAck` | `false` | Leave it off: the worker acknowledges every message itself. |
 | `Exclusive`, `NoLocal`, `NoWait`, `Args` | | AMQP consume options. |
 
-The worker's `SubscriberConfig.Concurrency` bounds how many messages are handled at once.
+The worker's `SubscriberConfig.Concurrency` bounds how many messages are handled at once. A subscriber consumes under the consumer tag `forgo-<Name>-<n>`, which tells subscribers apart in the management UI.
 
 #### Messages on the wire
 
@@ -342,6 +342,8 @@ While the connection is down:
 - **Publishes fail fast.** The outbox keeps the messages and retries them on its next cycle.
 - **Unacknowledged deliveries are requeued by the broker.** Delivery tags start over on a recovered channel, so a late acknowledgement from a handler that was still running would settle a different message. The broker marks those deliveries stale before the channel is reopened, and their acknowledgements fail instead (`rabbitmq: delivery belongs to a lost channel`). The message is delivered again, and the inbox recognizes it by its `x-msg-id`. If the handler had completed it, the redelivery is acknowledged and skipped.
 - **Unconfirmed publishes fail.** The client settles pending confirms as nacks when it reopens the channel, so the outbox retries them. A message the broker had already stored is then published twice, and the consumer inbox drops the duplicate.
+
+An exchange, queue, binding or consumer that fails to recover is skipped, so the rest of the topology still recovers. A consumer can fail because its queue was deleted, or because a consumer with `Exclusive` on another connection still holds the queue. Its subscriber would then receive nothing, so it stops with `rabbitmq: recovery could not re-subscribe the consumer`, followed by the broker's error. As when the broker cancels a consumer, the worker server fails and the app stops. When it starts again, the subscriber consumes again, or fails at startup if its queue is gone.
 
 The client logs its recovery through `amqp.Logger`, which discards everything by default. Call `amqp.SetLogger` in `main` to see reconnects.
 

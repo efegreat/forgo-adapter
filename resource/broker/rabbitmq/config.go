@@ -96,6 +96,7 @@ func (c Config) New() (forgo.Resource, error) {
 		subscribers: make(map[string]SubscriberConfig, len(cfg.Subscribers)),
 		publishers:  make(map[string]PublisherConfig, len(cfg.Publishers)),
 		owned:       make(map[*amqp.Channel]*ackGuard),
+		consumers:   make(map[string]*consumerLoss),
 	}
 	if err := broker.init(); err != nil {
 		return nil, err

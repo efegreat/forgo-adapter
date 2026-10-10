@@ -19,6 +19,7 @@ type fakeConsumeChannel struct {
 	qosErr     error
 	consumeErr error
 	queue      string
+	tag        string
 	msgs       chan amqp.Delivery
 }
 
@@ -27,8 +28,8 @@ func (c *fakeConsumeChannel) Qos(prefetchCount, _ int, _ bool) error {
 	return c.qosErr
 }
 
-func (c *fakeConsumeChannel) Consume(queue, _ string, _, _, _, _ bool, _ amqp.Table) (<-chan amqp.Delivery, error) {
-	c.queue = queue
+func (c *fakeConsumeChannel) Consume(queue, tag string, _, _, _, _ bool, _ amqp.Table) (<-chan amqp.Delivery, error) {
+	c.queue, c.tag = queue, tag
 	return c.msgs, c.consumeErr
 }
 
@@ -54,7 +55,7 @@ func TestPrefetch(t *testing.T) {
 func TestSubscriberConsume(t *testing.T) {
 	ch := &fakeConsumeChannel{msgs: make(chan amqp.Delivery, 3)}
 	guard := &ackGuard{}
-	s := &Subscriber{conf: SubscriberConfig{Name: "billing", Queue: "billing"}, ch: ch, guard: guard}
+	s := &Subscriber{conf: SubscriberConfig{Name: "billing", Queue: "billing"}, ch: ch, guard: guard, lost: newConsumerLoss()}
 
 	ack := &fakeAcknowledger{}
 	var (
@@ -113,7 +114,7 @@ func TestSubscriberConsumeErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := &Subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: tt.ch, guard: &ackGuard{}}
+			s := &Subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: tt.ch, guard: &ackGuard{}, lost: newConsumerLoss()}
 			err := s.Consume(context.Background(), worker.ConsumerState{Concurrency: 1, Handler: func(context.Context, worker.IDelivery) {}})
 			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
 				t.Fatalf("Consume = %v, want %v", err, tt.wantErr)
@@ -128,7 +129,7 @@ func TestSubscriberConsumeErrors(t *testing.T) {
 func TestSubscriberDropsAcksAcrossRecovery(t *testing.T) {
 	ch := &fakeConsumeChannel{msgs: make(chan amqp.Delivery, 1)}
 	guard := &ackGuard{}
-	s := &Subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: ch, guard: guard}
+	s := &Subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: ch, guard: guard, lost: newConsumerLoss()}
 
 	ack := &fakeAcknowledger{}
 	received := make(chan worker.IDelivery, 1)
@@ -154,6 +155,33 @@ func TestSubscriberDropsAcksAcrossRecovery(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func TestSubscriberStopsWhenConsumerLost(t *testing.T) {
+	// The delivery channel stays open: the recovery reopened the channel without the consumer.
+	ch := &fakeConsumeChannel{msgs: make(chan amqp.Delivery)}
+	lost := newConsumerLoss()
+	s := &Subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: ch, tag: "forgo-s-1", guard: &ackGuard{}, lost: lost}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Consume(context.Background(), worker.ConsumerState{Concurrency: 1, Handler: func(context.Context, worker.IDelivery) {}})
+	}()
+
+	refused := &amqp.Error{Code: amqp.AccessRefused, Reason: "queue 'q' in exclusive use"}
+	lost.report(amqp.TopologyRecoveryEntity{EntityType: amqp.TopologyEntityConsumer, EntityName: "forgo-s-1", Err: refused})
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errConsumerLost) || !errors.Is(err, refused) {
+			t.Fatalf("Consume = %v, want errConsumerLost wrapping the broker's error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Consume kept waiting on a consumer the recovery could not re-subscribe")
+	}
+	if ch.tag != "forgo-s-1" {
+		t.Fatalf("consumed under tag %q, want the tag the recovery reports", ch.tag)
+	}
 }
 
 // settledConfirmation is a confirmation that is already settled.

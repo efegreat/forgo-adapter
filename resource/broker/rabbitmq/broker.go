@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 
 	"github.com/efegreat/forgo/server/worker"
@@ -16,6 +17,10 @@ const (
 	// returnBuffer holds the returns of unroutable mandatory messages until Publish reads them.
 	// The client stalls the connection while a return listener is full.
 	returnBuffer = 16
+
+	consumerTagPrefix = "forgo-"
+	// maxConsumerTag is the longest AMQP short string.
+	maxConsumerTag = 255
 )
 
 type Broker struct {
@@ -30,6 +35,11 @@ type Broker struct {
 	mu sync.Mutex
 	// owned holds the channels to recover, with the ack guard of subscriber channels.
 	owned map[*amqp.Channel]*ackGuard
+	// consumers holds the loss of every open subscriber by consumer tag, the only name the
+	// recovery gives a consumer it could not re-subscribe.
+	consumers map[string]*consumerLoss
+	// consumerSeq numbers the consumer tags, so they are unique on the connection.
+	consumerSeq uint64
 }
 
 func (r *Broker) Name() string {
@@ -92,12 +102,18 @@ func (r *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 		r.disown(ch)
 		return nil, errors.Join(fmt.Errorf("rabbitmq: subscriber %s: %w", name, err), ch.Close())
 	}
+	tag, lost := r.addConsumer(name)
 	return &Subscriber{
-		conf:    conf,
-		ch:      ch,
-		guard:   guard,
-		retry:   retry,
-		release: func() { r.disown(ch) },
+		conf:  conf,
+		ch:    ch,
+		tag:   tag,
+		guard: guard,
+		lost:  lost,
+		retry: retry,
+		release: func() {
+			r.disown(ch)
+			r.removeConsumer(tag)
+		},
 	}, nil
 }
 
@@ -152,6 +168,44 @@ func (r *Broker) owner(ch *amqp.Channel) (*ackGuard, bool) {
 	defer r.mu.Unlock()
 	guard, ok := r.owned[ch]
 	return guard, ok
+}
+
+// addConsumer returns a new consumer tag for the subscriber name, and the loss the recovery
+// reports to when it cannot re-subscribe that consumer.
+func (r *Broker) addConsumer(name string) (string, *consumerLoss) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.consumerSeq++
+	tag := consumerTag(name, r.consumerSeq)
+	lost := newConsumerLoss()
+	r.consumers[tag] = lost
+	return tag, lost
+}
+
+func (r *Broker) removeConsumer(tag string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.consumers, tag)
+}
+
+// consumerLost reports err to the subscriber that consumes under tag, unless it is closed.
+func (r *Broker) consumerLost(tag string, err error) {
+	r.mu.Lock()
+	lost, ok := r.consumers[tag]
+	r.mu.Unlock()
+	if ok {
+		lost.report(err)
+	}
+}
+
+// consumerTag names a consumer after its subscriber, so it can be told apart in the management
+// UI, unless the name makes the tag too long for AMQP.
+func consumerTag(name string, seq uint64) string {
+	suffix := "-" + strconv.FormatUint(seq, 10)
+	if len(consumerTagPrefix)+len(name)+len(suffix) > maxConsumerTag {
+		return consumerTagPrefix + strconv.FormatUint(seq, 10)
+	}
+	return consumerTagPrefix + name + suffix
 }
 
 // invalidateAll marks the deliveries of every subscriber channel as stale.
