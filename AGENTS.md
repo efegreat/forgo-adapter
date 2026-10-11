@@ -4,9 +4,9 @@ Guide for coding agents and contributors working **on forgo-adapter itself**. Fo
 
 ## What forgo-adapter is
 
-The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ) and providers (a SQL transactor, inbox/outbox storages, a Redis locker, a Redis rate limiter) that implement forgo's interfaces. Module path: `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)). Go 1.27. Both repositories are private and untagged before the first release, so `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with `../forgo`: a sibling forgo checkout is required to build. At release, require a tagged forgo version and remove the `replace` directive.
+The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ) and providers (a SQL transactor, inbox/outbox storages, live config stores and a live config cache, a Redis locker, a Redis rate limiter) that implement forgo's interfaces. Module path: `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)). Go 1.27. Both repositories are private and untagged before the first release, so `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with `../forgo`: a sibling forgo checkout is required to build. At release, require a tagged forgo version and remove the `replace` directive.
 
-The dependency points one way. **Adapters import forgo; forgo never imports adapters.** Anything a server needs from an adapter is an interface declared in forgo. When a forgo contract changes (`worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `http.IRateLimiter`, …), update the adapters here in the same change set.
+The dependency points one way. **Adapters import forgo; forgo never imports adapters.** Anything a server needs from an adapter is an interface declared in forgo. When a forgo contract changes (`worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `http.IRateLimiter`, `forgo.LiveConfigStore`, `forgo.LiveConfigCache`, …), update the adapters here in the same change set.
 
 forgo's [AGENTS.md](https://github.com/efegreat/forgo/blob/main/AGENTS.md) applies here too: its design principles, coding conventions and logging rules. This file only adds what is specific to adapters.
 
@@ -31,6 +31,7 @@ forgo's four goals carry over:
 | `provider/outbox/` | `worker.OutboxStorage` for PostgreSQL and MySQL 8. `outbox.go`: the shared row scan. |
 | `provider/locker/` | `operation.ILocker` on Redis. Token-guarded unlock script, `ErrNotHeld`. |
 | `provider/ratelimit/` | `http.IRateLimiter` on Redis. GCRA Lua script on the server clock, `KeyPrefix`. |
+| `provider/liveconfig/` | `forgo.LiveConfigStore` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`) on the `live_configs` table, with versioned conditional saves. `liveconfig.go`: the shared `get` and `applied`. `redis.go`: `forgo.LiveConfigCache` on Redis, version-guarded Lua `Set`, `KeyPrefix`. |
 
 ## Invariants
 
@@ -66,6 +67,9 @@ Do not break these without an explicit decision from the maintainer.
 ### SQL storages
 
 - Every statement goes through `sqltx.From(ctx, db)`, and every multi-statement operation through `sqltx.Run`, so storages join the transaction of `sqltx.Transactor.Do`. The worker relies on it: `MarkCompleted` must commit or roll back with the handler.
+- The exception is `provider/liveconfig`, which runs on `db` directly. forgo caches a document as soon as its save succeeds, in a cache that never expires, so a save must be committed when `Set` returns.
+- Live config saves are conditional on the version and atomic: one statement per save, and zero affected rows means `forgo.ErrLiveConfigConflict`. The MySQL insert tells a duplicate key apart by reading the row afterwards, so it needs no driver error codes.
+- `liveconfig` sends documents as `string`, never `[]byte`: lib/pq sends `[]byte` as `bytea`, which a `JSONB` column rejects, and MySQL refuses JSON in the binary character set.
 - Each storage implements the contract and the comments in forgo's `server/worker/storage.go` exactly. The table schemas are documented in forgo's REFERENCE.md ("Storage contracts").
 - Claims use `FOR UPDATE SKIP LOCKED`. Status transitions only leave `InboxWaiting`. Repeating `MarkFailed` or `MarkRejected` succeeds, but `MarkCompleted` must succeed only when it moved the row itself (`unmoved` in `provider/inbox/inbox.go`): it runs in the handler's transaction, and a success for a concurrent duplicate would commit the handler's writes twice.
 - Outbox claims are stamped and expired on the database clock only. `Claim` turns `ExpiredBefore` into an age (`claimAge` in `provider/outbox/outbox.go`) and compares `processing_at` with the database time minus that age, so skew between app instances and the database never shifts `ClaimTTL`. Never compare `processing_at` with a time from the app. MySQL uses `UTC_TIMESTAMP(6)`, because `CURRENT_TIMESTAMP` in a `DATETIME` column follows the session time zone and its daylight saving changes.
@@ -75,11 +79,12 @@ Do not break these without an explicit decision from the maintainer.
 
 - Read-modify-write logic runs as one Lua script (`redis.NewScript`) that touches a single key, so it is atomic and works on Redis Cluster.
 - Time-based logic uses Redis `TIME`, never the app clock.
-- Keys the adapter invents are namespaced (`ratelimit.KeyPrefix`). Keys passed in by forgo, such as lock keys, are used as given.
+- The live config cache never expires its entries, and its `Set` keeps the newest version in one script, so out-of-order writes cannot regress it.
+- Keys the adapter invents are namespaced (`ratelimit.KeyPrefix`, `liveconfig.KeyPrefix`). Keys passed in by forgo, such as lock keys, are used as given.
 
 ## Coding conventions
 
-- Errors: prefix with the package (`sqldb:`, `redisdb:`, `rabbitmq:`, `inbox:`, `outbox:`, `locker:`, `ratelimit:`), wrap with `%w`, and declare sentinels as package-level `var`s.
+- Errors: prefix with the package (`sqldb:`, `redisdb:`, `rabbitmq:`, `inbox:`, `outbox:`, `liveconfig:`, `locker:`, `ratelimit:`), wrap with `%w`, and declare sentinels as package-level `var`s.
 - Doc comments on exported identifiers explain the contract and the why. Match the surrounding code.
 - Dependencies: forgo, `github.com/rabbitmq/amqp091-go`, `github.com/redis/go-redis/v9`. Test-only: `github.com/alicebob/miniredis/v2`, `github.com/DATA-DOG/go-sqlmock`. A new adapter may add the client library it wraps, and nothing else without a strong reason.
 - Tests must not need running infrastructure. Use miniredis for Redis (it runs Lua and `TIME`, and `SetTime`/`FastForward` control the clock), sqlmock for SQL (`sqlmock.NewWithDSN` plus `sql.Open("sqlmock", dsn)` exercises `sqldb.New`; storage tests set `SetMaxOpenConns(1)`, so a statement that bypasses an open transaction blocks and fails on the test's deadline), and fakes of narrow interfaces for AMQP (`declarer`, `consumeChannel`, `publishChannel`, `confirmation` and `amqp.Acknowledger`). Table-driven where possible, passing under `-race`.

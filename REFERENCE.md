@@ -15,6 +15,7 @@ The complete guide to the forgo adapter library. New here? Start with the [READM
   - [inbox and outbox](#inbox-and-outbox)
   - [locker](#locker)
   - [ratelimit](#ratelimit)
+  - [liveconfig](#liveconfig)
 - [A complete worker app](#a-complete-worker-app)
 - [Errors](#errors)
 
@@ -39,6 +40,7 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*Mysql` → `worker.OutboxStorage` | `*sql.DB` |
 | `locker` | `github.com/efegreat/forgo-adapter/provider/locker` | provider | `*Redis` → `operation.ILocker` | `redis.UniversalClient` |
 | `ratelimit` | `github.com/efegreat/forgo-adapter/provider/ratelimit` | provider | `*Redis` → `http.IRateLimiter` | `redis.UniversalClient` |
+| `liveconfig` | `github.com/efegreat/forgo-adapter/provider/liveconfig` | provider | `*Postgres`, `*Mysql` → `forgo.LiveConfigStore`; `*RedisCache` → `forgo.LiveConfigCache` | `*sql.DB`; `redis.UniversalClient` |
 
 `redis` in this document is `github.com/redis/go-redis/v9`, and `amqp` is `github.com/rabbitmq/amqp091-go`.
 
@@ -457,6 +459,34 @@ It implements the generic cell rate algorithm (GCRA), the algorithm of `http.Mem
 - **Resolution.** Microseconds. Rates above one request per microsecond per key are counted as one per microsecond.
 - **Failures.** A Redis error is returned to the middleware. By default the request fails with `rate_limit_unavailable` (503). With `RateLimitConfig.FailOpen` it is admitted and the failure is logged.
 
+### liveconfig
+
+Stores and a cache for forgo's [live configs](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#live-configs). `liveconfig.Postgres` and `liveconfig.Mysql` are `forgo.LiveConfigStore`s: the source of truth, in the `live_configs` table whose schema is given there, one row per config name. Create it with your migrations. `liveconfig.RedisCache` is a `forgo.LiveConfigCache` that every instance of your app shares.
+
+```go
+import "github.com/efegreat/forgo-adapter/provider/liveconfig"
+
+forgo.WithResources(config.Database, config.Redis),
+forgo.WithProviders(
+	liveconfig.NewPostgres,   // or liveconfig.NewMysql
+	liveconfig.NewRedisCache,
+	forgo.NewLiveConfigs,
+)
+```
+
+| Method | Behavior |
+| --- | --- |
+| SQL `Get(ctx, name)` | `SELECT data, version` of the row. A missing row returns version 0 and no error. |
+| SQL `Set(ctx, name, data, version)` | Version 0 inserts the row at version 1. Any other version updates the row only `WHERE version = ?`, to `version + 1`. When no row was written, it returns `forgo.ErrLiveConfigConflict`. Sets `updated_at` to `CURRENT_TIMESTAMP` on PostgreSQL and `UTC_TIMESTAMP(6)` on MySQL. |
+| Redis `Get(ctx, name)` | `HGET liveconfig:<name> data`. A missing entry returns `false` and no error. |
+| Redis `Set(ctx, name, data, version)` | One Lua script that writes the hash `liveconfig:<name>` (`version`, `data`) unless it holds the same or a newer version. Entries never expire. |
+
+- **Conflicts.** The conditional write is atomic, so of two saves from the same version, exactly one succeeds. PostgreSQL inserts with `ON CONFLICT (name) DO NOTHING`. MySQL inserts plainly, and when the insert fails, reads the row: a stored row means a conflict, and no row means the insert's own error.
+- **Outside transactions.** Unlike the inbox and outbox, the SQL stores never join the transaction a context carries. forgo caches a document as soon as its save succeeds, and the cache never expires, so a save must be committed when `Set` returns.
+- **Text parameters.** Documents are sent as text, because a JSON column rejects `[]byte` from some drivers: lib/pq sends it as `bytea`, and MySQL refuses JSON from the binary character set.
+- **Newest version wins.** The cache compares versions in the script, so a save whose cache write arrives late never replaces a newer one. Versions are compared as Lua numbers, exact up to 2^53.
+- **Keys.** Stored as `liveconfig:<name>` (`liveconfig.KeyPrefix`). Each entry is a single key, so the cache works on Redis Cluster. Configure Redis without eviction for these keys: an evicted entry is read from the store on every `Load` until the config is saved again.
+
 ---
 
 ## A complete worker app
@@ -533,3 +563,4 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | `outbox:` | Outbox queries. |
 | `locker:` | Redis errors. `locker.ErrNotHeld` from `Unlock`. |
 | `ratelimit:` | An invalid `Rate` and Redis errors. |
+| `liveconfig:` | Live config queries and Redis errors. Conflicting saves return forgo's `forgo.ErrLiveConfigConflict`. |
