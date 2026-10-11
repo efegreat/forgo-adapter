@@ -2,7 +2,7 @@
 
 **Ready-made infrastructure for [forgo](https://github.com/efegreat/forgo): databases, brokers, storages, locks and rate limits you configure instead of write.**
 
-[Forgo](https://github.com/efegreat/forgo) defines contracts such as `worker.IBroker`, `worker.InboxStorage`, `operation.ILocker` and `http.IRateLimiter`, and never depends on a concrete database, broker or cache. This library implements those contracts for common infrastructure. Resources are config values, and providers are constructors you hand to the bootstrap.
+[Forgo](https://github.com/efegreat/forgo) defines contracts such as `worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `http.IRateLimiter`, `forgo.LiveConfigStore` and `forgo.LiveConfigCache`, and never depends on a concrete database, broker or cache. This library implements those contracts for common infrastructure. Resources are config values, and providers are constructors you hand to the bootstrap.
 
 ```go
 app := forgo.NewApp(
@@ -47,6 +47,7 @@ app.Run()
 | `provider/outbox` | provider | `worker.OutboxStorage` | PostgreSQL, MySQL 8 |
 | `provider/locker` | provider | `operation.ILocker` | Redis |
 | `provider/ratelimit` | provider | `http.IRateLimiter` | Redis, GCRA |
+| `provider/liveconfig` | provider | `forgo.LiveConfigStore`, `forgo.LiveConfigCache` | PostgreSQL, MySQL 8; Redis |
 
 - **Configure, don't wire.** Every resource is a plain config value whose zero fields mean "use the default". Every provider is a constructor that the bootstrap calls with the resources it needs.
 - **Fail at startup.** Resources connect and verify the connection in `New`. RabbitMQ declares its whole topology there too, so a bad DSN or a conflicting queue stops the app before it serves anything.
