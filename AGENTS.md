@@ -24,7 +24,7 @@ forgo's four goals carry over:
 | Path | Responsibility |
 | --- | --- |
 | `resource/sqldb/` | `Config` → `*sql.DB`. Applies pool limits, pings with `ConnectTimeout`, closes the pool if the ping fails. |
-| `resource/redisdb/` | `Config` → `*redis.Client`. Pings with `ConnectTimeout`, closes the client if the ping fails. |
+| `resource/redisdb/` | `Config` → `redis.NewUniversalClient`: a `*redis.Client` for a server or a Sentinel master, a `*redis.ClusterClient` for a cluster. Validates the mode and `DB` before connecting, pings with `ConnectTimeout`, closes the client if the ping fails. |
 | `resource/broker/rabbitmq/` | `Config` → `worker.IBroker`. `config.go`: config, `Sanitize`, `validate`, `RecoveryConfig`, `DeadLetterConfig`, queue args. `broker.go`: connection, owned channels, `declare` (topology through the `declarer` interface), publisher and subscriber factories. `recovery.go`: `ackGuard`, `consumerLoss` and the `recoveryHooks` around the client's connection and topology recovery. `publisher.go`: confirm-mode publishing, mandatory returns, `Message` → `amqp.Publishing` with identity headers. `subscriber.go`: prefetch, `Consume` over a `process.ConcurrentRunner`. `delivery.go`: `amqp.Delivery` → `worker.IDelivery` with guarded acknowledgements, and AMQP header values → strings (`headerValue`). |
 | `provider/sqltx/` | `operation.Transactor` on `*sql.DB`. `Run`, `From`, `Executor`: transactions carried in the context, keyed by database. |
 | `provider/inbox/` | `worker.InboxStorage` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`). `ErrNotWaiting`. |
@@ -39,9 +39,9 @@ Do not break these without an explicit decision from the maintainer.
 
 ### Resources
 
-- `Config` is a value type with value receivers. `Sanitize()` returns a copy with defaults. It **never writes into the caller's slices or maps**, because configs are package-level vars shared by several apps and tests. Build new slices, and clone maps before adding keys (see `QueueConfig.args`).
+- `Config` is a value type with value receivers. `Sanitize()` returns a copy with defaults. It **never writes into the caller's slices or maps**, because configs are package-level vars shared by several apps and tests. Build new slices, and clone maps before adding keys (see `QueueConfig.args`). The same holds for what `New` hands to a client: the go-redis cluster client appends discovered nodes to its seed list, so `redisdb` clones `Addrs`.
 - `New()` follows this order: `Sanitize` → `validate` (no network) → connect → verify (ping, declare). On any failure after connecting, close what was opened and join the close error with `errors.Join`.
-- `Value()` returns the concrete client (`*sql.DB`, `*redis.Client`) or, for brokers, the forgo interface (`worker.IBroker(r)`). Bootstrap binds the dynamic type of `Value()` and matches by assignability. Document in REFERENCE.md what providers should request.
+- `Value()` returns the concrete client (`*sql.DB`, the `*redis.Client` or `*redis.ClusterClient` of `redis.NewUniversalClient`) or, for brokers, the forgo interface (`worker.IBroker(r)`). Bootstrap binds the dynamic type of `Value()` and matches by assignability. Document in REFERENCE.md what providers should request.
 - `Close()` releases everything `New` opened.
 
 ### Providers

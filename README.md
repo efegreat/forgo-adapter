@@ -9,9 +9,9 @@ app := forgo.NewApp(
 	forgo.WithName("shop-worker"),
 	forgo.WithLogger(config.Logger),
 	forgo.WithResources(
-		sqldb.Config{Name: "main", DriverName: "postgres", DSN: forgo.Env("DATABASE_URL", "")}, // *sql.DB
-		redisdb.Config{Name: "cache", Addr: forgo.Env("REDIS_ADDR", "localhost:6379")},     // *redis.Client
-		rabbitmq.Config{                                                                     // worker.IBroker
+		sqldb.Config{Name: "main", DriverName: "postgres", DSN: forgo.Env("DATABASE_URL", "")},    // *sql.DB
+		redisdb.Config{Name: "cache", Addrs: []string{forgo.Env("REDIS_ADDR", "localhost:6379")}}, // redis.UniversalClient
+		rabbitmq.Config{                                                                           // worker.IBroker
 			Name:      "events",
 			Exchanges: []rabbitmq.ExchangeConfig{{Name: "orders", Kind: "topic", Durable: true}},
 			Queues: []rabbitmq.QueueConfig{{
@@ -40,7 +40,7 @@ app.Run()
 | Package | Kind | Provides | Backed by |
 | --- | --- | --- | --- |
 | `resource/sqldb` | resource | `*sql.DB` | any `database/sql` driver |
-| `resource/redisdb` | resource | `*redis.Client` | go-redis v9 |
+| `resource/redisdb` | resource | `redis.UniversalClient` | go-redis v9: a server, Redis Cluster or Sentinel |
 | `resource/broker/rabbitmq` | resource | `worker.IBroker` | amqp091-go, with automatic recovery, publisher confirms, prefetch and optional dead-letter queues |
 | `provider/sqltx` | provider | `operation.Transactor` | `database/sql`, transactions carried in the context |
 | `provider/inbox` | provider | `worker.InboxStorage` | PostgreSQL, MySQL 8 |
