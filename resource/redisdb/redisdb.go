@@ -14,11 +14,30 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// ReadFrom chooses the nodes that serve the read-only commands of a cluster client or a failover
+// client. Writes and scripts always go to the master. Replicas lag their master, so a read from
+// a replica can miss a write that just succeeded.
+type ReadFrom string
+
+const (
+	// ReadFromMaster sends every command to the master. The default.
+	ReadFromMaster ReadFrom = "master"
+	// ReadFromReplica sends read-only commands to a replica, and to the master while no replica
+	// is healthy.
+	ReadFromReplica ReadFrom = "replica"
+	// ReadFromNearest sends read-only commands to the node with the lowest latency, master or
+	// replica.
+	ReadFromNearest ReadFrom = "nearest"
+	// ReadFromAny sends read-only commands to a random node, master or replica.
+	ReadFromAny ReadFrom = "any"
+)
+
 // Config is a go-redis universal client resource: one Redis server, a Redis Cluster or a
 // Sentinel-managed master, chosen from Addrs, MasterName and ClusterMode the way
-// redis.NewUniversalClient chooses. Its Value is a *redis.Client for a server or a master and a
-// *redis.ClusterClient for a cluster. Providers should request redis.UniversalClient, which both
-// satisfy, so they work with every deployment shape.
+// redis.NewUniversalClient chooses. Its Value is a *redis.Client for a server or a master, and a
+// *redis.ClusterClient for a cluster or for a master whose reads go to replicas (ReadFrom).
+// Providers should request redis.UniversalClient, which both satisfy, so they work with every
+// deployment shape.
 type Config struct {
 	Name string
 	// Addrs is a list of host:port addresses: the server, the seed nodes of a cluster, or the
@@ -31,8 +50,11 @@ type Config struct {
 	// ClusterMode makes a cluster client from a single address, such as the configuration endpoint
 	// of a managed cluster. It cannot be combined with MasterName.
 	ClusterMode bool
-	Username    string
-	Password    string
+	// ReadFrom chooses the nodes that serve read-only commands. A single-server client has one
+	// node and ignores it, so one config can serve every environment. Default: ReadFromMaster.
+	ReadFrom ReadFrom
+	Username string
+	Password string
 	// SentinelUsername and SentinelPassword authenticate against the Sentinels of MasterName, when
 	// they differ from the master's credentials.
 	SentinelUsername string
@@ -56,6 +78,9 @@ type Config struct {
 func (c Config) Sanitize() Config {
 	if len(c.Addrs) == 0 {
 		c.Addrs = []string{"localhost:6379"}
+	}
+	if c.ReadFrom == "" {
+		c.ReadFrom = ReadFromMaster
 	}
 	if c.ConnectTimeout == 0 {
 		c.ConnectTimeout = 5 * time.Second
@@ -90,6 +115,11 @@ func (c Config) validate() error {
 	if c.MasterName != "" && c.ClusterMode {
 		return errors.New("redisdb: ClusterMode and MasterName cannot be combined")
 	}
+	switch c.ReadFrom {
+	case ReadFromMaster, ReadFromReplica, ReadFromNearest, ReadFromAny:
+	default:
+		return fmt.Errorf("redisdb: unknown ReadFrom %q", c.ReadFrom)
+	}
 	if c.cluster() && c.DB != 0 {
 		return fmt.Errorf("redisdb: DB %d is not supported by Redis Cluster, which only has database 0", c.DB)
 	}
@@ -102,12 +132,15 @@ func (c Config) cluster() bool {
 }
 
 func (c Config) client() redis.UniversalClient {
-	return redis.NewUniversalClient(&redis.UniversalOptions{
+	opts := &redis.UniversalOptions{
 		// The cluster client appends the nodes it discovers to its seed list, which would write
 		// into the backing array of a shared config.
 		Addrs:            slices.Clone(c.Addrs),
 		MasterName:       c.MasterName,
 		IsClusterMode:    c.ClusterMode,
+		ReadOnly:         c.ReadFrom == ReadFromReplica,
+		RouteByLatency:   c.ReadFrom == ReadFromNearest,
+		RouteRandomly:    c.ReadFrom == ReadFromAny,
 		Username:         c.Username,
 		Password:         c.Password,
 		SentinelUsername: c.SentinelUsername,
@@ -118,7 +151,14 @@ func (c Config) client() redis.UniversalClient {
 		ReadTimeout:      c.ReadTimeout,
 		WriteTimeout:     c.WriteTimeout,
 		TLSConfig:        c.TLSConfig,
-	})
+	}
+	if c.MasterName != "" && c.ReadFrom != ReadFromMaster {
+		// A cluster client over the master and replicas the Sentinels report, which routes reads
+		// like a cluster. NewUniversalClient would turn ReadOnly into a failover client that sends
+		// every command, writes included, to a replica.
+		return redis.NewFailoverClusterClient(opts.Failover())
+	}
+	return redis.NewUniversalClient(opts)
 }
 
 // target names what New pings, for its error.
