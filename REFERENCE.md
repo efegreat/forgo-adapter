@@ -28,12 +28,12 @@ Forgo's bootstrap builds **resources** first, then calls **providers** in declar
 - A **resource** is a config value implementing `forgo.ResourceFactory`. Its `New` opens the connection, verifies it and returns a `forgo.Resource` that the bootstrap closes on shutdown. Put it in `forgo.WithResources`.
 - A **provider** is a constructor such as `inbox.NewPostgres(db *sql.DB) *inbox.Postgres`. The bootstrap resolves its parameters from earlier bindings. Put it in `forgo.WithProviders`, after the resources it needs.
 
-The bootstrap matches by assignability. A provider that asks for `redis.UniversalClient` receives the `*redis.Client` of `redisdb`, and the worker servers asking for `worker.InboxStorage` receive the `*inbox.Postgres` returned by `inbox.NewPostgres`. You never name the interface yourself.
+The bootstrap matches by assignability. A provider that asks for `redis.UniversalClient` receives the `*redis.Client` or `*redis.ClusterClient` of `redisdb`, and the worker servers asking for `worker.InboxStorage` receive the `*inbox.Postgres` returned by `inbox.NewPostgres`. You never name the interface yourself.
 
 | Package | Import path | Kind | Value or result | Needs |
 | --- | --- | --- | --- | --- |
 | `sqldb` | `github.com/efegreat/forgo-adapter/resource/sqldb` | resource | `*sql.DB` | a `database/sql` driver |
-| `redisdb` | `github.com/efegreat/forgo-adapter/resource/redisdb` | resource | `*redis.Client` | |
+| `redisdb` | `github.com/efegreat/forgo-adapter/resource/redisdb` | resource | `*redis.Client` or `*redis.ClusterClient` → `redis.UniversalClient` | |
 | `rabbitmq` | `github.com/efegreat/forgo-adapter/resource/broker/rabbitmq` | resource | `worker.IBroker` | |
 | `sqltx` | `github.com/efegreat/forgo-adapter/provider/sqltx` | provider | `*Transactor` → `operation.Transactor` | `*sql.DB` |
 | `inbox` | `github.com/efegreat/forgo-adapter/provider/inbox` | provider | `*Postgres`, `*Mysql` → `worker.InboxStorage` | `*sql.DB` |
@@ -118,30 +118,43 @@ forgo.WithProviders(
 
 ### redisdb
 
-A go-redis client. Its value is a `*redis.Client`. The providers of this library request `redis.UniversalClient`, which also accepts a cluster or failover client that you expose as your own resource.
+A go-redis universal client, for one Redis server, a Redis Cluster or a Sentinel-managed master. Its value is a `*redis.Client` for a server or a master, and a `*redis.ClusterClient` for a cluster. Request `redis.UniversalClient`, as the providers of this library do, so your code runs unchanged on every deployment shape.
 
 ```go
 import "github.com/efegreat/forgo-adapter/resource/redisdb"
 
 var Redis = redisdb.Config{
 	Name:     "cache",
-	Addr:     forgo.Env("REDIS_ADDR", "localhost:6379"),
+	Addrs:    strings.Split(forgo.Env("REDIS_ADDRS", "localhost:6379"), ","),
 	Password: forgo.Env("REDIS_PASSWORD", ""),
 }
 ```
 
+The client follows `redis.NewUniversalClient`:
+
+| Config | Client |
+| --- | --- |
+| `MasterName` set | Failover client. `Addrs` are the Sentinels, and the client follows the master they promote. |
+| Two or more `Addrs`, or `ClusterMode` | Cluster client. `Addrs` are seed nodes, and the client discovers the others. |
+| Otherwise | Single-server client on `Addrs[0]`. |
+
 | Field | Default | Description |
 | --- | --- | --- |
 | `Name` | | The resource name, for `boot:"name"` tags. |
-| `Addr` | `localhost:6379` | `host:port`. |
-| `Username`, `Password` | | ACL credentials. |
-| `DB` | `0` | Logical database. |
-| `PoolSize` | go-redis default (10 per `GOMAXPROCS`) | Maximum socket connections. |
+| `Addrs` | `localhost:6379` | `host:port` of the server, of cluster seed nodes, or of the Sentinels of `MasterName`. |
+| `MasterName` | | Sentinel master name. Makes a failover client. |
+| `ClusterMode` | `false` | Makes a cluster client from a single address, such as a managed cluster's configuration endpoint. Not combinable with `MasterName`. |
+| `Username`, `Password` | | ACL credentials of the server, nodes or master. |
+| `SentinelUsername`, `SentinelPassword` | | Credentials of the Sentinels, when they differ. |
+| `DB` | `0` | Logical database. Redis Cluster only has database 0, so a cluster client rejects any other. |
+| `PoolSize` | go-redis default (10 per `GOMAXPROCS`) | Maximum socket connections, per node for a cluster. |
 | `DialTimeout`, `ReadTimeout`, `WriteTimeout` | go-redis defaults (5s, 3s, 3s) | Network timeouts. |
 | `TLSConfig` | plaintext | Enables TLS when set. |
 | `ConnectTimeout` | `5s` | Bounds the startup ping. |
 
-A failed ping closes the client and fails the bootstrap with `redisdb: ping <addr>: …`.
+`New` rejects an empty address, `ClusterMode` with `MasterName`, and a non-zero `DB` for a cluster before connecting. A failed ping closes the client and fails the bootstrap with `redisdb: ping <addrs>: …`, or `redisdb: ping <master> via <sentinels>: …` for a failover client.
+
+Every command and script of the Redis providers touches a single key, so they also work on a cluster.
 
 ### rabbitmq
 
@@ -495,7 +508,7 @@ forgo.WithProviders(
 // config/config.go
 var (
 	DB     = sqldb.Config{Name: "main", DriverName: "postgres", DSN: forgo.Env("DATABASE_URL", "")}
-	Redis  = redisdb.Config{Name: "cache", Addr: forgo.Env("REDIS_ADDR", "localhost:6379")}
+	Redis  = redisdb.Config{Name: "cache", Addrs: []string{forgo.Env("REDIS_ADDR", "localhost:6379")}}
 	Broker = rabbitmq.Config{
 		Name:      "events",
 		Exchanges: []rabbitmq.ExchangeConfig{{Name: "orders", Kind: amqp.ExchangeTopic, Durable: true}},
@@ -556,7 +569,7 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | Prefix | Raised by |
 | --- | --- |
 | `sqldb:` | Opening or pinging the database. |
-| `redisdb:` | Pinging Redis. |
+| `redisdb:` | Validation (empty addresses, `ClusterMode` with `MasterName`, a `DB` on a cluster) and pinging Redis. |
 | `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names and missing queues, a closed delivery channel, nacked and unroutable publishes, retries that could not be delayed, acknowledgements of deliveries from a lost channel. |
 | `sqltx:` | Beginning, committing or rolling back a transaction. Errors returned by your function pass through unchanged. |
 | `inbox:` | Inbox queries. `inbox.ErrNotWaiting` when a message left the waiting status. |
