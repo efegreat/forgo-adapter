@@ -118,7 +118,7 @@ forgo.WithProviders(
 
 ### redisdb
 
-A go-redis universal client, for one Redis server, a Redis Cluster or a Sentinel-managed master. Its value is a `*redis.Client` for a server or a master, and a `*redis.ClusterClient` for a cluster. Request `redis.UniversalClient`, as the providers of this library do, so your code runs unchanged on every deployment shape.
+A go-redis universal client, for one Redis server, a Redis Cluster or a Sentinel-managed master. Its value is a `*redis.Client` for a server or a master, and a `*redis.ClusterClient` for a cluster or for a master whose reads go to replicas. Request `redis.UniversalClient`, as the providers of this library do, so your code runs unchanged on every deployment shape.
 
 ```go
 import "github.com/efegreat/forgo-adapter/resource/redisdb"
@@ -134,7 +134,7 @@ The client follows `redis.NewUniversalClient`:
 
 | Config | Client |
 | --- | --- |
-| `MasterName` set | Failover client. `Addrs` are the Sentinels, and the client follows the master they promote. |
+| `MasterName` set | Failover client. `Addrs` are the Sentinels, and the client follows the master they promote. With a `ReadFrom` other than `ReadFromMaster`, a cluster client over the master and the replicas the Sentinels report. |
 | Two or more `Addrs`, or `ClusterMode` | Cluster client. `Addrs` are seed nodes, and the client discovers the others. |
 | Otherwise | Single-server client on `Addrs[0]`. |
 
@@ -144,6 +144,7 @@ The client follows `redis.NewUniversalClient`:
 | `Addrs` | `localhost:6379` | `host:port` of the server, of cluster seed nodes, or of the Sentinels of `MasterName`. |
 | `MasterName` | | Sentinel master name. Makes a failover client. |
 | `ClusterMode` | `false` | Makes a cluster client from a single address, such as a managed cluster's configuration endpoint. Not combinable with `MasterName`. |
+| `ReadFrom` | `ReadFromMaster` | The nodes that serve read-only commands. See [Replica reads](#replica-reads). |
 | `Username`, `Password` | | ACL credentials of the server, nodes or master. |
 | `SentinelUsername`, `SentinelPassword` | | Credentials of the Sentinels, when they differ. |
 | `DB` | `0` | Logical database. Redis Cluster only has database 0, so a cluster client rejects any other. |
@@ -152,9 +153,24 @@ The client follows `redis.NewUniversalClient`:
 | `TLSConfig` | plaintext | Enables TLS when set. |
 | `ConnectTimeout` | `5s` | Bounds the startup ping. |
 
-`New` rejects an empty address, `ClusterMode` with `MasterName`, and a non-zero `DB` for a cluster before connecting. A failed ping closes the client and fails the bootstrap with `redisdb: ping <addrs>: …`, or `redisdb: ping <master> via <sentinels>: …` for a failover client.
+`New` rejects an empty address, `ClusterMode` with `MasterName`, an unknown `ReadFrom`, and a non-zero `DB` for a cluster before connecting. A failed ping closes the client and fails the bootstrap with `redisdb: ping <addrs>: …`, or `redisdb: ping <master> via <sentinels>: …` for a failover client.
 
 Every command and script of the Redis providers touches a single key, so they also work on a cluster.
+
+#### Replica reads
+
+`ReadFrom` spreads the read-only commands of a cluster or failover client over replicas. Writes and scripts always go to the master. A single-server client has one node and ignores it, so a config that sets `ReadFrom` also runs against one local Redis.
+
+| `ReadFrom` | Read-only commands go to |
+| --- | --- |
+| `ReadFromMaster` (default) | The master. |
+| `ReadFromReplica` | A random replica, or the master while no replica is healthy. |
+| `ReadFromNearest` | The node with the lowest latency, master or replica. |
+| `ReadFromAny` | A random node, master or replica. |
+
+`ReadFrom` is a string (`master`, `replica`, `nearest`, `any`), so it can come from the environment: `ReadFrom: redisdb.ReadFrom(forgo.Env("REDIS_READ_FROM", ""))`.
+
+Replicas lag their master, so a read from a replica can miss a write that just succeeded. The locker and the rate limiter only write, so they always use the master. The live config cache reads with `HGET`: after a save, a `Load` may still get the previous version for the replication delay, and a `MemoryTTL` keeps what it read. Give the live config cache a resource with `ReadFromMaster` if it must read its own writes.
 
 ### rabbitmq
 
@@ -569,7 +585,7 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | Prefix | Raised by |
 | --- | --- |
 | `sqldb:` | Opening or pinging the database. |
-| `redisdb:` | Validation (empty addresses, `ClusterMode` with `MasterName`, a `DB` on a cluster) and pinging Redis. |
+| `redisdb:` | Validation (empty addresses, `ClusterMode` with `MasterName`, an unknown `ReadFrom`, a `DB` on a cluster) and pinging Redis. |
 | `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names and missing queues, a closed delivery channel, nacked and unroutable publishes, retries that could not be delayed, acknowledgements of deliveries from a lost channel. |
 | `sqltx:` | Beginning, committing or rolling back a transaction. Errors returned by your function pass through unchanged. |
 | `inbox:` | Inbox queries. `inbox.ErrNotWaiting` when a message left the waiting status. |
