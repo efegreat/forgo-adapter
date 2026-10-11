@@ -10,6 +10,7 @@ The complete guide to the forgo adapter library. New here? Start with the [READM
   - [sqldb](#sqldb)
   - [redisdb](#redisdb)
   - [rabbitmq](#rabbitmq)
+  - [pubsub](#pubsub)
 - [Providers](#providers)
   - [sqltx](#sqltx)
   - [inbox and outbox](#inbox-and-outbox)
@@ -35,6 +36,7 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `sqldb` | `github.com/efegreat/forgo-adapter/resource/sqldb` | resource | `*sql.DB` | a `database/sql` driver |
 | `redisdb` | `github.com/efegreat/forgo-adapter/resource/redisdb` | resource | `*redis.Client` or `*redis.ClusterClient` → `redis.UniversalClient` | |
 | `rabbitmq` | `github.com/efegreat/forgo-adapter/resource/broker/rabbitmq` | resource | `worker.IBroker` | |
+| `pubsub` | `github.com/efegreat/forgo-adapter/resource/broker/pubsub` | resource | `worker.IBroker` | |
 | `sqltx` | `github.com/efegreat/forgo-adapter/provider/sqltx` | provider | `*Transactor` → `operation.Transactor` | `*sql.DB` |
 | `inbox` | `github.com/efegreat/forgo-adapter/provider/inbox` | provider | `*Postgres`, `*Mysql` → `worker.InboxStorage` | `*sql.DB` |
 | `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*Mysql` → `worker.OutboxStorage` | `*sql.DB` |
@@ -42,7 +44,7 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `ratelimit` | `github.com/efegreat/forgo-adapter/provider/ratelimit` | provider | `*Redis` → `http.IRateLimiter` | `redis.UniversalClient` |
 | `liveconfig` | `github.com/efegreat/forgo-adapter/provider/liveconfig` | provider | `*Postgres`, `*Mysql` → `forgo.LiveConfigStore`; `*RedisCache` → `forgo.LiveConfigCache` | `*sql.DB`; `redis.UniversalClient` |
 
-`redis` in this document is `github.com/redis/go-redis/v9`, and `amqp` is `github.com/rabbitmq/amqp091-go`.
+`redis` in this document is `github.com/redis/go-redis/v9`, `amqp` is `github.com/rabbitmq/amqp091-go`, and `option` is `google.golang.org/api/option`.
 
 ---
 
@@ -378,6 +380,175 @@ An exchange, queue, binding or consumer that fails to recover is skipped, so the
 
 The client logs its recovery through `amqp.Logger`, which discards everything by default. Call `amqp.SetLogger` in `main` to see reconnects.
 
+### pubsub
+
+A Google Cloud Pub/Sub broker for forgo's [worker](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#worker), on the official client `cloud.google.com/go/pubsub/v2`. Its value is the `worker.IBroker` that both `worker.ConsumerConfig` and `worker.ProducerConfig` resolve.
+
+```go
+import "github.com/efegreat/forgo-adapter/resource/broker/pubsub"
+
+var Broker = pubsub.Config{
+	Name:      "events",
+	ProjectID: forgo.Env("GOOGLE_CLOUD_PROJECT", ""),
+	Topics:    []pubsub.TopicConfig{{Name: "orders"}},
+	Subscriptions: []pubsub.SubscriptionConfig{
+		{
+			Name:       "billing",
+			Topic:      "orders",
+			Retry:      pubsub.RetryConfig{Initial: time.Second}, // redeliveries back off from 1s up to 10m
+			DeadLetter: pubsub.DeadLetterConfig{Enabled: true},   // billing.dlq topic and subscription
+		},
+	},
+	Subscribers: []pubsub.SubscriberConfig{
+		{Name: "billing", Subscription: "billing"}, // MaxOutstandingMessages defaults to the worker's Concurrency
+	},
+}
+```
+
+#### Client and topology
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `Name` | | The resource name. |
+| `ProjectID` | `GOOGLE_CLOUD_PROJECT`, or the project of the credentials | Project of the topics and subscriptions. Set it for the emulator. |
+| `Options` | Application Default Credentials | `option.ClientOption`s of the client, such as `option.WithCredentialsFile`, or `option.WithEndpoint` for a regional endpoint. |
+| `DeclareTimeout` | `30s` | Time limit for creating and checking the topics and subscriptions in `New`. |
+| `Topics` | | Topics to create: `Name`. |
+| `Subscriptions` | | Subscriptions to create, see below. |
+| `Subscribers` | | Named subscribers, see below. |
+
+A topic or subscription is an ID in `ProjectID`, or a full name such as `projects/shared/topics/orders` for one in another project.
+
+`New` creates the client, then the topics, then every subscription, after its dead-letter topic and subscription. Any failure closes the client and fails the bootstrap. What already exists is kept, but an existing subscription must have the settings of its config: its topic, filter, message ordering, exactly-once delivery, retry policy and dead-letter policy. Otherwise `New` fails with `pubsub: subscription exists with other settings: projects/<project>/subscriptions/billing has another retry policy; update or recreate it`. Most of these settings cannot change after a subscription is created, and `New` never changes one behind your back. Update it yourself, for example with `gcloud pubsub subscriptions update billing --min-retry-delay=1s --max-retry-delay=600s`, or delete it and let `New` create it again. The subscriptions `New` creates never expire, whereas Pub/Sub deletes a subscription after 31 days without subscribers by default.
+
+Creating needs `roles/pubsub.editor` on what you list. An app that only publishes and consumes, with `roles/pubsub.publisher` and `roles/pubsub.subscriber`, lists nothing in `Topics` and `Subscriptions` and uses topics and subscriptions created elsewhere, for example with Terraform. `New` then makes no call to Pub/Sub, and a missing topic or subscription shows up at the first publish or receive.
+
+To develop against the [emulator](https://cloud.google.com/pubsub/docs/emulator), set `PUBSUB_EMULATOR_HOST`, such as `localhost:8085`, and a `ProjectID`. The client then connects without credentials, and `New` creates the topology in the empty emulator.
+
+#### Subscriptions
+
+| `SubscriptionConfig` field | Default | Description |
+| --- | --- | --- |
+| `Name` | | The subscription. |
+| `Topic` | | The topic it receives from. |
+| `Filter` | | Delivers only the messages whose attributes match it, such as `attributes.tenant = "acme"`. Pub/Sub acknowledges the others itself. |
+| `Ordering` | `false` | Delivers the messages that share an ordering key (`Message.Key`) one at a time, in the order Pub/Sub received them. |
+| `ExactlyOnce` | `false` | Exactly-once delivery: an acknowledged message is not delivered again, and `Complete` waits until Pub/Sub confirms the acknowledgement. |
+| `Retry` | disabled | The retry policy, see [Retry policy](#retry-policy). |
+| `DeadLetter` | disabled | A dead-letter topic, see [Dead-letter topics](#dead-letter-topics). |
+
+The other subscription settings keep Pub/Sub's defaults, such as a 10s ack deadline and 7 days of retention.
+
+**Validation.** `New` fails before connecting when a topic or subscription has no `Name`, a subscription has no `Topic`, a subscriber has no `Subscription`, or `Retry` or `DeadLetter` is out of range (see below).
+
+#### Publishers and subscribers
+
+Publishers have no settings. `NewPublisher` accepts every `worker.PublisherConfig.Name`, and each message goes to the topic its `Destination` names. All publishers of the broker share one client publisher per topic, so the parallel publishes of the worker publisher's `Concurrency` are sent to Pub/Sub in batches. The client waits up to 10ms for other messages to share a batch: raise `Concurrency` for throughput.
+
+`Publish` waits, up to the worker's `PublisherConfig.Timeout`, until Pub/Sub has stored the message. Only then does the outbox mark the message processed. A publish fails, and the message stays in the outbox for the next cycle, when:
+
+- the message has no `Destination` (`pubsub: message has no Destination topic`),
+- the topic does not exist, or the credentials may not publish to it,
+- no answer arrives in time.
+
+| `SubscriberConfig` field | Default | Description |
+| --- | --- | --- |
+| `Name` | | Matches `worker.SubscriberConfig.Name`. |
+| `Subscription` | | The subscription to receive from. |
+| `MaxOutstandingMessages` | the worker subscriber's `Concurrency` | How many unsettled messages Pub/Sub delivers to this subscriber. The default keeps every handler slot busy and leaves the rest of the backlog to other instances. Messages beyond `Concurrency` wait in the subscriber, which extends their ack deadline. A negative value removes the limit. |
+| `DeadLetterTopic` | the `DeadLetter` topic of its subscription in `Subscriptions` | The topic `Reject` publishes to, for a subscription created outside `New`. |
+
+An unknown subscriber name fails the server at startup. A missing subscription does not, because `roles/pubsub.subscriber` cannot read subscriptions. Instead, receiving fails at once with `pubsub: subscriber billing: receive from projects/<project>/subscriptions/billing`, followed by Pub/Sub's `NotFound` or `PermissionDenied`, and the worker server stops the app.
+
+The worker's `SubscriberConfig.Concurrency` bounds how many messages are handled at once. The subscriber extends the ack deadline of every message it holds for up to 60 minutes. A handler that runs longer has its message delivered again meanwhile, so bound slow handlers with `HandlerConfig.Timeout`. On shutdown, the subscriber stops pulling and waits for every running handler, and the client sends their acknowledgements before `Consume` returns. Delivered messages whose handler had not started are nacked, so they are delivered again.
+
+#### Messages on the wire
+
+A `worker.Message` is published to the topic `Message.Destination`:
+
+| Pub/Sub | From |
+| --- | --- |
+| data | `Message.Payload` |
+| ordering key | `Message.Key` |
+| `x-msg-id` attribute | `Message.ID` |
+| `x-msg-name` attribute | `Message.Name` |
+| `x-msg-timestamp` attribute (Unix nanoseconds) | `Message.CreatedAt`, when set |
+| attributes | `Message.Headers` |
+
+Consuming reverses the mapping with `worker.NewMessageFromDelivery`: `Key` is the ordering key, and `Destination` is empty, because Pub/Sub does not tell a subscriber which topic a message was published to. Messages from other producers without `x-msg-id` keep the message ID Pub/Sub assigned them, which stays the same across redeliveries, and those without `x-msg-timestamp` take the time Pub/Sub received them. Without `x-msg-name`, no handler receives them (`nf_mh`).
+
+**Ordering keys.** Every client publisher enables message ordering, so a message with a `Key` never fails for want of it. The client then sends the messages of a key one batch at a time, and Pub/Sub accepts at most 1 MB/s per key. A failed publish pauses its key in the client, and `Publish` resumes it at once: the outbox publishes the message again on a later cycle, and does not keep the order of messages it retries anyway. Subscriptions deliver in key order only with `Ordering`. Pub/Sub keeps the order of messages published in one region, so publish them through a regional endpoint, such as `option.WithEndpoint("us-east1-pubsub.googleapis.com:443")`.
+
+The worker settles each delivery:
+
+| Worker | Pub/Sub | Effect |
+| --- | --- | --- |
+| `Complete` | ack | The message is removed. With `ExactlyOnce`, `Complete` waits until Pub/Sub confirms the ack. |
+| `Retry` | nack | The message is delivered again, after the delay of the subscription's [retry policy](#retry-policy) if it has one, and at once otherwise. |
+| `Reject` | ack | The message is dropped. With a [dead-letter topic](#dead-letter-topics), a copy is published there first. |
+
+Without `ExactlyOnce`, Pub/Sub acknowledgements are best effort, so a message can be delivered again after `Complete`. The inbox recognizes it by its `x-msg-id` and skips it.
+
+#### Retry policy
+
+By default, a message the worker retries is delivered again at once. Pub/Sub delays redeliveries through the subscription's retry policy:
+
+```go
+pubsub.SubscriptionConfig{
+	Name:  "billing",
+	Topic: "orders",
+	Retry: pubsub.RetryConfig{Initial: time.Second, Max: time.Minute},
+}
+```
+
+This sets the policy's minimum backoff to `Initial` and its maximum to `Max`. After a nack, Pub/Sub waits `Initial` before the next delivery, and the delay grows exponentially with every further failed delivery of the message, up to `Max`. Pub/Sub counts the deliveries itself and cannot delay a single message by request. So the attempt the worker passes to `Retry` is not used, and the retries that count no attempt, such as a lock conflict or an inbox outage, are delayed too.
+
+| `RetryConfig` field | Default | Description |
+| --- | --- | --- |
+| `Initial` | disabled | Minimum backoff, at most 10 minutes. Zero leaves the subscription without a retry policy. |
+| `Max` | `10m` | Maximum backoff, at most 10 minutes. |
+
+**Validation.** `New` fails before connecting when `Retry` has a negative value, a value over 10 minutes, or a `Max` under `Initial`.
+
+#### Dead-letter topics
+
+Messages the worker rejects are dropped unless the subscription has a dead-letter topic:
+
+```go
+pubsub.SubscriptionConfig{
+	Name:       "billing",
+	Topic:      "orders",
+	DeadLetter: pubsub.DeadLetterConfig{Enabled: true},
+}
+```
+
+This creates the topic `billing.dlq` and a subscription `billing.dlq` to it before `billing`. The subscription keeps the dead letters, because Pub/Sub drops the messages of a topic without subscriptions. When it exists, only its topic is checked, so you can change its other settings, such as a longer retention.
+
+Pub/Sub's own dead-lettering only forwards a message after a number of failed deliveries, and the worker cannot trigger it. So to reject a message, the subscriber publishes a copy of it to the dead-letter topic, waits until Pub/Sub has stored the copy, and then acknowledges the message. The copy keeps the data, the attributes and the ordering key, with the message ID in `x-msg-id`.
+
+| `DeadLetterConfig` field | Default | Description |
+| --- | --- | --- |
+| `Enabled` | `false` | Creates the dead-letter topic and subscription, and makes `Reject` publish to the topic. |
+| `Topic` | `<subscription>.dlq` | The dead-letter topic. |
+| `Subscription` | the ID of `Topic` | The subscription that keeps the dead letters. |
+| `MaxDeliveryAttempts` | no policy | Also gives the subscription a dead-letter policy, between 5 and 100: Pub/Sub itself forwards a message to `Topic` once it was delivered that many times without an ack. That catches messages that keep failing before the worker counts an attempt, such as during a long inbox outage, so set it above the worker's `MaxAttempt` plus room for those retries. The policy needs the Pub/Sub service agent, `service-<project number>@gcp-sa-pubsub.iam.gserviceaccount.com`, to have `roles/pubsub.publisher` on `Topic` and `roles/pubsub.subscriber` on the subscription. |
+
+For a subscription created outside `New`, set `SubscriberConfig.DeadLetterTopic` instead, and create the dead-letter topic and its subscription yourself.
+
+**What ends up there.** Every message the worker rejects:
+
+- a message that failed `MaxAttempt` times (the inbox marks it *failed*),
+- a message whose payload cannot be bound (`msg_bind`, inbox *rejected*),
+- a message no handler is registered for (`nf_mh`),
+
+and, with `MaxDeliveryAttempts`, the messages Pub/Sub forwards itself.
+
+**A copy that cannot be published.** The copy must be stored within the worker's `SubscriberConfig.AckTimeout`. If the topic is gone, the credentials may not publish to it or Pub/Sub does not answer in time, `Reject` fails with `pubsub: dead-letter <id> to <topic>, delivering it again` and nacks the message. A message without a handler is then rejected again on its next delivery. A message the inbox already marks *failed* or *rejected* is not: the worker acknowledges its redelivery and skips it, so it never reaches the dead-letter topic. Give the subscriber's credentials `roles/pubsub.publisher` on the dead-letter topic.
+
+Dead letters keep their `x-msg-id`, so the consumer inbox skips a replayed message as already *failed* or *rejected*. To process one again, first set its inbox row back to *waiting* with zero attempts, then publish it to the original topic again. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages).
+
+**Validation.** `New` fails before connecting when an enabled `DeadLetter` has a `MaxDeliveryAttempts` other than zero outside 5 to 100.
+
 ---
 
 ## Providers
@@ -587,6 +758,7 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | `sqldb:` | Opening or pinging the database. |
 | `redisdb:` | Validation (empty addresses, `ClusterMode` with `MasterName`, an unknown `ReadFrom`, a `DB` on a cluster) and pinging Redis. |
 | `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names and missing queues, a closed delivery channel, nacked and unroutable publishes, retries that could not be delayed, acknowledgements of deliveries from a lost channel. |
+| `pubsub:` | Validation, the client, creating and checking topics and subscriptions (`pubsub: subscription exists with other settings`), unknown subscriber names, publishes without a `Destination` or after `Close`, failed publishes, receiving, acknowledgements, dead-letter copies that could not be published. |
 | `sqltx:` | Beginning, committing or rolling back a transaction. Errors returned by your function pass through unchanged. |
 | `inbox:` | Inbox queries. `inbox.ErrNotWaiting` when a message left the waiting status. |
 | `outbox:` | Outbox queries. |

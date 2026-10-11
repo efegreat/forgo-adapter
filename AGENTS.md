@@ -4,7 +4,7 @@ Guide for coding agents and contributors working **on forgo-adapter itself**. Fo
 
 ## What forgo-adapter is
 
-The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ) and providers (a SQL transactor, inbox/outbox storages, live config stores and a live config cache, a Redis locker, a Redis rate limiter) that implement forgo's interfaces. Module path: `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)). Go 1.27. Both repositories are private and untagged before the first release, so `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with `../forgo`: a sibling forgo checkout is required to build. At release, require a tagged forgo version and remove the `replace` directive.
+The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ, Google Cloud Pub/Sub) and providers (a SQL transactor, inbox/outbox storages, live config stores and a live config cache, a Redis locker, a Redis rate limiter) that implement forgo's interfaces. Module path: `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)). Go 1.27. Both repositories are private and untagged before the first release, so `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with `../forgo`: a sibling forgo checkout is required to build. At release, require a tagged forgo version and remove the `replace` directive.
 
 The dependency points one way. **Adapters import forgo; forgo never imports adapters.** Anything a server needs from an adapter is an interface declared in forgo. When a forgo contract changes (`worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `http.IRateLimiter`, `forgo.LiveConfigStore`, `forgo.LiveConfigCache`, …), update the adapters here in the same change set.
 
@@ -26,6 +26,7 @@ forgo's four goals carry over:
 | `resource/sqldb/` | `Config` → `*sql.DB`. Applies pool limits, pings with `ConnectTimeout`, closes the pool if the ping fails. |
 | `resource/redisdb/` | `Config` → `redis.NewUniversalClient`: a `*redis.Client` for a server or a Sentinel master, a `*redis.ClusterClient` for a cluster. `ReadFrom` routes read-only commands to replicas; for a Sentinel master it builds `redis.NewFailoverClusterClient` itself, because the universal client's `ReadOnly` would send writes to a replica too. Validates the mode, `ReadFrom` and `DB` before connecting, pings with `ConnectTimeout`, closes the client if the ping fails. |
 | `resource/broker/rabbitmq/` | `Config` → `worker.IBroker`. `config.go`: config, `Sanitize`, `validate`, `RecoveryConfig`, `DeadLetterConfig`, queue args. `broker.go`: connection, owned channels, `declare` (topology through the `declarer` interface), publisher and subscriber factories. `recovery.go`: `ackGuard`, `consumerLoss` and the `recoveryHooks` around the client's connection and topology recovery. `publisher.go`: confirm-mode publishing, mandatory returns, `Message` → `amqp.Publishing` with identity headers. `subscriber.go`: prefetch, `Consume` over a `process.ConcurrentRunner`. `delivery.go`: `amqp.Delivery` → `worker.IDelivery` with guarded acknowledgements, and AMQP header values → strings (`headerValue`). |
+| `resource/broker/pubsub/` | `Config` → `worker.IBroker` on `cloud.google.com/go/pubsub/v2`. `config.go`: config, `Sanitize`, `validate`, `RetryConfig`, `DeadLetterConfig`, the `*pb.Subscription` `New` creates, and full topic and subscription names. `broker.go`: client, `declare` (create topics and subscriptions, compare existing ones), subscriber factory. `publisher.go`: `Message` → Pub/Sub message with identity attributes, and `topics`, the client publishers shared per topic. `subscriber.go`: `Receive` with `MaxOutstandingMessages` and a concurrency semaphore. `delivery.go`: Pub/Sub message → `worker.IDelivery`, dead-letter copies. |
 | `provider/sqltx/` | `operation.Transactor` on `*sql.DB`. `Run`, `From`, `Executor`: transactions carried in the context, keyed by database. |
 | `provider/inbox/` | `worker.InboxStorage` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`). `ErrNotWaiting`. |
 | `provider/outbox/` | `worker.OutboxStorage` for PostgreSQL and MySQL 8. `outbox.go`: the shared row scan. |
@@ -64,6 +65,18 @@ Do not break these without an explicit decision from the maintainer.
 - `NewSubscriber` checks the queue with a passive declare **before** the channel is owned, so the channel the broker closes on a missing queue is not recovered. Prefetch (`basic.qos`) must precede `basic.consume`, which is why consuming starts in `Consume`, where the worker's concurrency is known.
 - Publisher channels are in confirm mode. `Publish` holds the publisher's mutex from publish to confirm, so one message is in flight per channel and a mandatory return can be matched to it by message ID.
 
+### Pub/Sub
+
+- Published messages carry `worker.MessageIDHeader`, `MessageNameHeader` and `MessageTimestampHeader` as attributes, written from the `Message` fields over any header of the same name. `Message.Destination` is the topic and is required, `Message.Key` is the ordering key.
+- Every `Publisher` of a broker shares one client publisher per topic (`topics`), so the worker's parallel publishes are batched, and the broker stops them in `Close` before it closes the client. They have `EnableMessageOrdering` on, so a `Key` never fails a publish. After a failed publish, `topics.publish` resumes the message's ordering key, which the client paused: the outbox retries the message later.
+- `Delivery`: `Complete` = ack, `Retry` = nack, both through their `*WithResult` variant and waiting on the result, which only takes time with exactly-once delivery. The retry delay is the subscription's retry policy, and the attempt is not used. `Reject` publishes a copy to the dead-letter topic, waits for it and acks, or only acks without a dead-letter topic. When the copy fails, it nacks: it never acks a message whose copy was not stored.
+- Pub/Sub's dead-letter policy cannot be triggered by the client, which is why `Reject` publishes copies. `DeadLetterConfig.MaxDeliveryAttempts` only adds the policy as a backstop for messages that keep failing without a verdict.
+- `Consume` sets `ReceiveSettings.MaxOutstandingMessages` before `Receive`, and bounds the handlers with a semaphore of the worker's concurrency, because `Receive` runs up to `MaxOutstandingMessages` callbacks at once. A callback that gets no slot before the context ends nacks its message. `Receive` returns only after every callback returned **and every message it delivered was settled**, so every path settles its delivery. The worker does that for the deliveries it handles.
+- `Consume` returns `errReceiveStopped` when `Receive` ends without an error before its context, so a subscriber never stops consuming silently.
+- `New` creates only the topics and subscriptions listed in the config, and never updates one. An existing subscription must equal the config in every setting `differences` compares; a dead-letter subscription only in its topic (`topicDifference`). Created subscriptions never expire.
+- `NewSubscriber` does not check that the subscription exists: `roles/pubsub.subscriber` cannot read subscriptions. `Receive` fails at once on a missing one.
+- `NewClient` receives `context.Background()`, never a context with a deadline: the client keeps it for its credentials.
+
 ### SQL storages
 
 - Every statement goes through `sqltx.From(ctx, db)`, and every multi-statement operation through `sqltx.Run`, so storages join the transaction of `sqltx.Transactor.Do`. The worker relies on it: `MarkCompleted` must commit or roll back with the handler.
@@ -84,10 +97,10 @@ Do not break these without an explicit decision from the maintainer.
 
 ## Coding conventions
 
-- Errors: prefix with the package (`sqldb:`, `redisdb:`, `rabbitmq:`, `inbox:`, `outbox:`, `liveconfig:`, `locker:`, `ratelimit:`), wrap with `%w`, and declare sentinels as package-level `var`s.
+- Errors: prefix with the package (`sqldb:`, `redisdb:`, `rabbitmq:`, `pubsub:`, `inbox:`, `outbox:`, `liveconfig:`, `locker:`, `ratelimit:`), wrap with `%w`, and declare sentinels as package-level `var`s.
 - Doc comments on exported identifiers explain the contract and the why. Match the surrounding code.
-- Dependencies: forgo, `github.com/rabbitmq/amqp091-go`, `github.com/redis/go-redis/v9`. Test-only: `github.com/alicebob/miniredis/v2`, `github.com/DATA-DOG/go-sqlmock`. A new adapter may add the client library it wraps, and nothing else without a strong reason.
-- Tests must not need running infrastructure. Use miniredis for Redis (it runs Lua and `TIME`, and `SetTime`/`FastForward` control the clock), sqlmock for SQL (`sqlmock.NewWithDSN` plus `sql.Open("sqlmock", dsn)` exercises `sqldb.New`; storage tests set `SetMaxOpenConns(1)`, so a statement that bypasses an open transaction blocks and fails on the test's deadline), and fakes of narrow interfaces for AMQP (`declarer`, `consumeChannel`, `publishChannel`, `confirmation` and `amqp.Acknowledger`). Table-driven where possible, passing under `-race`.
+- Dependencies: forgo, `github.com/rabbitmq/amqp091-go`, `github.com/redis/go-redis/v9`, `cloud.google.com/go/pubsub/v2` (with `google.golang.org/api/option` for its client options). Test-only: `github.com/alicebob/miniredis/v2`, `github.com/DATA-DOG/go-sqlmock`. A new adapter may add the client library it wraps, and nothing else without a strong reason.
+- Tests must not need running infrastructure. Use miniredis for Redis (it runs Lua and `TIME`, and `SetTime`/`FastForward` control the clock), sqlmock for SQL (`sqlmock.NewWithDSN` plus `sql.Open("sqlmock", dsn)` exercises `sqldb.New`; storage tests set `SetMaxOpenConns(1)`, so a statement that bypasses an open transaction blocks and fails on the test's deadline), fakes of narrow interfaces for AMQP (`declarer`, `consumeChannel`, `publishChannel`, `confirmation` and `amqp.Acknowledger`), and `pstest` for Pub/Sub, the in-memory server of the client module, which the real client connects to with `option.WithGRPCConn`. Table-driven where possible, passing under `-race`.
 
 ## Workflow
 
@@ -129,3 +142,5 @@ When you change behavior:
 When you find one, verify it against the code and add it here with a `file:line` reference. Delete it in the change that fixes it.
 
 - The RabbitMQ adapter is tested against fakes of the client only. Recovery, confirms and dead-lettering have not run against a live broker in this repository's tests.
+- The Pub/Sub adapter is tested against `pstest` only, which applies neither retry-policy delays nor IAM.
+- A Pub/Sub message whose dead-letter copy cannot be published is nacked (`resource/broker/pubsub/delivery.go:75`). When the inbox already marks it *failed* or *rejected*, the worker's idempotency guard acknowledges the redelivery, so the message never reaches the dead-letter topic. RabbitMQ dead-letters on the broker and has no such window.
