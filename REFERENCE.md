@@ -11,6 +11,7 @@ The complete guide to the forgo adapter library. New here? Start with the [READM
   - [redisdb](#redisdb)
   - [rabbitmq](#rabbitmq)
   - [pubsub](#pubsub)
+  - [redisstream](#redisstream)
 - [Providers](#providers)
   - [sqltx](#sqltx)
   - [inbox and outbox](#inbox-and-outbox)
@@ -37,6 +38,7 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `redisdb` | `github.com/efegreat/forgo-adapter/resource/redisdb` | resource | `*redis.Client` or `*redis.ClusterClient` → `redis.UniversalClient` | |
 | `rabbitmq` | `github.com/efegreat/forgo-adapter/resource/broker/rabbitmq` | resource | `worker.IBroker` | |
 | `pubsub` | `github.com/efegreat/forgo-adapter/resource/broker/pubsub` | resource | `worker.IBroker` | |
+| `redisstream` | `github.com/efegreat/forgo-adapter/resource/broker/redisstream` | resource | `worker.IBroker` | |
 | `sqltx` | `github.com/efegreat/forgo-adapter/provider/sqltx` | provider | `*Transactor` → `operation.Transactor` | `*sql.DB` |
 | `inbox` | `github.com/efegreat/forgo-adapter/provider/inbox` | provider | `*Postgres`, `*Mysql` → `worker.InboxStorage` | `*sql.DB` |
 | `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*Mysql` → `worker.OutboxStorage` | `*sql.DB` |
@@ -549,6 +551,182 @@ Dead letters keep their `x-msg-id`, so the consumer inbox skips a replayed messa
 
 **Validation.** `New` fails before connecting when an enabled `DeadLetter` has a `MaxDeliveryAttempts` other than zero outside 5 to 100.
 
+### redisstream
+
+A Redis Streams broker for forgo's [worker](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#worker), on go-redis v9 and Redis 6.2 or newer. Its value is the `worker.IBroker` that both `worker.ConsumerConfig` and `worker.ProducerConfig` resolve. A stream plays the part of a topic, and each consumer group the part of a subscription: every group receives every entry once, spread over the instances that read it.
+
+```go
+import "github.com/efegreat/forgo-adapter/resource/broker/redisstream"
+
+var Broker = redisstream.Config{
+	Name:  "events",
+	Redis: Redis, // a redisdb.Config: one server, a cluster or a Sentinel master
+	Streams: []redisstream.StreamConfig{
+		{
+			Name:   "orders",
+			MaxLen: 1_000_000, // trimmed on every publish
+			Groups: []redisstream.GroupConfig{{Name: "billing"}, {Name: "shipping"}},
+		},
+	},
+	Subscribers: []redisstream.SubscriberConfig{
+		{
+			Name:       "billing", // reads the group billing
+			Stream:     "orders",
+			Retry:      redisstream.RetryConfig{Initial: time.Second}, // delayed retries: 1s, 2s, 4s… up to ClaimIdle
+			DeadLetter: redisstream.DeadLetterConfig{Enabled: true},   // orders:billing:dlq
+		},
+	},
+}
+```
+
+#### Connection and streams
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `Name` | | The resource name. |
+| `Redis` | see [redisdb](#redisdb) | The connection. The broker opens a client of its own, so the connections its subscribers hold while they wait for entries never come from the pool of your providers. Its `Name` is not used. |
+| `Streams` | | Streams to trim and groups to create, see below. |
+| `Subscribers` | | Named subscribers, see below. |
+
+| `StreamConfig` field | Default | Description |
+| --- | --- | --- |
+| `Name` | | The key of the stream. |
+| `MaxLen` | no trimming | Trims the stream to about `MaxLen` entries on every entry the broker adds to it (`XADD MAXLEN ~`). See [Trimming](#trimming). |
+| `Groups` | | Consumer groups to create: `Name`, and `StartID`, the last entry the group counts as delivered when it is created. `$` (the default) delivers only the entries added afterwards, `0` every entry the stream holds. |
+
+`New` connects with `Redis` like the `redisdb` resource, with its validation and startup ping. It then creates every group of `Streams` that does not exist, and its stream with it (`XGROUP CREATE … MKSTREAM`). A group that exists is kept as it is, with its position, so `StartID` only applies when a group is created. Any failure closes the client and fails the bootstrap, for example `redisstream: create group billing of stream orders: WRONGTYPE …` when the key holds another type.
+
+List the groups in the config the producer uses too. With `$`, a group created after a message was published never receives it, so the group must exist before the first publish. When both servers share the broker config, whichever starts first creates the groups.
+
+Every command touches a single key, so the broker works on Redis Cluster. A dead-letter stream is another key, which the broker writes with commands of its own, so it may hash to another slot.
+
+**Validation.** `New` fails before connecting when a stream has no `Name` or is listed twice, `MaxLen` is negative, a group has no `Name`, a subscriber has no `Stream`, or `ClaimIdle`, `Retry` or `DeadLetter` is out of range (see below).
+
+#### Publishers and subscribers
+
+Publishers have no settings. `NewPublisher` accepts every `worker.PublisherConfig.Name`, and each message is added to the stream its `Destination` names, which Redis creates when it does not exist. `Publish` returns, up to the worker's `PublisherConfig.Timeout`, once Redis has added the entry, and only then does the outbox mark the message processed. A publish fails, and the message stays in the outbox for the next cycle, when:
+
+- the message has no `Destination` (`redisstream: message has no Destination stream`),
+- the key holds another type (`WRONGTYPE`), or Redis is out of memory with the `noeviction` policy (`OOM`),
+- Redis cannot be reached or does not answer in time.
+
+Redis acknowledges an entry once it is in memory. It is on disk after the next `fsync` of the append-only file (`appendfsync everysec` by default), and it reaches replicas asynchronously, so a crash or a failover can lose entries Redis acknowledged, which the outbox no longer holds. For durable messages, enable the append-only file and keep the failover window small.
+
+| `SubscriberConfig` field | Default | Description |
+| --- | --- | --- |
+| `Name` | | Matches `worker.SubscriberConfig.Name`. |
+| `Stream` | | The stream to read. |
+| `Group` | `Name` | The consumer group to read as. It must exist when the server starts. |
+| `ClaimIdle` | `1m` | How long an entry stays pending without a sign of its consumer before another consumer claims it. At least `1s`. See [Claiming pending entries](#claiming-pending-entries). |
+| `Retry` | disabled | Delays retried entries, see [Delayed retries](#delayed-retries). |
+| `DeadLetter` | disabled | A dead-letter stream, see [Dead-letter streams](#dead-letter-streams). |
+
+Each subscriber reads as a consumer of its own, named after the host with a random suffix, such as `billing-7d9f-x2k4p-UJ4K5N7QRA`, which the worker server creates when it starts (`XGROUP CREATECONSUMER`). An unknown subscriber name, or a stream or group that does not exist, fails the server at startup: `redisstream: subscriber billing: create consumer in group billing of stream orders: NOGROUP …`.
+
+A subscriber reads no more new entries (`XREADGROUP`) than it has free handler slots, so the rest of the backlog stays in the stream for other instances, and waits up to a second for new ones. The worker's `SubscriberConfig.Concurrency` bounds how many entries are handled at once. Entries are read in the order of the stream, but handled in parallel, and retried entries come back after newer ones, so there is no ordering by `Key`.
+
+On shutdown, the subscriber stops reading within a second and waits for every running handler. It then deletes its consumer from the group, unless the consumer still has pending entries, such as one whose acknowledgement failed: deleting it would drop them from the group.
+
+While Redis cannot be reached, is loading its data or fails over, the subscriber keeps trying, with a pause of a second after every failure. Any other error reply stops it, and the worker server stops the app, for example `redisstream: subscriber billing: read group billing of stream orders: NOGROUP …` once the group was deleted. When the group is listed in `Streams`, the restarted app creates it again.
+
+#### Messages on the wire
+
+A `worker.Message` is added to the stream `Message.Destination` as one entry:
+
+| Field | From |
+| --- | --- |
+| `x-msg-id` | `Message.ID` |
+| `x-msg-name` | `Message.Name` |
+| `x-msg-timestamp` (Unix nanoseconds) | `Message.CreatedAt`, when set |
+| every header | `Message.Headers` |
+| `x-msg-key` (`redisstream.KeyField`) | `Message.Key`, when set |
+| `payload` (`redisstream.PayloadField`) | `Message.Payload` |
+
+The identity fields are written from the message over any header of the same name, and headers named `payload` or `x-msg-key` are not sent. Consuming reverses the mapping with `worker.NewMessageFromDelivery`: `Key` comes from `x-msg-key`, `Destination` is the stream, and every other field is a header. Entries of other producers without `x-msg-id` take the entry ID, which stays the same across redeliveries, and those without `x-msg-timestamp` the time in the entry ID, when Redis added the entry. Without `x-msg-name`, no handler receives them (`nf_mh`). Another producer only needs `XADD orders * x-msg-name order.placed payload '{"id":1}'`.
+
+The worker settles each delivery:
+
+| Worker | Redis | Effect |
+| --- | --- | --- |
+| `Complete` | `XACK` | The entry leaves the group's pending entries. It stays in the stream until it is trimmed. |
+| `Retry` | `XCLAIM … IDLE … JUSTID` to `forgo-retry` | A consumer of the group claims the entry again after its [delay](#delayed-retries), or at once without `Retry`. |
+| `Reject` | `XACK` | The entry is dropped from the group. With a [dead-letter stream](#dead-letter-streams), a copy is added there first. |
+
+A settlement that fails, for example while Redis cannot be reached, leaves the entry pending, and another consumer claims it once it was idle for `ClaimIdle`. The inbox recognizes it by its `x-msg-id`. Acknowledging an entry that is no longer pending, because a duplicate settled it or it was trimmed, succeeds.
+
+#### Claiming pending entries
+
+A consumer that stops without settling its entries, because it crashed, was killed or lost its connection, leaves them pending in the group. Every subscriber with a free handler slot claims the entries of its group that were idle for `ClaimIdle` (`XAUTOCLAIM`), about once a second and before it reads new entries, and handles them. So after a crash, its messages are delivered again about `ClaimIdle` later.
+
+While a handler runs, its subscriber resets the idle time of the entry every `ClaimIdle`/3 (`XCLAIM … JUSTID`, which counts no delivery). A handler may therefore run longer than `ClaimIdle`, and only an instance that cannot reach Redis for `ClaimIdle`, for example because of a network partition, loses its entries to another consumer. Both then handle the message: the inbox completes it once, and a `HandlerConfig.Lock` keeps them from running at the same time.
+
+`ClaimIdle` is also the longest retry delay. Raise it for longer delays, at the price of a slower recovery after a crash. Every subscriber of a group needs the same `ClaimIdle`.
+
+The consumers of instances that crashed stay in the group without pending entries once their entries are claimed. They cost a few bytes each, and `XGROUP DELCONSUMER orders billing <consumer>` deletes one.
+
+#### Delayed retries
+
+By default, a retried entry is claimed again at once, within about a second. Without a delay, a downstream outage of a few seconds uses up every `MaxAttempt`, and a lock conflict or an inbox outage redelivers every second until it is resolved. `Retry` delays each redelivery:
+
+```go
+redisstream.SubscriberConfig{
+	Name:   "billing",
+	Stream: "orders",
+	Retry:  redisstream.RetryConfig{Initial: time.Second, Max: 30 * time.Second},
+}
+```
+
+The delay doubles with every failed attempt, from `Initial` up to `Max`, from the attempt the worker passes to `Retry`:
+
+| Attempt | Delay |
+| --- | --- |
+| 1, and 0 for a failure before the attempt was counted (lock conflict, inbox outage) | `Initial` |
+| n | `Initial` × 2ⁿ⁻¹, at most `Max` |
+
+Redis Streams have no delays of their own. To retry, the subscriber hands the entry to the consumer `forgo-retry` of the group and sets its idle time to `ClaimIdle` minus the delay, so the consumers of the group claim it once the delay has passed. The waiting entry holds no handler slot and stays in the stream, and `XPENDING orders billing - + 10 forgo-retry` lists the entries waiting for a retry. A retry comes back up to about a second after its delay, and no delay is longer than `ClaimIdle`. If the hand-over fails, the entry is claimed again once it was idle for `ClaimIdle`.
+
+| `RetryConfig` field | Default | Description |
+| --- | --- | --- |
+| `Initial` | disabled | Delay after the first failed attempt, at least 1ms. Zero claims retried entries again at once. |
+| `Max` | `ClaimIdle` | The longest delay, at most `ClaimIdle`. |
+
+**Validation.** `New` fails before connecting when `Retry` has a negative value, an `Initial` under 1ms, a value over `ClaimIdle`, or a `Max` under `Initial`.
+
+#### Dead-letter streams
+
+Entries the worker rejects are acknowledged and dropped from the group unless the subscriber has a dead-letter stream:
+
+```go
+redisstream.SubscriberConfig{
+	Name:       "billing",
+	Stream:     "orders",
+	DeadLetter: redisstream.DeadLetterConfig{Enabled: true},
+}
+```
+
+To reject an entry, the subscriber adds a copy of it to `orders:billing:dlq`, then acknowledges the entry. The copy keeps every field, with the message ID in `x-msg-id`. Redis creates the stream with the first dead letter. List it in `Streams` with a `MaxLen` to trim it.
+
+| `DeadLetterConfig` field | Default | Description |
+| --- | --- | --- |
+| `Enabled` | `false` | Makes `Reject` copy entries to `Stream`. |
+| `Stream` | `<stream>:<group>:dlq` | The dead-letter stream. Several subscribers may share one. |
+
+**What ends up there.** Every message the worker rejects:
+
+- a message that failed `MaxAttempt` times (the inbox marks it *failed*),
+- a message whose payload cannot be bound (`msg_bind`, inbox *rejected*),
+- a message no handler is registered for (`nf_mh`).
+
+**A copy that cannot be added.** When the key holds another type or Redis does not answer within the worker's `SubscriberConfig.AckTimeout`, `Reject` fails with `redisstream: dead-letter <id> to <stream>, delivering it again` and the entry is claimed again at once. A message without a handler is then rejected again. A message the inbox already marks *failed* or *rejected* is not: the worker acknowledges its redelivery and skips it, so it never reaches the dead-letter stream.
+
+Dead letters keep their `x-msg-id`, so the consumer inbox skips a replayed message as already *failed* or *rejected*. To process one again, first set its inbox row back to *waiting* with zero attempts, then add it to the original stream again, for example with `XADD` of its fields. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages). Read them with `XRANGE orders:billing:dlq - +`, and delete one with `XDEL` once handled.
+
+**Validation.** `New` fails before connecting when `DeadLetter.Stream` is the stream the subscriber reads.
+
+#### Trimming
+
+Redis keeps every entry of a stream until it is trimmed, also once every group acknowledged it. `MaxLen` trims the stream on every entry the broker adds to it, to about `MaxLen` entries: Redis trims whole nodes of its stream, so it keeps somewhat more. Trimming drops the oldest entries whether or not every group has read and acknowledged them, including the pending ones and the ones waiting for a retry, so a dropped entry is never delivered again. Size `MaxLen` well above the backlog a group can fall behind by. Without `MaxLen`, trim the stream yourself, for example with `XTRIM orders MINID ~ <id>` from a cron job.
+
 ---
 
 ## Providers
@@ -759,6 +937,7 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | `redisdb:` | Validation (empty addresses, `ClusterMode` with `MasterName`, an unknown `ReadFrom`, a `DB` on a cluster) and pinging Redis. |
 | `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names and missing queues, a closed delivery channel, nacked and unroutable publishes, retries that could not be delayed, acknowledgements of deliveries from a lost channel. |
 | `pubsub:` | Validation, the client, creating and checking topics and subscriptions (`pubsub: subscription exists with other settings`), unknown subscriber names, publishes without a `Destination` or after `Close`, failed publishes, receiving, acknowledgements, dead-letter copies that could not be published. |
+| `redisstream:` | Validation, connecting (wrapping the `redisdb:` error), creating groups, unknown subscriber names and missing streams or groups, publishes without a `Destination` and failed publishes, reads and claims that stopped a subscriber, acknowledgements, retries and dead-letter copies that failed, deleting a consumer on `Close`. |
 | `sqltx:` | Beginning, committing or rolling back a transaction. Errors returned by your function pass through unchanged. |
 | `inbox:` | Inbox queries. `inbox.ErrNotWaiting` when a message left the waiting status. |
 | `outbox:` | Outbox queries. |
