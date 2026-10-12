@@ -112,6 +112,71 @@ func TestRedisContext(t *testing.T) {
 	}
 }
 
+func TestRedisWaitLock(t *testing.T) {
+	ctx := context.Background()
+	cl, _ := newTestClient(t)
+	l, other := NewRedis(cl), NewRedis(cl)
+
+	t.Run("free", func(t *testing.T) {
+		ok, err := l.WaitLock(ctx, "free", 3, time.Hour, time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("WaitLock = %v, %v; want true, nil", ok, err)
+		}
+	})
+
+	if ok, err := other.Lock(ctx, "held", time.Minute); err != nil || !ok {
+		t.Fatalf("other Lock = %v, %v", ok, err)
+	}
+
+	t.Run("held, no wait after the last attempt", func(t *testing.T) {
+		const delay = 50 * time.Millisecond
+		start := time.Now()
+		ok, err := l.WaitLock(ctx, "held", 2, delay, time.Minute)
+		if err != nil || ok {
+			t.Fatalf("WaitLock = %v, %v; want false, nil", ok, err)
+		}
+		if elapsed := time.Since(start); elapsed >= 2*delay {
+			t.Fatalf("WaitLock took %v, want one delay (%v) for two attempts", elapsed, delay)
+		}
+	})
+
+	t.Run("zero attempts tries once", func(t *testing.T) {
+		ok, err := l.WaitLock(ctx, "once", 0, time.Hour, time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("WaitLock = %v, %v; want true, nil", ok, err)
+		}
+	})
+
+	t.Run("context canceled while waiting", func(t *testing.T) {
+		waitCtx, cancel := context.WithCancel(ctx)
+		time.AfterFunc(20*time.Millisecond, cancel)
+		ok, err := l.WaitLock(waitCtx, "held", 3, time.Hour, time.Minute)
+		if ok || !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitLock = %v, %v; want false, context.Canceled", ok, err)
+		}
+	})
+
+	t.Run("context canceled before", func(t *testing.T) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		ok, err := l.WaitLock(canceled, "free-again", 3, time.Hour, time.Minute)
+		if ok || !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitLock = %v, %v; want false, context.Canceled", ok, err)
+		}
+	})
+
+	t.Run("released while waiting", func(t *testing.T) {
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			_ = other.Unlock(ctx, "held")
+		}()
+		ok, err := l.WaitLock(ctx, "held", 50, 5*time.Millisecond, time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("WaitLock = %v, %v; want true, nil", ok, err)
+		}
+	})
+}
+
 func TestRedisStoreError(t *testing.T) {
 	ctx := context.Background()
 	cl, m := newTestClient(t)

@@ -47,6 +47,30 @@ func (r *Redis) Lock(ctx context.Context, key string, ttl time.Duration) (bool, 
 	return ok, nil
 }
 
+// WaitLock tries to acquire key up to attempts times, waiting delay between tries but not after the
+// last one. It stops early with ctx's error when ctx is done. Fewer than one attempt means one.
+func (r *Redis) WaitLock(ctx context.Context, key string, attempts int, delay, ttl time.Duration) (bool, error) {
+	attempts = max(attempts, 1)
+	for i := range attempts {
+		ok, err := r.Lock(ctx, key, ttl)
+		if err != nil || ok {
+			return ok, err
+		}
+		if i == attempts-1 {
+			break
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return false, nil
+}
+
 // Unlock releases key. It returns ErrNotHeld when the lock expired before Unlock and leaves the key
 // untouched, because another process may hold it now.
 func (r *Redis) Unlock(ctx context.Context, key string) error {
