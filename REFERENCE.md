@@ -806,11 +806,13 @@ forgo.WithProviders(locker.NewRedis),
 
 | Method | Behavior |
 | --- | --- |
-| `Lock(key, ttl)` | `SET key token NX PX ttl`. Returns whether the lock was acquired. |
-| `WaitLock(ctx, key, attempts, delay, ttl)` | Tries up to `attempts` times (at least once), waiting `delay` between tries but not after the last one. Returns `ctx.Err()` when `ctx` ends first. |
-| `Unlock(key)` | Deletes the key only while it still holds this process's token. Otherwise returns `locker.ErrNotHeld` and leaves the key alone. |
+| `Lock(ctx, key, ttl)` | `SET key token NX PX ttl`, once, without waiting. Returns whether the lock was acquired, and an error only when Redis fails. |
+| `WaitLock(ctx, key, attempts, delay, ttl)` | Tries up to `attempts` times (at least once), waiting `delay` between tries but not after the last one. Returns `ctx.Err()` when `ctx` ends first. forgo's servers never call it; it is for application code that waits for a lock. |
+| `Unlock(ctx, key)` | Deletes the key only while it still holds this process's token. Otherwise returns `locker.ErrNotHeld` and leaves the key alone. |
 
-The token is random per `locker.Redis`, so one instance per process. A lock that expires while its operation still runs can be taken by another process. The late `Unlock` then fails with `ErrNotHeld` instead of releasing the other process's lock, and forgo's `Locker` middleware logs that failure at critical severity. A TTL that is too short for the operation shows up in your logs this way. Size `Lock.Ttl` to the longest expected run.
+All three run on the caller's context. forgo's `Locker` middleware passes the operation's context to `Lock`, and to `Unlock` a copy that is never canceled, so that a lock is released even after its operation's context ended.
+
+The token is random per `locker.Redis`, so one instance per process. A lock that expires while its operation still runs can be taken by another process. The late `Unlock` then fails with `ErrNotHeld` instead of releasing the other process's lock, and forgo's `Locker` middleware logs that failure at critical severity. A TTL that is too short for the operation shows up in your logs this way. Size `Lock.TTL` to the longest expected run, every retry included.
 
 Keys are used as given. forgo builds them from your `Lock.Key`, for example `<Key>-<subscriber>-<messageID>` for message handlers.
 
@@ -901,7 +903,7 @@ var (
 			MaxAttempt:  5, // then rejected → billing.dlq
 			Handlers: []worker.HandlerConfig{{
 				Name:    "order.placed", // runs in a sqltx transaction with its inbox completion
-				Lock:    operation.Lock{Key: "order-placed", Ttl: time.Minute}, // locker.Redis
+				Lock:    operation.Lock{Key: "order-placed", TTL: time.Minute}, // locker.Redis
 				Handler: worker.HandlerFor((*billing.Service).OnOrderPlaced),
 			}},
 		}},

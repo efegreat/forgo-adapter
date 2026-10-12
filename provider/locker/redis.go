@@ -38,21 +38,21 @@ func NewRedis(cl redis.UniversalClient) *Redis {
 	return &Redis{cl: cl, token: rand.Text()}
 }
 
-// Lock acquires key for ttl and reports whether it was acquired.
-func (r *Redis) Lock(key string, ttl time.Duration) (bool, error) {
-	ok, err := r.cl.SetNX(context.Background(), key, r.token, ttl).Result()
+// Lock tries once to acquire key for ttl and reports whether it was acquired.
+func (r *Redis) Lock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	ok, err := r.cl.SetNX(ctx, key, r.token, ttl).Result()
 	if err != nil {
 		return false, fmt.Errorf("locker: lock %s: %w", key, err)
 	}
 	return ok, nil
 }
 
-// WaitLock tries to acquire key up to attempts times, waiting delay between tries. It stops early
-// with ctx's error when ctx is done. Fewer than one attempt means one.
+// WaitLock tries to acquire key up to attempts times, waiting delay between tries but not after the
+// last one. It stops early with ctx's error when ctx is done. Fewer than one attempt means one.
 func (r *Redis) WaitLock(ctx context.Context, key string, attempts int, delay, ttl time.Duration) (bool, error) {
 	attempts = max(attempts, 1)
 	for i := range attempts {
-		ok, err := r.Lock(key, ttl)
+		ok, err := r.Lock(ctx, key, ttl)
 		if err != nil || ok {
 			return ok, err
 		}
@@ -73,8 +73,8 @@ func (r *Redis) WaitLock(ctx context.Context, key string, attempts int, delay, t
 
 // Unlock releases key. It returns ErrNotHeld when the lock expired before Unlock and leaves the key
 // untouched, because another process may hold it now.
-func (r *Redis) Unlock(key string) error {
-	deleted, err := unlockScript.Run(context.Background(), r.cl, []string{key}, r.token).Int64()
+func (r *Redis) Unlock(ctx context.Context, key string) error {
+	deleted, err := unlockScript.Run(ctx, r.cl, []string{key}, r.token).Int64()
 	if err != nil {
 		return fmt.Errorf("locker: unlock %s: %w", key, err)
 	}
