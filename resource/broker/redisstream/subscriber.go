@@ -112,7 +112,7 @@ func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 			entries, err = s.read(rctx, n)
 		}
 		for range n - len(entries) {
-			_ = slots.Release()
+			slots.Release()
 		}
 		if err != nil {
 			if !transient(err) {
@@ -128,7 +128,7 @@ func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 			d := newDelivery(s, e)
 			s.inflight.add(d)
 			handlers.Go(func() {
-				defer func() { _ = slots.Release() }()
+				defer slots.Release()
 				defer s.inflight.remove(d)
 				state.Handler(ctx, d)
 			})
