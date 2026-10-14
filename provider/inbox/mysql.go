@@ -12,17 +12,18 @@ import (
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
-// Mysql is a worker.InboxStorage on the inbox_events table of a MySQL 8 database.
-type Mysql struct {
+// MySQL is a worker.InboxStorage on the inbox_events table of a MySQL 8 database.
+type MySQL struct {
 	db *sql.DB
 }
 
-// NewMysql returns an inbox storage using db, for forgo.WithProviders.
-func NewMysql(db *sql.DB) *Mysql {
-	return &Mysql{db: db}
+// NewMySQL returns an inbox storage using db, for forgo.WithProviders.
+func NewMySQL(db *sql.DB) *MySQL {
+	return &MySQL{db: db}
 }
 
-func (m *Mysql) Status(
+// Status returns the status of the message for the subscriber, and false when the inbox has no row for it.
+func (m *MySQL) Status(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -55,7 +56,9 @@ func (m *Mysql) Status(
 	return status, true, nil
 }
 
-func (m *Mysql) IncrementAttempt(
+// IncrementAttempt counts an attempt at a waiting message and returns the count, inserting the
+// message on its first attempt. It returns ErrNotWaiting once the message left waiting.
+func (m *MySQL) IncrementAttempt(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -154,7 +157,9 @@ func (m *Mysql) IncrementAttempt(
 	return attempts, nil
 }
 
-func (m *Mysql) MarkCompleted(
+// MarkCompleted moves the waiting message to completed. It fails unless it moved the message itself,
+// as the package documentation explains.
+func (m *MySQL) MarkCompleted(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -168,7 +173,8 @@ func (m *Mysql) MarkCompleted(
 	)
 }
 
-func (m *Mysql) MarkFailed(
+// MarkFailed moves the waiting message to failed. Repeating it succeeds.
+func (m *MySQL) MarkFailed(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -182,7 +188,8 @@ func (m *Mysql) MarkFailed(
 	)
 }
 
-func (m *Mysql) MarkRejected(
+// MarkRejected moves the waiting message to rejected. Repeating it succeeds.
+func (m *MySQL) MarkRejected(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -196,7 +203,7 @@ func (m *Mysql) MarkRejected(
 	)
 }
 
-func (m *Mysql) markStatus(
+func (m *MySQL) markStatus(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -252,7 +259,9 @@ func (m *Mysql) markStatus(
 	return unmoved(current, exists, target, repeatable)
 }
 
-func (m *Mysql) DeleteBefore(
+// DeleteBefore deletes up to limit completed and rejected messages last updated before before, and
+// returns how many it deleted.
+func (m *MySQL) DeleteBefore(
 	ctx context.Context,
 	before time.Time,
 	limit int,

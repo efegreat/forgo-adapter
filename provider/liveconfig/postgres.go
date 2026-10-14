@@ -16,10 +16,13 @@ func NewPostgres(db *sql.DB) *Postgres {
 	return &Postgres{db: db}
 }
 
+// Get reads the row of name. Without one, it returns version 0.
 func (p *Postgres) Get(ctx context.Context, name string) ([]byte, uint64, error) {
 	return get(ctx, p.db, `SELECT data, version FROM live_configs WHERE name = $1`, name)
 }
 
+// Set inserts the row of name when version is 0, and otherwise updates it only while it holds version.
+// When no row changed, it returns forgo.ErrLiveConfigConflict.
 func (p *Postgres) Set(ctx context.Context, name string, data []byte, version uint64) error {
 	var (
 		res sql.Result

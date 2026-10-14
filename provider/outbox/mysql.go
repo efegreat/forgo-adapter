@@ -12,21 +12,21 @@ import (
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
-// Mysql is a worker.OutboxStorage on the outbox_events table of a MySQL 8 database.
+// MySQL is a worker.OutboxStorage on the outbox_events table of a MySQL 8 database.
 // Statements join the transaction a sqltx.Transactor put in the context.
-type Mysql struct {
+type MySQL struct {
 	db *sql.DB
 }
 
-// NewMysql returns an outbox storage using db, for forgo.WithProviders.
-func NewMysql(db *sql.DB) *Mysql {
-	return &Mysql{db: db}
+// NewMySQL returns an outbox storage using db, for forgo.WithProviders.
+func NewMySQL(db *sql.DB) *MySQL {
+	return &MySQL{db: db}
 }
 
 // Claim selects the messages and stamps them in one transaction. Claims are stamped and expired on
 // the database clock (see claimAge), in UTC so that neither the session time zone nor its daylight
 // saving changes move them.
-func (m *Mysql) Claim(
+func (m *MySQL) Claim(
 	ctx context.Context,
 	claim worker.Claim,
 ) ([]worker.Message, error) {
@@ -106,7 +106,9 @@ func (m *Mysql) Claim(
 	return messages, nil
 }
 
-func (m *Mysql) Complete(
+// Complete marks the messages of successfulIDs processed and releases the other messages of the
+// claim, so that the next claim takes them again, in one transaction.
+func (m *MySQL) Complete(
 	ctx context.Context,
 	claimID string,
 	successfulIDs []string,
@@ -175,7 +177,9 @@ func (m *Mysql) Complete(
 	})
 }
 
-func (m *Mysql) DeleteProcessedBefore(
+// DeleteProcessedBefore deletes up to limit messages processed before before, and returns how many
+// it deleted.
+func (m *MySQL) DeleteProcessedBefore(
 	ctx context.Context,
 	before time.Time,
 	limit int,

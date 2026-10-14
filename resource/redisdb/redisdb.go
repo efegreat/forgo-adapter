@@ -1,3 +1,5 @@
+// Package redisdb is a Redis resource: a go-redis universal client for one server, a Redis Cluster or a
+// Sentinel-managed master, connected and verified when the application starts and closed when it stops.
 package redisdb
 
 import (
@@ -39,6 +41,8 @@ const (
 // Providers should request redis.UniversalClient, which both satisfy, so they work with every
 // deployment shape.
 type Config struct {
+	// Name identifies the resource and must be unique in the bootstrap. `boot:"name"` tags select it
+	// by this name when the bootstrap has several Redis deployments. Required.
 	Name string
 	// Addrs is a list of host:port addresses: the server, the seed nodes of a cluster, or the
 	// Sentinels of MasterName. Two or more addresses without MasterName make a cluster client.
@@ -53,6 +57,7 @@ type Config struct {
 	// ReadFrom chooses the nodes that serve read-only commands. A single-server client has one
 	// node and ignores it, so one config can serve every environment. Default: ReadFromMaster.
 	ReadFrom ReadFrom
+	// Username and Password authenticate against the server, the cluster nodes or the master.
 	Username string
 	Password string
 	// SentinelUsername and SentinelPassword authenticate against the Sentinels of MasterName, when
@@ -75,6 +80,7 @@ type Config struct {
 	ConnectTimeout time.Duration
 }
 
+// Sanitize returns a copy of the config with defaults applied to its zero fields.
 func (c Config) Sanitize() Config {
 	if len(c.Addrs) == 0 {
 		c.Addrs = []string{"localhost:6379"}
@@ -88,6 +94,8 @@ func (c Config) Sanitize() Config {
 	return c
 }
 
+// New validates the config, creates the client and pings Redis within ConnectTimeout, so that an
+// unreachable deployment stops the application before it serves. Its Resource is a *Redis.
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
@@ -170,19 +178,23 @@ func (c Config) target() string {
 	return addrs
 }
 
+// Redis is the resource New returns. Its Value is the redis.UniversalClient.
 type Redis struct {
 	name   string
 	client redis.UniversalClient
 }
 
+// Name returns Config.Name.
 func (r *Redis) Name() string {
 	return r.name
 }
 
+// Value returns the client: a *redis.Client or a *redis.ClusterClient, as Config describes.
 func (r *Redis) Value() any {
 	return r.client
 }
 
+// Close closes the client and its connections.
 func (r *Redis) Close() error {
 	return r.client.Close()
 }

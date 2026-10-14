@@ -112,6 +112,7 @@ func (p *Publisher) dropReturns() {
 	}
 }
 
+// Close closes the publisher's channel.
 func (p *Publisher) Close() error {
 	if p.release != nil {
 		p.release()

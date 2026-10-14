@@ -1,0 +1,43 @@
+name: Bug report
+description: An adapter does not work as documented.
+labels: [bug]
+body:
+  - type: dropdown
+    id: adapter
+    attributes:
+      label: Adapter
+      options:
+        - sqldb
+        - redisdb
+        - rabbitmq
+        - pubsub
+        - redisstream
+        - sqltx
+        - inbox
+        - outbox
+        - locker
+        - ratelimit
+        - liveconfig
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Include logs if they help, with secrets removed.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The smallest program or test that shows the problem.
+      render: go
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: forgo-adapter, forgo, Go, and the database, broker or Redis server.
+      placeholder: forgo-adapter v1.2.3, forgo v1.2.3, go1.27.2, RabbitMQ 4.1
+    validations:
+      required: true

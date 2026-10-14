@@ -1,3 +1,5 @@
+// Package sqldb is a database/sql resource: a *sql.DB with pool limits, opened and verified when the
+// application starts and closed when it stops.
 package sqldb
 
 import (
@@ -13,6 +15,8 @@ import (
 // Config is a database/sql resource. Its Value is the *sql.DB providers request.
 // Import the driver for DriverName in main.
 type Config struct {
+	// Name identifies the resource and must be unique in the bootstrap. `boot:"name"` tags select it
+	// by this name when the bootstrap has several databases. Required.
 	Name string
 	// DriverName is the registered database/sql driver, such as "postgres" or "mysql".
 	DriverName string
@@ -30,6 +34,7 @@ type Config struct {
 	ConnectTimeout time.Duration
 }
 
+// Sanitize returns a copy of the config with defaults applied to its zero fields.
 func (s Config) Sanitize() Config {
 	if s.ConnectTimeout == 0 {
 		s.ConnectTimeout = time.Second * 5
@@ -46,6 +51,8 @@ func (s Config) Sanitize() Config {
 	return s
 }
 
+// New opens the database and pings it within ConnectTimeout, so that an unreachable database or a
+// wrong DSN stops the application before it serves. Its Resource is a *SQLDB.
 func (s Config) New() (forgo.Resource, error) {
 	cfg := s.Sanitize()
 
@@ -65,25 +72,29 @@ func (s Config) New() (forgo.Resource, error) {
 		return nil, errors.Join(fmt.Errorf("sqldb: ping %s: %w", cfg.Name, err), db.Close())
 	}
 
-	return &SqlDB{
+	return &SQLDB{
 		name: cfg.Name,
 		db:   db,
 	}, nil
 }
 
-type SqlDB struct {
+// SQLDB is the resource New returns. Its Value is the *sql.DB.
+type SQLDB struct {
 	name string
 	db   *sql.DB
 }
 
-func (s *SqlDB) Name() string {
+// Name returns Config.Name.
+func (s *SQLDB) Name() string {
 	return s.name
 }
 
-func (s *SqlDB) Value() any {
+// Value returns the *sql.DB.
+func (s *SQLDB) Value() any {
 	return s.db
 }
 
-func (s *SqlDB) Close() error {
+// Close closes the *sql.DB.
+func (s *SQLDB) Close() error {
 	return s.db.Close()
 }

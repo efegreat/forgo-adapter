@@ -82,6 +82,8 @@ func (p *Postgres) Claim(
 	return messages, nil
 }
 
+// Complete marks the messages of successfulIDs processed and releases the other messages of the
+// claim, so that the next claim takes them again, in one transaction.
 func (p *Postgres) Complete(
 	ctx context.Context,
 	claimID string,
@@ -148,6 +150,8 @@ func (p *Postgres) Complete(
 	})
 }
 
+// DeleteProcessedBefore deletes up to limit messages processed before before, and returns how many
+// it deleted. Rows that another cleanup holds are skipped.
 func (p *Postgres) DeleteProcessedBefore(
 	ctx context.Context,
 	before time.Time,

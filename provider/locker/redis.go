@@ -1,3 +1,5 @@
+// Package locker implements operation.ILocker on Redis, for the locks of cron jobs, commands and
+// messages that must not run twice at once across the instances of an application.
 package locker
 
 import (

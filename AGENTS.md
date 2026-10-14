@@ -34,6 +34,7 @@ forgo's four goals carry over:
 | `provider/locker/` | `operation.ILocker` on Redis. Token-guarded unlock script, `ErrNotHeld`. |
 | `provider/ratelimit/` | `http.IRateLimiter` on Redis. GCRA Lua script on the server clock, `KeyPrefix`. |
 | `provider/liveconfig/` | `forgo.LiveConfigStore` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`) on the `live_configs` table, with versioned conditional saves. `liveconfig.go`: the shared `get` and `applied`. `redis.go`: `forgo.LiveConfigCache` on Redis, version-guarded Lua `Set`, `KeyPrefix`. |
+| `.github/` | The CI workflow (lint, tests, govulncheck, releases on `v*` tags), Dependabot, and the issue and pull request templates. |
 
 ## Invariants
 
@@ -122,13 +123,25 @@ go build ./...
 go vet ./...
 go test -race ./...
 gofmt -l .        # must print nothing
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 ```
+
+CI (`.github/workflows/ci.yml`) runs these on every push and pull request, plus `go mod tidy -diff`, govulncheck and `go test` without the race detector. While `go.mod` replaces forgo with `../forgo`, CI checks out forgo's `main` next to this repository, so a change that needs an unmerged forgo change passes once that change is merged.
 
 When you change behavior:
 
 1. Update [REFERENCE.md](REFERENCE.md) in the same change whenever a config field, default, constructor, wire format or error changes. Update [README.md](README.md) only if the pitch, the table or the headline example is affected.
 2. If an adapter is added or renamed, update the Adapters section of forgo's REFERENCE.md and the adapter row of its README.md.
 3. If you fix an item from [Known gaps](#known-gaps), remove it. If you find a new one, add it.
+4. Doc comments render on pkg.go.dev, with the `Example` functions of `example_test.go` files. Keep the examples in line with REFERENCE.md.
+
+### Releasing
+
+Versions follow semantic versioning. `go get` picks the latest tag, and pkg.go.dev documents it.
+
+1. Require a released forgo (`go get github.com/efegreat/forgo@v1.2.3`) and remove the `replace` directive: modules that depend on this one ignore it, so a release that replaces forgo does not build for them. The release job of CI refuses such a tag.
+2. Check that CI passes on `main`.
+3. Tag the commit and push the tag: `git tag v1.2.3 && git push origin v1.2.3`. CI runs on the tag, then creates the GitHub release with generated notes and asks the module proxy for the version, so that pkg.go.dev lists it.
 
 ### Checklists
 

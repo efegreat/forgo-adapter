@@ -15,6 +15,7 @@ import (
 // ended.
 var errReceiveStopped = errors.New("pubsub: receiving stopped before the subscriber was stopped")
 
+// Subscriber is the worker.ISubscriber of a SubscriberConfig.
 type Subscriber struct {
 	conf SubscriberConfig
 	sub  *gpubsub.Subscriber

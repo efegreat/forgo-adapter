@@ -15,6 +15,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// Delivery is the worker.IDelivery of an AMQP delivery.
 type Delivery struct {
 	delivery amqp.Delivery
 	msg      worker.Message
@@ -56,10 +57,12 @@ func newDelivery(delivery amqp.Delivery, guard *ackGuard, retry *retrier) *Deliv
 	return d
 }
 
+// Message returns the message, with the identity its headers carry.
 func (d *Delivery) Message() worker.Message {
 	return d.msg
 }
 
+// Complete acknowledges the message.
 func (d *Delivery) Complete(context.Context) error {
 	return d.settle(func() error { return d.delivery.Ack(false) })
 }

@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest a new adapter, or a change to an existing one.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do, and what makes it hard with the adapters today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How it could work, ideally as configuration whose zero value keeps today's behavior. For a new adapter, the client library it would wrap.

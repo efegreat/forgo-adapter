@@ -40,11 +40,11 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `pubsub` | `github.com/efegreat/forgo-adapter/resource/broker/pubsub` | resource | `worker.IBroker` | |
 | `redisstream` | `github.com/efegreat/forgo-adapter/resource/broker/redisstream` | resource | `worker.IBroker` | |
 | `sqltx` | `github.com/efegreat/forgo-adapter/provider/sqltx` | provider | `*Transactor` → `operation.Transactor` | `*sql.DB` |
-| `inbox` | `github.com/efegreat/forgo-adapter/provider/inbox` | provider | `*Postgres`, `*Mysql` → `worker.InboxStorage` | `*sql.DB` |
-| `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*Mysql` → `worker.OutboxStorage` | `*sql.DB` |
+| `inbox` | `github.com/efegreat/forgo-adapter/provider/inbox` | provider | `*Postgres`, `*MySQL` → `worker.InboxStorage` | `*sql.DB` |
+| `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*MySQL` → `worker.OutboxStorage` | `*sql.DB` |
 | `locker` | `github.com/efegreat/forgo-adapter/provider/locker` | provider | `*Redis` → `operation.ILocker` | `redis.UniversalClient` |
 | `ratelimit` | `github.com/efegreat/forgo-adapter/provider/ratelimit` | provider | `*Redis` → `http.IRateLimiter` | `redis.UniversalClient` |
-| `liveconfig` | `github.com/efegreat/forgo-adapter/provider/liveconfig` | provider | `*Postgres`, `*Mysql` → `forgo.LiveConfigStore`; `*RedisCache` → `forgo.LiveConfigCache` | `*sql.DB`; `redis.UniversalClient` |
+| `liveconfig` | `github.com/efegreat/forgo-adapter/provider/liveconfig` | provider | `*Postgres`, `*MySQL` → `forgo.LiveConfigStore`; `*RedisCache` → `forgo.LiveConfigCache` | `*sql.DB`; `redis.UniversalClient` |
 
 `redis` in this document is `github.com/redis/go-redis/v9`, `amqp` is `github.com/rabbitmq/amqp091-go`, and `option` is `google.golang.org/api/option`.
 
@@ -52,21 +52,11 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 
 ## Installation
 
-Go 1.27 or newer. forgo and forgo-adapter are private and untagged until their first release, so point your `go.mod` at local checkouts of both:
+Go 1.27 or newer.
 
+```sh
+go get github.com/efegreat/forgo-adapter
 ```
-require (
-	github.com/efegreat/forgo v0.0.0
-	github.com/efegreat/forgo-adapter v0.0.0
-)
-
-replace (
-	github.com/efegreat/forgo => ../forgo
-	github.com/efegreat/forgo-adapter => ../forgo-adapter
-)
-```
-
-Once they are released, drop the `replace` directives and run `go get github.com/efegreat/forgo-adapter`. While the repositories stay private, set `GOPRIVATE=github.com/efegreat/*` so Go fetches them with your git credentials instead of the public proxy.
 
 ---
 
@@ -775,17 +765,17 @@ import (
 )
 
 forgo.WithProviders(
-	inbox.NewPostgres,  // or inbox.NewMysql
-	outbox.NewPostgres, // or outbox.NewMysql
+	inbox.NewPostgres,  // or inbox.NewMySQL
+	outbox.NewPostgres, // or outbox.NewMySQL
 )
 ```
 
 | Constructor | Database | Notes |
 | --- | --- | --- |
 | `inbox.NewPostgres(*sql.DB)` | PostgreSQL | `INSERT … ON CONFLICT` increments attempts in one statement. |
-| `inbox.NewMysql(*sql.DB)` | MySQL 8 | Locks the row with `SELECT … FOR UPDATE`. Timestamps are `CURRENT_TIMESTAMP(6)`, so use `DATETIME(6)` columns. |
+| `inbox.NewMySQL(*sql.DB)` | MySQL 8 | Locks the row with `SELECT … FOR UPDATE`. Timestamps are `CURRENT_TIMESTAMP(6)`, so use `DATETIME(6)` columns. |
 | `outbox.NewPostgres(*sql.DB)` | PostgreSQL | Claims with `FOR UPDATE SKIP LOCKED`. Stamps and expires claims with `CURRENT_TIMESTAMP`. |
-| `outbox.NewMysql(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED`. Stamps and expires claims with `UTC_TIMESTAMP(6)`, so `processing_at` holds UTC, unaffected by the session time zone. |
+| `outbox.NewMySQL(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED`. Stamps and expires claims with `UTC_TIMESTAMP(6)`, so `processing_at` holds UTC, unaffected by the session time zone. |
 
 Both outboxes time claims on the database clock alone: a claim expires once its `processing_at` is `ClaimTTL` older than the database's current time. Clock skew between producer instances, or between them and the database, does not change `ClaimTTL`.
 
@@ -841,14 +831,14 @@ It implements the generic cell rate algorithm (GCRA), the algorithm of `http.Mem
 
 ### liveconfig
 
-Stores and a cache for forgo's [live configs](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#live-configs). `liveconfig.Postgres` and `liveconfig.Mysql` are `forgo.LiveConfigStore`s: the source of truth, in the `live_configs` table whose schema is given there, one row per config name. Create it with your migrations. `liveconfig.RedisCache` is a `forgo.LiveConfigCache` that every instance of your app shares.
+Stores and a cache for forgo's [live configs](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#live-configs). `liveconfig.Postgres` and `liveconfig.MySQL` are `forgo.LiveConfigStore`s: the source of truth, in the `live_configs` table whose schema is given there, one row per config name. Create it with your migrations. `liveconfig.RedisCache` is a `forgo.LiveConfigCache` that every instance of your app shares.
 
 ```go
 import "github.com/efegreat/forgo-adapter/provider/liveconfig"
 
 forgo.WithResources(config.Database, config.Redis),
 forgo.WithProviders(
-	liveconfig.NewPostgres,   // or liveconfig.NewMysql
+	liveconfig.NewPostgres,   // or liveconfig.NewMySQL
 	liveconfig.NewRedisCache,
 	forgo.NewLiveConfigs,
 )
@@ -916,14 +906,17 @@ var (
 
 // cmd/worker/main.go
 func main() {
-	forgo.NewApp(
+	app := forgo.NewApp(
 		forgo.WithName("shop-worker"),
 		forgo.WithLogger(config.Logger),
 		forgo.WithResources(config.DB, config.Redis, config.Broker),
 		forgo.WithProviders(config.Adapters...),
 		forgo.WithProviders(config.Services...),
 		forgo.WithServers(config.Consumer, config.Producer),
-	).Run()
+	)
+	if err := app.Run(); err != nil { // logged; main picks the exit code
+		os.Exit(1)
+	}
 }
 ```
 

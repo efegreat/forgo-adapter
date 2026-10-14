@@ -23,6 +23,8 @@ const (
 	maxConsumerTag = 255
 )
 
+// Broker is the resource New returns and its worker.IBroker Value. It holds one connection, and a
+// channel for every publisher and subscriber.
 type Broker struct {
 	conf        Config
 	subscribers map[string]SubscriberConfig
@@ -42,14 +44,17 @@ type Broker struct {
 	consumerSeq uint64
 }
 
+// Name returns Config.Name.
 func (r *Broker) Name() string {
 	return r.conf.Name
 }
 
+// NewDefaultPublisher returns a publisher of persistent messages that needs no PublisherConfig.
 func (r *Broker) NewDefaultPublisher() (worker.IPublisher, error) {
 	return r.newPublisher(PublisherConfig{Name: defaultPublisherName}.Sanitize())
 }
 
+// NewPublisher returns a publisher with the PublisherConfig named name.
 func (r *Broker) NewPublisher(name string) (worker.IPublisher, error) {
 	conf, ok := r.publishers[name]
 	if !ok {
@@ -142,6 +147,7 @@ func retryQueues(cfg Config, queue string) []retryQueue {
 	return nil
 }
 
+// Value returns the broker as a worker.IBroker.
 func (r *Broker) Value() any {
 	return worker.IBroker(r)
 }

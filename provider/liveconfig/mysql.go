@@ -8,21 +8,24 @@ import (
 	"github.com/efegreat/forgo"
 )
 
-// Mysql is a forgo.LiveConfigStore on the live_configs table of a MySQL 8 database.
-type Mysql struct {
+// MySQL is a forgo.LiveConfigStore on the live_configs table of a MySQL 8 database.
+type MySQL struct {
 	db *sql.DB
 }
 
-// NewMysql returns a live config store using db, for forgo.WithProviders.
-func NewMysql(db *sql.DB) *Mysql {
-	return &Mysql{db: db}
+// NewMySQL returns a live config store using db, for forgo.WithProviders.
+func NewMySQL(db *sql.DB) *MySQL {
+	return &MySQL{db: db}
 }
 
-func (m *Mysql) Get(ctx context.Context, name string) ([]byte, uint64, error) {
+// Get reads the row of name. Without one, it returns version 0.
+func (m *MySQL) Get(ctx context.Context, name string) ([]byte, uint64, error) {
 	return get(ctx, m.db, `SELECT data, version FROM live_configs WHERE name = ?`, name)
 }
 
-func (m *Mysql) Set(ctx context.Context, name string, data []byte, version uint64) error {
+// Set inserts the row of name when version is 0, and otherwise updates it only while it holds version.
+// When no row changed, it returns forgo.ErrLiveConfigConflict.
+func (m *MySQL) Set(ctx context.Context, name string, data []byte, version uint64) error {
 	// data is sent as text: MySQL cannot create a JSON value from a []byte, whose character set is binary.
 	if version == 0 {
 		return m.insert(ctx, name, string(data))
@@ -52,7 +55,7 @@ func (m *Mysql) Set(ctx context.Context, name string, data []byte, version uint6
 }
 
 // insert stores the first version of name.
-func (m *Mysql) insert(ctx context.Context, name, data string) error {
+func (m *MySQL) insert(ctx context.Context, name, data string) error {
 	_, err := m.db.ExecContext(
 		ctx,
 		`

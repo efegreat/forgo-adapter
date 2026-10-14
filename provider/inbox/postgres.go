@@ -22,6 +22,7 @@ func NewPostgres(db *sql.DB) *Postgres {
 	return &Postgres{db: db}
 }
 
+// Status returns the status of the message for the subscriber, and false when the inbox has no row for it.
 func (p *Postgres) Status(
 	ctx context.Context,
 	messageID string,
@@ -55,6 +56,8 @@ func (p *Postgres) Status(
 	return status, true, nil
 }
 
+// IncrementAttempt counts an attempt at a waiting message and returns the count, inserting the
+// message on its first attempt. It returns ErrNotWaiting once the message left waiting.
 func (p *Postgres) IncrementAttempt(
 	ctx context.Context,
 	messageID string,
@@ -107,6 +110,8 @@ func (p *Postgres) IncrementAttempt(
 	return attempts, nil
 }
 
+// MarkCompleted moves the waiting message to completed. It fails unless it moved the message itself,
+// as the package documentation explains.
 func (p *Postgres) MarkCompleted(
 	ctx context.Context,
 	messageID string,
@@ -121,6 +126,7 @@ func (p *Postgres) MarkCompleted(
 	)
 }
 
+// MarkFailed moves the waiting message to failed. Repeating it succeeds.
 func (p *Postgres) MarkFailed(
 	ctx context.Context,
 	messageID string,
@@ -135,6 +141,7 @@ func (p *Postgres) MarkFailed(
 	)
 }
 
+// MarkRejected moves the waiting message to rejected. Repeating it succeeds.
 func (p *Postgres) MarkRejected(
 	ctx context.Context,
 	messageID string,
@@ -201,6 +208,8 @@ func (p *Postgres) markStatus(
 	return unmoved(current, exists, target, repeatable)
 }
 
+// DeleteBefore deletes up to limit completed and rejected messages last updated before before, and
+// returns how many it deleted. Rows that another cleanup holds are skipped.
 func (p *Postgres) DeleteBefore(
 	ctx context.Context,
 	before time.Time,

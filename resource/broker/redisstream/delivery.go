@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Delivery is the worker.IDelivery of a stream entry.
 type Delivery struct {
 	sub   *Subscriber
 	entry redis.XMessage
@@ -24,6 +25,7 @@ func newDelivery(s *Subscriber, e redis.XMessage) *Delivery {
 	return &Delivery{sub: s, entry: e, msg: message(s.conf.Stream, e)}
 }
 
+// Message returns the message the entry holds.
 func (d *Delivery) Message() worker.Message {
 	return d.msg
 }

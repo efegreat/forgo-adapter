@@ -22,6 +22,7 @@ type consumeChannel interface {
 	Close() error
 }
 
+// Subscriber is the worker.ISubscriber of a SubscriberConfig. It consumes on a channel of its own.
 type Subscriber struct {
 	conf SubscriberConfig
 	ch   consumeChannel
@@ -86,6 +87,7 @@ func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 	}
 }
 
+// Close closes the subscriber's channel, and the publisher of its queue's retry queues.
 func (s *Subscriber) Close() error {
 	if s.release != nil {
 		s.release()
