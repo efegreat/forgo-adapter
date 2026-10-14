@@ -12,13 +12,19 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/efegreat/forgo/logger"
 	"github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
+	"github.com/rs/zerolog"
+
+	"github.com/efegreat/forgo-adapter/resource/sqldb"
 )
 
 // Dialect is a database the integration tests run against.
@@ -40,8 +46,14 @@ var (
 // that follows the session time zone instead of UTC fails them.
 const sessionTimeZone = "'-05:00'"
 
-// Open opens the database of d and checks that it answers, or skips t when its DSN is not set. The
-// database is closed when t ends.
+// discardLogs sends the lines of the query log, which the tests never read, nowhere.
+var discardLogs sync.Once
+
+// Open opens the database of d as a sqldb resource and checks that it answers, or skips t when its
+// DSN is not set. The database is closed when t ends.
+//
+// Every statement goes through sqldb's query log, arguments and masking included, so the storages
+// are tested on each driver through the log's wrapper. The lines are discarded.
 //
 // MySQL connections get parseTime, the driver's default loc (UTC) and a session time zone other
 // than UTC.
@@ -65,18 +77,19 @@ func (d Dialect) Open(t *testing.T) *sql.DB {
 		dsn = cfg.FormatDSN()
 	}
 
-	db, err := sql.Open(d.Name, dsn)
+	discardLogs.Do(func() { logger.SetDefault(zerolog.New(io.Discard)) })
+	res, err := sqldb.Config{
+		Name:           d.Name,
+		DriverName:     d.Name,
+		DSN:            dsn,
+		ConnectTimeout: 30 * time.Second,
+		Logger:         sqldb.LoggerConfig{Enabled: true, Args: true, SensitiveFields: []string{"payload", "data"}},
+	}.New()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		t.Fatalf("ping %s: %v", d.Name, err)
-	}
-	return db
+	t.Cleanup(func() { _ = res.Close() })
+	return res.Value().(*sql.DB)
 }
 
 // Reset drops table, one of inbox_events, outbox_events and live_configs, and creates it again

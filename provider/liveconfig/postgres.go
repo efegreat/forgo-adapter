@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/efegreat/forgo-adapter/internal/sqllog"
 )
 
 // Postgres is a forgo.LiveConfigStore on the live_configs table of a PostgreSQL database.
@@ -18,12 +20,14 @@ func NewPostgres(db *sql.DB) *Postgres {
 
 // Get reads the row of name. Without one, it returns version 0.
 func (p *Postgres) Get(ctx context.Context, name string) ([]byte, uint64, error) {
+	ctx = sqllog.Quiet(ctx)
 	return get(ctx, p.db, `SELECT data, version FROM live_configs WHERE name = $1`, name)
 }
 
 // Set inserts the row of name when version is 0, and otherwise updates it only while it holds version.
 // When no row changed, it returns forgo.ErrLiveConfigConflict.
 func (p *Postgres) Set(ctx context.Context, name string, data []byte, version uint64) error {
+	ctx = sqllog.Quiet(ctx)
 	var (
 		res sql.Result
 		err error

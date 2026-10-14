@@ -91,6 +91,7 @@ var DB = sqldb.Config{
 | `ConnMaxLifetime` | `1h` | Connections older than this are closed. |
 | `ConnMaxIdleTime` | `10m` | Connections idle for longer than this are closed. |
 | `ConnectTimeout` | `5s` | Bounds the startup ping. |
+| `Logger` | off | Logs every statement. See [Query log](#query-log). |
 
 `New` opens the pool, applies the limits and pings the database. A failed ping closes the pool and fails the bootstrap with `sqldb: ping <name>: …`.
 
@@ -109,6 +110,93 @@ forgo.WithProviders(
 	},
 ),
 ```
+
+#### Query log
+
+`Logger` logs every statement on a line of its own, through `logger.FromCtx` of the context the statement ran with, so the line carries `op_id` and the other fields of the operation that ran it. It is off by default, and the pool then runs on the driver alone.
+
+```go
+var DB = sqldb.Config{
+	Name:       "main",
+	DriverName: "postgres",
+	DSN:        forgo.Env("DATABASE_URL", ""),
+	Logger: sqldb.LoggerConfig{
+		Enabled:         true,
+		SlowThreshold:   500 * time.Millisecond,
+		Args:            true,
+		SensitiveFields: []string{"password_hash", "token"},
+	},
+}
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `Enabled` | `false` | Turns the log on. |
+| `SlowThreshold` | `200ms` | Statements that take at least this long log as slow. Negative values fail `New`. |
+| `SlowOnly` | `false` | Logs only slow and failed statements. |
+| `Args` | `false` | Logs the arguments of each statement. |
+| `SensitiveFields` | | Masks logged arguments. See [Masking arguments](#masking-arguments). |
+
+| Statement | Level | Message |
+| --- | --- | --- |
+| Completed within `SlowThreshold` | info, or debug for the [storages](#inbox-and-outbox) and [live config stores](#liveconfig) of this library | `sql query completed` |
+| Completed in `SlowThreshold` or more | warn | `slow sql query` |
+| Failed | error, with `err_severity` 2 (critical) | `sql query failed` |
+| Canceled through its context, or failed with `driver.ErrBadConn` (database/sql retries on another connection) | warn, with `err_severity` 0 (light) | `sql query failed` |
+
+```json
+{"level":"warn","op_id":"…","sql_db":"main","sql_query":"SELECT id FROM users WHERE email = $1 AND password_hash = $2","sql_args":["ada@example.com","[*]"],"sql_returned":1,"elapsed":0.6124,"sql_caller":"/app/users/repository.go:42","message":"slow sql query"}
+```
+
+| Key | Value |
+| --- | --- |
+| `sql_db` | `Config.Name`. |
+| `sql_query` | The statement as written, or `BEGIN`, `COMMIT` and `ROLLBACK` for transactions. Cut at 32 KiB, with `sql_query_cut: true`. |
+| `sql_args` | With `Args`, the arguments in placeholder order. Strings and byte slices are cut at 1 KiB and at most 100 arguments are logged, with `sql_args_cut: true`. |
+| `sql_affected` | The rows an exec affected. |
+| `sql_returned` | The rows read from a query. |
+| `elapsed` | Seconds, as a float. A query lasts until its rows close, so reading them counts. Waiting for a connection of the pool does not: see `db.Stats()`. |
+| `sql_caller` | On slow and failed statements, the `file:line` of the code that ran the statement, past `database/sql` and `sqltx`. |
+| `err_severity`, `error` | On failures. |
+
+Every exec and query is logged, prepared statements each time they run. A failed prepare is logged too, since its statement never runs: with MySQL's server-side prepares, a syntax error shows there. Successful prepares and pings are not.
+
+The storages of this library run their statements at debug, because the outbox relay polls every second whether or not there is work. Set the logger to the debug level to see them. Their slow and failed statements log like any other.
+
+##### Masking arguments
+
+Arguments are masked as `[*]` under the rules of forgo's [`SensitiveFields`](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#masking-sensitive-fields): names match case-insensitively. They reach the driver by position only, so the log reads the statement to find the column of each placeholder: the column it is compared with, assigned to or inserted into.
+
+| Statement | Column of each placeholder |
+| --- | --- |
+| `email = $1`, `$1 = email`, `u.email <> ?`, `email LIKE ?`, `email IS DISTINCT FROM $1` | `email` |
+| `lower(email) = lower($1)`, `email = $1::citext`, `data->>'email' = $1` | `email` |
+| `id IN (?, ?)`, `id = ANY($1)`, `created_at BETWEEN $1 AND $2` | `id`, `id`, `created_at` |
+| `SET password_hash = $1` | `password_hash` |
+| `INSERT INTO users (email, token) VALUES (?, ?), (?, ?)` | from the column list, for every row |
+| `LIMIT $1`, `OFFSET $2`, `FETCH FIRST $1 ROWS`, `INTERVAL ? SECOND` | always shown |
+
+An argument passed with `sql.Named` is masked by its own name. Every other argument is masked when:
+
+- its column is sensitive, or any column in the expression around it is: `hash = sha256(salt || $1)` is masked when `hash` or `salt` is sensitive;
+- no column can be found for it, as in `SELECT $1`, `COALESCE(?, name)`, `INSERT … SELECT ?`, `CASE WHEN … THEN $2` and `ORDER BY $1`, or in a subquery's select list;
+- it is a `$n` that appears several times, unless every appearance is shown. Tests such as `$1 IS NULL` do not count, so `($1::text IS NULL OR name = $1)` is shown.
+
+Text in literals, quoted identifiers, comments and PostgreSQL dollar quotes is skipped, so `'a = ?'` holds no placeholder.
+
+A string or byte slice that starts with `{` or `[` is masked like a request body: the value of every sensitive member at any depth, and it is logged as compact JSON. One that was cut at 1 KiB, or that is not valid JSON, is logged as a string up to where it stops being valid, with `sql_args_cut: true`, since the rest cannot be masked. A type the driver accepts as is is logged as `encoding/json` encodes it, and masked the same way.
+
+Without `SensitiveFields`, every argument is logged as is.
+
+The log reads a statement once, the first time one of its lines logs arguments, and caches the result for up to 1,024 statements per database. Past that, each line reads its statement again, which takes about a microsecond.
+
+##### Cost
+
+Off, nothing wraps the driver. On, a statement costs two clock reads. A line written to an output costs about 0.2 µs, or 0.3 µs with masked arguments, and allocates nothing once its statement was read. A line below the logger's level, or a fast statement with `SlowOnly`, is never built. `go test -bench Exec ./resource/sqldb` measures it.
+
+##### Drivers
+
+The log wraps the connections of the driver and implements exactly the optional `database/sql/driver` interfaces the driver does, so `database/sql` behaves as without it. `db.Driver()` still returns the driver, so forgo's `migration.DetectDialect` finds the dialect. The function given to `sql.Conn.Raw` receives the wrapper's connection rather than the driver's.
 
 ### redisdb
 
@@ -934,7 +1022,7 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 
 | Prefix | Raised by |
 | --- | --- |
-| `sqldb:` | Opening or pinging the database. |
+| `sqldb:` | A negative `Logger.SlowThreshold`, and opening or pinging the database. |
 | `redisdb:` | Validation (empty addresses, `ClusterMode` with `MasterName`, an unknown `ReadFrom`, a `DB` on a cluster) and pinging Redis. |
 | `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names and missing queues, a closed delivery channel, nacked and unroutable publishes, retries that could not be delayed, acknowledgements of deliveries from a lost channel. |
 | `pubsub:` | Validation, the client, creating and checking topics and subscriptions (`pubsub: subscription exists with other settings`), unknown subscriber names, publishes without a `Destination` or after `Close`, failed publishes, receiving, acknowledgements, dead-letter copies that could not be published. |

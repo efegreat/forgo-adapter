@@ -9,6 +9,7 @@ import (
 
 	"github.com/efegreat/forgo/server/worker"
 
+	"github.com/efegreat/forgo-adapter/internal/sqllog"
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
@@ -39,6 +40,7 @@ func (m *MySQL) Claim(
 	ctx context.Context,
 	claim worker.Claim,
 ) ([]worker.Message, error) {
+	ctx = sqllog.Quiet(ctx)
 	var messages []worker.Message
 
 	err := sqltx.RunWith(ctx, m.db, readCommitted, func(ctx context.Context) error {
@@ -122,6 +124,7 @@ func (m *MySQL) Complete(
 	claimID string,
 	successfulIDs []string,
 ) error {
+	ctx = sqllog.Quiet(ctx)
 	return sqltx.RunWith(ctx, m.db, readCommitted, func(ctx context.Context) error {
 		tx := sqltx.From(ctx, m.db)
 
@@ -189,6 +192,7 @@ func (m *MySQL) DeleteProcessedBefore(
 	before time.Time,
 	limit int,
 ) (int64, error) {
+	ctx = sqllog.Quiet(ctx)
 	result, err := sqltx.From(ctx, m.db).ExecContext(
 		ctx,
 		`

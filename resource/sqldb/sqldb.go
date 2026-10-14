@@ -1,10 +1,11 @@
 // Package sqldb is a database/sql resource: a *sql.DB with pool limits, opened and verified when the
-// application starts and closed when it stops.
+// application starts and closed when it stops, and optionally logging every statement it runs.
 package sqldb
 
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"time"
@@ -32,6 +33,8 @@ type Config struct {
 	ConnMaxIdleTime time.Duration
 	// ConnectTimeout bounds the ping New sends to verify the database is reachable. Default: 5 seconds.
 	ConnectTimeout time.Duration
+	// Logger logs the statements run on the database. Its zero value logs nothing.
+	Logger LoggerConfig
 }
 
 // Sanitize returns a copy of the config with defaults applied to its zero fields.
@@ -48,6 +51,7 @@ func (s Config) Sanitize() Config {
 	if s.ConnMaxIdleTime == 0 {
 		s.ConnMaxIdleTime = time.Minute * 10
 	}
+	s.Logger = s.Logger.Sanitize()
 	return s
 }
 
@@ -55,8 +59,11 @@ func (s Config) Sanitize() Config {
 // wrong DSN stops the application before it serves.
 func (s Config) New() (forgo.Resource, error) {
 	cfg := s.Sanitize()
+	if err := cfg.Logger.validate(); err != nil {
+		return nil, err
+	}
 
-	db, err := sql.Open(cfg.DriverName, cfg.DSN)
+	db, err := cfg.open()
 	if err != nil {
 		return nil, fmt.Errorf("sqldb: open %s: %w", cfg.Name, err)
 	}
@@ -76,6 +83,27 @@ func (s Config) New() (forgo.Resource, error) {
 		name: cfg.Name,
 		db:   db,
 	}, nil
+}
+
+// open opens the database, on its driver alone or, with Logger enabled, through the logging wrapper
+// of driver.go.
+func (s Config) open() (*sql.DB, error) {
+	db, err := sql.Open(s.DriverName, s.DSN)
+	if err != nil || !s.Logger.Enabled {
+		return db, err
+	}
+	// The driver is only reachable through a *sql.DB, which connects lazily: this one never does.
+	drv := db.Driver()
+	if err := db.Close(); err != nil {
+		return nil, err
+	}
+	var base driver.Connector = dsnConnector{dsn: s.DSN, driver: drv}
+	if drvCtx, ok := drv.(driver.DriverContext); ok {
+		if base, err = drvCtx.OpenConnector(s.DSN); err != nil {
+			return nil, err
+		}
+	}
+	return sql.OpenDB(&connector{Connector: base, log: newQueryLog(s.Name, s.Logger)}), nil
 }
 
 // resource is the forgo.Resource New returns. Its Value is the *sql.DB.

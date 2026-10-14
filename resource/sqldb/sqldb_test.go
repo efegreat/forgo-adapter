@@ -3,6 +3,7 @@ package sqldb
 import (
 	"database/sql"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -12,14 +13,34 @@ import (
 
 func TestSanitize(t *testing.T) {
 	got := Config{}.Sanitize()
-	want := Config{MaxIdleConns: 5, ConnMaxLifetime: time.Hour, ConnMaxIdleTime: 10 * time.Minute, ConnectTimeout: 5 * time.Second}
-	if got != want {
+	want := Config{
+		MaxIdleConns:    5,
+		ConnMaxLifetime: time.Hour,
+		ConnMaxIdleTime: 10 * time.Minute,
+		ConnectTimeout:  5 * time.Second,
+		Logger:          LoggerConfig{SlowThreshold: 200 * time.Millisecond},
+	}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Sanitize() = %+v, want %+v", got, want)
 	}
 
-	custom := Config{MaxOpenConns: 20, MaxIdleConns: 2, ConnMaxLifetime: time.Minute, ConnMaxIdleTime: time.Second, ConnectTimeout: time.Second}
-	if got := custom.Sanitize(); got != custom {
+	custom := Config{
+		MaxOpenConns:    20,
+		MaxIdleConns:    2,
+		ConnMaxLifetime: time.Minute,
+		ConnMaxIdleTime: time.Second,
+		ConnectTimeout:  time.Second,
+		Logger:          LoggerConfig{Enabled: true, SlowThreshold: time.Second, SlowOnly: true, Args: true, SensitiveFields: []string{"token"}},
+	}
+	if got := custom.Sanitize(); !reflect.DeepEqual(got, custom) {
 		t.Fatalf("Sanitize() overrode set fields: %+v", got)
+	}
+}
+
+func TestNewRejectsNegativeSlowThreshold(t *testing.T) {
+	_, err := Config{Name: "main", DriverName: "sqlmock", DSN: "unused", Logger: LoggerConfig{Enabled: true, SlowThreshold: -time.Second}}.New()
+	if err == nil || !strings.Contains(err.Error(), "SlowThreshold") {
+		t.Fatalf("New err = %v", err)
 	}
 }
 

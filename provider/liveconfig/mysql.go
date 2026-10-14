@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/efegreat/forgo"
+
+	"github.com/efegreat/forgo-adapter/internal/sqllog"
 )
 
 // MySQL is a forgo.LiveConfigStore on the live_configs table of a MySQL 8 database.
@@ -20,12 +22,14 @@ func NewMySQL(db *sql.DB) *MySQL {
 
 // Get reads the row of name. Without one, it returns version 0.
 func (m *MySQL) Get(ctx context.Context, name string) ([]byte, uint64, error) {
+	ctx = sqllog.Quiet(ctx)
 	return get(ctx, m.db, `SELECT data, version FROM live_configs WHERE name = ?`, name)
 }
 
 // Set inserts the row of name when version is 0, and otherwise updates it only while it holds version.
 // When no row changed, it returns forgo.ErrLiveConfigConflict.
 func (m *MySQL) Set(ctx context.Context, name string, data []byte, version uint64) error {
+	ctx = sqllog.Quiet(ctx)
 	// data is sent as text: MySQL cannot create a JSON value from a []byte, whose character set is binary.
 	if version == 0 {
 		return m.insert(ctx, name, string(data))

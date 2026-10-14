@@ -16,14 +16,14 @@ forgo's four goals carry over:
 
 1. **Simplicity.** A resource is a config value, a provider is a constructor. Zero fields mean defaults, filled by `Sanitize()`. Optional features, such as `rabbitmq.DeadLetterConfig`, are config structs whose zero value turns them off.
 2. **Speed.** Connections, topology and scripts are set up in `New` and in constructors. Hot paths, such as `Allow`, `Lock` or `Publish`, do one round trip and no reflection, and Redis scripts are sent with `EVALSHA`.
-3. **Abstraction.** An adapter implements a forgo contract and nothing more. It does not log, and it reports through returned errors. Logging, retries and acknowledgement policy belong to the forgo servers.
+3. **Abstraction.** An adapter implements a forgo contract and nothing more. It does not log, and it reports through returned errors. Logging, retries and acknowledgement policy belong to the forgo servers. The one exception is `sqldb`'s opt-in query log, which observes the application's own statements rather than the adapter's decisions.
 4. **Scalability.** Shared-state adapters must be correct with many app instances: atomic Redis scripts, `FOR UPDATE SKIP LOCKED` claims, the Redis server clock.
 
 ## Repository map
 
 | Path | Responsibility |
 | --- | --- |
-| `resource/sqldb/` | `Config` → `*sql.DB`. Applies pool limits, pings with `ConnectTimeout`, closes the pool if the ping fails. |
+| `resource/sqldb/` | `Config` → `*sql.DB`. Applies pool limits, pings with `ConnectTimeout`, closes the pool if the ping fails. With `Logger` enabled, opens the pool on a wrapped connector. `log.go`: `LoggerConfig`, `queryLog.record` (level, keys, caller), argument formatting and JSON masking through forgo's `redact`. `driver.go`: the connector, connection, statement, transaction and rows wrappers. `params.go`: the `paramPlan` that names each placeholder by reading the statement (tokenizer and resolver), and its cache. |
 | `resource/redisdb/` | `Config` → `redis.NewUniversalClient`: a `*redis.Client` for a server or a Sentinel master, a `*redis.ClusterClient` for a cluster. `ReadFrom` routes read-only commands to replicas; for a Sentinel master it builds `redis.NewFailoverClusterClient` itself, because the universal client's `ReadOnly` would send writes to a replica too. Validates the mode, `ReadFrom` and `DB` before connecting, pings with `ConnectTimeout`, closes the client if the ping fails. |
 | `resource/broker/rabbitmq/` | `Config` → `worker.IBroker`. `config.go`: config, `Sanitize`, `validate`, `RecoveryConfig`, `DeadLetterConfig`, queue args. `broker.go`: connection, owned channels, `declare` (topology through the `declarer` interface), publisher and subscriber factories. `recovery.go`: `ackGuard`, `consumerLoss` and the `recoveryHooks` around the client's connection and topology recovery. `publisher.go`: confirm-mode publishing, mandatory returns, `Message` → `amqp.Publishing` with identity headers. `subscriber.go`: prefetch, `Consume` over a `process.ConcurrentRunner`. `delivery.go`: `amqp.Delivery` → `worker.IDelivery` with guarded acknowledgements, and AMQP header values → strings (`headerValue`). |
 | `resource/broker/pubsub/` | `Config` → `worker.IBroker` on `cloud.google.com/go/pubsub/v2`. `config.go`: config, `Sanitize`, `validate`, `RetryConfig`, `DeadLetterConfig`, the `*pb.Subscription` `New` creates, and full topic and subscription names. `broker.go`: client, `declare` (create topics and subscriptions, compare existing ones), subscriber factory. `publisher.go`: `Message` → Pub/Sub message with identity attributes, and `topics`, the client publishers shared per topic. `subscriber.go`: `Receive` with `MaxOutstandingMessages` and a concurrency semaphore. `delivery.go`: Pub/Sub message → `worker.IDelivery`, dead-letter copies. |
@@ -34,7 +34,8 @@ forgo's four goals carry over:
 | `provider/locker/` | `operation.ILocker` on Redis. Token-guarded unlock script, `ErrNotHeld`. |
 | `provider/ratelimit/` | `http.IRateLimiter` on Redis. GCRA Lua script on the server clock, `KeyPrefix`. |
 | `provider/liveconfig/` | `forgo.LiveConfigStore` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`) on the `live_configs` table, with versioned conditional saves. `liveconfig.go`: the shared `get` and `applied`. `redis.go`: `forgo.LiveConfigCache` on Redis, version-guarded Lua `Set`, `KeyPrefix`. |
-| `internal/sqltest/` | The databases of the integration tests: `Dialect.Open` opens PostgreSQL or MySQL from the environment or skips, `Reset` creates a table with the schema of forgo's REFERENCE.md, `Ago` is a time on the database clock. Imported by tests only. |
+| `internal/sqltest/` | The databases of the integration tests: `Dialect.Open` opens PostgreSQL or MySQL from the environment as a `sqldb` resource with its query log on (lines discarded) or skips, `Reset` creates a table with the schema of forgo's REFERENCE.md, `Ago` is a time on the database clock. Imported by tests only. |
+| `internal/sqllog/` | `Quiet` marks the context of the storages' statements, which the query log writes at debug. |
 | `.github/` | The CI workflow (lint, tests with PostgreSQL, MySQL and RabbitMQ services, govulncheck, releases on `v*` tags), Dependabot, and the issue and pull request templates. |
 
 ## Invariants
@@ -93,6 +94,16 @@ Do not break these without an explicit decision from the maintainer.
 - `transient` decides whether a read or claim error stops `Consume`: errors without a Redis reply (network, pool) and `LOADING`, `READONLY`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, max clients are retried after `errorWait`. Every other reply, and `redis.ErrClosed`, returns, so a deleted group stops the app rather than leaving it up without consuming.
 - `XReadGroupArgs.Block` must always be set: its zero value blocks forever.
 
+### SQL query log
+
+- Off, `New` opens the pool with `sql.Open` and nothing wraps the driver. On, it finds the driver through a `*sql.DB` it never connects, and opens the pool with `sql.OpenDB` on a `connector` around the driver's own connector.
+- The wrappers must behave exactly like the driver. database/sql changes behavior on some optional interfaces in ways a fallback cannot reproduce, so a wrapper implements those only when the driver does: `SessionResetter` and `Validator` (with both, a connection outlives a rollback after its context is canceled), `ColumnConverter` (it skips converting arguments past `NumInput`) and `RowsColumnScanner` (it replaces `Next`). Every other optional interface is always implemented, with database/sql's own fallback, which `driver_test.go` checks through database/sql on fake drivers. `connector.Driver` returns the driver, never a wrapper, so `migration.DetectDialect` keeps working.
+- `driver.ErrSkip` is never logged: the statement did not run, and database/sql prepares it instead, so it logs once, from the statement.
+- A query is logged when its rows close, with the rows read, so its duration includes reading them. A context canceled before the end of the rows is the failure.
+- Arguments are masked fail-closed while `SensitiveFields` is set: a placeholder the `paramPlan` cannot name is masked, and so is one with a sensitive name anywhere in its expression. A change to `params.go` keeps that property, adds its forms to `TestParamPlan`, and passes `FuzzParamPlan`.
+- A logged line allocates nothing once its plan is cached (`TestRecordDoesNotAllocate`). Nothing is formatted for a line that is not written: the level is checked before any field.
+- Every statement of the storages runs on a context marked by `sqllog.Quiet`, set at the entry of each exported method.
+
 ### SQL storages
 
 - Every statement goes through `sqltx.From(ctx, db)`, and every multi-statement operation through `sqltx.Run` or `sqltx.RunWith`, so storages join the transaction of `sqltx.Transactor.Do`. The worker relies on it: `MarkCompleted` must commit or roll back with the handler.
@@ -120,7 +131,7 @@ Do not break these without an explicit decision from the maintainer.
 
 - Errors: prefix with the package (`sqldb:`, `redisdb:`, `rabbitmq:`, `pubsub:`, `redisstream:`, `inbox:`, `outbox:`, `liveconfig:`, `locker:`, `ratelimit:`), wrap with `%w`, and declare sentinels as package-level `var`s.
 - Doc comments on exported identifiers explain the contract and the why. Match the surrounding code.
-- Dependencies: forgo, `github.com/rabbitmq/amqp091-go`, `github.com/redis/go-redis/v9`, `cloud.google.com/go/pubsub/v2` (with `google.golang.org/api/option` for its client options). Test-only: `github.com/alicebob/miniredis/v2`, `github.com/DATA-DOG/go-sqlmock`, and the drivers `github.com/lib/pq` and `github.com/go-sql-driver/mysql` of the integration tests. A new adapter may add the client library it wraps, and nothing else without a strong reason.
+- Dependencies: forgo, `github.com/rs/zerolog` (forgo's logger, for the query log), `github.com/rabbitmq/amqp091-go`, `github.com/redis/go-redis/v9`, `cloud.google.com/go/pubsub/v2` (with `google.golang.org/api/option` for its client options). Test-only: `github.com/alicebob/miniredis/v2`, `github.com/DATA-DOG/go-sqlmock`, and the drivers `github.com/lib/pq` and `github.com/go-sql-driver/mysql` of the integration tests. A new adapter may add the client library it wraps, and nothing else without a strong reason.
 - Tests must not need running infrastructure. Use miniredis for Redis (it runs Lua and `TIME`, and `SetTime`/`FastForward` control the clock; stream idle times follow `SetTime`, and `SetError` fakes error replies), sqlmock for SQL (`sqlmock.NewWithDSN` plus `sql.Open("sqlmock", dsn)` exercises `sqldb.New`; storage tests set `SetMaxOpenConns(1)`, so a statement that bypasses an open transaction blocks and fails on the test's deadline), fakes of narrow interfaces for AMQP (`declarer`, `consumeChannel`, `publishChannel`, `confirmation` and `amqp.Acknowledger`), and `pstest` for Pub/Sub, the in-memory server of the client module, which the real client connects to with `option.WithGRPCConn`. Table-driven where possible, passing under `-race`.
 - Integration tests (`TestIntegration…`) run the SQL storages against PostgreSQL and MySQL, and the RabbitMQ broker against RabbitMQ, when `ADAPTER_TEST_POSTGRES_DSN`, `ADAPTER_TEST_MYSQL_DSN` and `ADAPTER_TEST_RABBITMQ_URL` are set, and skip otherwise. CI sets them for its service containers. MySQL runs them in a session time zone behind UTC, so a timestamp that follows the session fails them. They check what sqlmock and the fakes cannot: that the SQL runs, the documented schema, and the broker's own behavior.
 
@@ -175,6 +186,7 @@ Versions follow semantic versioning. `go get` picks the latest tag, and pkg.go.d
 
 When you find one, verify it against the code and add it here with a `file:line` reference. Delete it in the change that fixes it.
 
+- With the query log on, the function given to `sql.Conn.Raw` receives the log's connection instead of the driver's (`resource/sqldb/driver.go:60`), so code that asserts the driver's connection type there, such as pgx's `*stdlib.Conn`, fails. The wrapper has no way to unwrap it yet.
 - The RabbitMQ integration test covers the topology, confirms, returns, retry queues and dead-lettering on a live broker, but not recovery: a lost connection or channel runs against fakes of the client only.
 - The Pub/Sub adapter is tested against `pstest` only, which applies neither retry-policy delays nor IAM.
 - The Redis Streams adapter is tested against miniredis only, which differs from Redis in ways the tests work around: it counts `XCLAIM … JUSTID` as a delivery, reports `0` instead of `0-0` as a group position, trims `MAXLEN ~` exactly, and keeps its blocking commands canceled after `Restart` (`resource/broker/redisstream/redisstream_test.go`, test `TestConsumeErrors/restart`).

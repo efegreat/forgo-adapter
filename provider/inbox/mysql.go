@@ -9,6 +9,7 @@ import (
 
 	"github.com/efegreat/forgo/server/worker"
 
+	"github.com/efegreat/forgo-adapter/internal/sqllog"
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
@@ -37,6 +38,7 @@ func (m *MySQL) Status(
 	messageID string,
 	subscriberName string,
 ) (worker.InboxStatus, bool, error) {
+	ctx = sqllog.Quiet(ctx)
 	var status worker.InboxStatus
 
 	err := sqltx.From(ctx, m.db).QueryRowContext(
@@ -74,6 +76,7 @@ func (m *MySQL) IncrementAttempt(
 	messageID string,
 	subscriberName string,
 ) (int, error) {
+	ctx = sqllog.Quiet(ctx)
 	var attempts int
 
 	err := sqltx.RunWith(ctx, m.db, readCommitted, func(ctx context.Context) error {
@@ -152,6 +155,7 @@ func (m *MySQL) MarkCompleted(
 	messageID string,
 	subscriberName string,
 ) error {
+	ctx = sqllog.Quiet(ctx)
 	return m.markStatus(
 		ctx,
 		messageID,
@@ -167,6 +171,7 @@ func (m *MySQL) MarkFailed(
 	messageID string,
 	subscriberName string,
 ) error {
+	ctx = sqllog.Quiet(ctx)
 	return m.markStatus(
 		ctx,
 		messageID,
@@ -182,6 +187,7 @@ func (m *MySQL) MarkRejected(
 	messageID string,
 	subscriberName string,
 ) error {
+	ctx = sqllog.Quiet(ctx)
 	return m.markStatus(
 		ctx,
 		messageID,
@@ -257,6 +263,7 @@ func (m *MySQL) DeleteBefore(
 	before time.Time,
 	limit int,
 ) (int64, error) {
+	ctx = sqllog.Quiet(ctx)
 	result, err := sqltx.From(ctx, m.db).ExecContext(
 		ctx,
 		`
