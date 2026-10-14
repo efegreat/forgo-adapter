@@ -46,7 +46,7 @@ if err := app.Run(); err != nil { // logged; main picks the exit code
 
 | Package | Kind | Provides | Backed by |
 | --- | --- | --- | --- |
-| `resource/sqldb` | resource | `*sql.DB` | any `database/sql` driver |
+| `resource/sqldb` | resource | `*sql.DB` | any `database/sql` driver, with an optional query log that flags slow statements and masks arguments |
 | `resource/redisdb` | resource | `redis.UniversalClient` | go-redis v9: a server, Redis Cluster or Sentinel |
 | `resource/broker/rabbitmq` | resource | `worker.IBroker` | amqp091-go, with automatic recovery, publisher confirms, prefetch and optional dead-letter queues |
 | `resource/broker/pubsub` | resource | `worker.IBroker` | Google Cloud Pub/Sub client v2, with batched publishing, flow control, retry policies and optional dead-letter topics |

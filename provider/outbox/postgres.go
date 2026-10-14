@@ -10,6 +10,7 @@ import (
 
 	"github.com/efegreat/forgo/server/worker"
 
+	"github.com/efegreat/forgo-adapter/internal/sqllog"
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
@@ -35,6 +36,7 @@ func (p *Postgres) Claim(
 	ctx context.Context,
 	claim worker.Claim,
 ) ([]worker.Message, error) {
+	ctx = sqllog.Quiet(ctx)
 	var messages []worker.Message
 
 	err := sqltx.Run(ctx, p.db, func(ctx context.Context) error {
@@ -91,6 +93,7 @@ func (p *Postgres) Complete(
 	claimID string,
 	successfulIDs []string,
 ) error {
+	ctx = sqllog.Quiet(ctx)
 	return sqltx.Run(ctx, p.db, func(ctx context.Context) error {
 		tx := sqltx.From(ctx, p.db)
 
@@ -159,6 +162,7 @@ func (p *Postgres) DeleteProcessedBefore(
 	before time.Time,
 	limit int,
 ) (int64, error) {
+	ctx = sqllog.Quiet(ctx)
 	// PostgreSQL has no DELETE … LIMIT, so the IDs of a limited batch are
 	// collected into an array first, and the delete reads them through the
 	// primary key, in generic plans too (see Claim).
