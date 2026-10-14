@@ -263,7 +263,9 @@ func (m *MySQL) markStatus(
 
 // DeleteBefore deletes up to limit completed and rejected messages last updated before before, and
 // returns how many it deleted. before is turned into an age, which the database compares with its
-// own clock.
+// own clock. Rows are read in the order of the inbox_events_cleanup index, (status, updated_at), so
+// that a batch stops at its limit without sorting the expired rows or reading and locking the
+// failed ones, which are kept.
 func (m *MySQL) DeleteBefore(
 	ctx context.Context,
 	before time.Time,
@@ -275,7 +277,7 @@ func (m *MySQL) DeleteBefore(
 		DELETE FROM inbox_events
 		WHERE status IN (?, ?)
 		  AND updated_at < UTC_TIMESTAMP(6) - INTERVAL ? MICROSECOND
-		ORDER BY updated_at
+		ORDER BY status, updated_at
 		LIMIT ?
 		`,
 		worker.InboxCompleted,
