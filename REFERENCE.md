@@ -403,7 +403,7 @@ This declares a durable direct exchange `billing.dlx` and a durable queue `billi
 
 RabbitMQ also dead-letters messages that expire through `x-message-ttl` or overflow a queue with `x-overflow: reject-publish-dlx`. Retried messages are not dead-lettered: they are requeued, or wait in a retry queue.
 
-Dead letters keep their body, properties and headers. RabbitMQ adds an `x-death` header recording the source queue, the reason and a count. To replay messages, consume `<queue>.dlq` with another subscriber or use a shovel. Because a replayed message keeps its `x-msg-id`, the consumer inbox skips it as already *failed* or *rejected*. To process it again, first set its inbox row back to *waiting* with zero attempts, then replay it. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages).
+Dead letters keep their body, properties and headers. RabbitMQ adds an `x-death` header recording the source queue, the reason and a count. To replay messages, consume `<queue>.dlq` with another subscriber or use a shovel. Because a replayed message keeps its `x-msg-id`, the worker rejects it again, back to `<queue>.dlq`, while its inbox row is *failed* or *rejected*. To process it again, first set its inbox row back to *waiting* with zero attempts, then replay it. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages).
 
 **Validation.** `New` fails before connecting when a queue enables `DeadLetter` without a `Name`, or also sets `x-dead-letter-exchange` or `x-dead-letter-routing-key` in its `Args`. Use one or the other.
 
@@ -635,9 +635,9 @@ For a subscription created outside `New`, set `SubscriberConfig.DeadLetterTopic`
 
 and, with `MaxDeliveryAttempts`, the messages Pub/Sub forwards itself.
 
-**A copy that cannot be published.** The copy must be stored within the worker's `SubscriberConfig.AckTimeout`. If the topic is gone, the credentials may not publish to it or Pub/Sub does not answer in time, `Reject` fails with `pubsub: dead-letter <id> to <topic>, delivering it again` and nacks the message. A message without a handler is then rejected again on its next delivery. A message the inbox already marks *failed* or *rejected* is not: the worker acknowledges its redelivery and skips it, so it never reaches the dead-letter topic. Give the subscriber's credentials `roles/pubsub.publisher` on the dead-letter topic.
+**A copy that cannot be published.** The copy must be stored within the worker's `SubscriberConfig.AckTimeout`. If the topic is gone, the credentials may not publish to it or Pub/Sub does not answer in time, `Reject` fails with `pubsub: dead-letter <id> to <topic>, delivering it again` and nacks the message. The worker rejects it again on its next delivery, after the subscription's [retry policy](#retry-policy) delay, until the copy is published. Without a retry policy, a topic that stays unreachable redelivers such messages in a tight loop. Give the subscriber's credentials `roles/pubsub.publisher` on the dead-letter topic.
 
-Dead letters keep their `x-msg-id`, so the consumer inbox skips a replayed message as already *failed* or *rejected*. To process one again, first set its inbox row back to *waiting* with zero attempts, then publish it to the original topic again. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages).
+Dead letters keep their `x-msg-id`, so the worker rejects a replayed message again, back to the dead-letter topic, while its inbox row is *failed* or *rejected*. To process one again, first set its inbox row back to *waiting* with zero attempts, then publish it to the original topic again. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages).
 
 **Validation.** `New` fails before connecting when an enabled `DeadLetter` has a `MaxDeliveryAttempts` other than zero outside 5 to 100.
 
@@ -807,9 +807,9 @@ To reject an entry, the subscriber adds a copy of it to `orders:billing:dlq`, th
 - a message whose payload cannot be bound (`msg_bind`, inbox *rejected*),
 - a message no handler is registered for (`nf_mh`).
 
-**A copy that cannot be added.** When the key holds another type or Redis does not answer within the worker's `SubscriberConfig.AckTimeout`, `Reject` fails with `redisstream: dead-letter <id> to <stream>, delivering it again` and the entry is claimed again at once. A message without a handler is then rejected again. A message the inbox already marks *failed* or *rejected* is not: the worker acknowledges its redelivery and skips it, so it never reaches the dead-letter stream.
+**A copy that cannot be added.** When the key holds another type or Redis does not answer within the worker's `SubscriberConfig.AckTimeout`, `Reject` fails with `redisstream: dead-letter <id> to <stream>, delivering it again` and the entry is claimed again at once, within about a second. The worker then rejects it again, until the copy is added.
 
-Dead letters keep their `x-msg-id`, so the consumer inbox skips a replayed message as already *failed* or *rejected*. To process one again, first set its inbox row back to *waiting* with zero attempts, then add it to the original stream again, for example with `XADD` of its fields. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages). Read them with `XRANGE orders:billing:dlq - +`, and delete one with `XDEL` once handled.
+Dead letters keep their `x-msg-id`, so the worker rejects a replayed message again, back to the dead-letter stream, while its inbox row is *failed* or *rejected*. To process one again, first set its inbox row back to *waiting* with zero attempts, then add it to the original stream again, for example with `XADD` of its fields. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages). Read them with `XRANGE orders:billing:dlq - +`, and delete one with `XDEL` once handled.
 
 **Validation.** `New` fails before connecting when `DeadLetter.Stream` is the stream the subscriber reads.
 
