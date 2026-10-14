@@ -22,6 +22,12 @@ const (
 	claimInterval = time.Second
 	// errorWait is the pause after a read or claim that failed for a reason that may pass.
 	errorWait = time.Second
+	// sweepInterval is the pause between two sweeps of the stale consumers of a group.
+	sweepInterval = 5 * time.Minute
+	// staleIdle is how many times ClaimIdle a consumer without pending entries stays idle before a
+	// sweep deletes it. A live consumer claims about once a second, or holds the entries it
+	// handles, so it is never stale.
+	staleIdle = 10
 
 	// retryConsumer owns the entries that wait for a retry.
 	retryConsumer = "forgo-retry"
@@ -52,12 +58,17 @@ type subscriber struct {
 	reading  []string
 	inflight inflight
 
-	// block, claimEvery, beat and errorWait time the reads, the scans, the heartbeat and the
-	// pauses after errors. Tests shorten them.
+	// staleAfter is how long a consumer without pending entries stays idle before a sweep deletes
+	// it.
+	staleAfter time.Duration
+
+	// block, claimEvery, beat, errorWait and sweepEvery time the reads, the scans, the heartbeat,
+	// the pauses after errors and the sweeps. Tests shorten them.
 	block      time.Duration
 	claimEvery time.Duration
 	beat       time.Duration
 	errorWait  time.Duration
+	sweepEvery time.Duration
 }
 
 func newSubscriber(client redis.UniversalClient, streams *streams, conf SubscriberConfig, consumer string) *subscriber {
@@ -68,10 +79,12 @@ func newSubscriber(client redis.UniversalClient, streams *streams, conf Subscrib
 		consumer:   consumer,
 		reading:    []string{conf.Stream, ">"},
 		inflight:   inflight{deliveries: make(map[*delivery]struct{})},
+		staleAfter: staleIdle * conf.ClaimIdle,
 		block:      readBlock,
 		claimEvery: claimInterval,
 		beat:       conf.ClaimIdle / 3,
 		errorWait:  errorWait,
+		sweepEvery: sweepInterval,
 	}
 }
 
@@ -79,7 +92,8 @@ func newSubscriber(client redis.UniversalClient, streams *streams, conf Subscrib
 // flight. A read takes no more entries than there are free handler slots, so the rest of the
 // backlog stays in the stream for the other consumers. Before it reads new entries, Consume claims
 // the entries that were idle for ClaimIdle: those of consumers that stopped and the retries that
-// are due.
+// are due. Once a scan of them reached the end, and at most every sweepInterval, it sweeps the
+// stale consumers of the group.
 //
 // It returns once ctx ends and every handler finished, or with the error that stopped it, such as
 // a deleted group. While Redis cannot be reached or fails over, it keeps trying, with a pause of a
@@ -95,7 +109,7 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 	// The commands do not end with ctx: the entries of a read are handled even when ctx ended
 	// meanwhile, instead of staying pending until another consumer claims them.
 	rctx := context.WithoutCancel(ctx)
-	cursor, nextClaim := claimStart, time.Time{}
+	cursor, nextClaim, nextSweep := claimStart, time.Time{}, time.Time{}
 	for ctx.Err() == nil {
 		n := acquire(ctx, slots, concurrency)
 		if n == 0 {
@@ -107,7 +121,12 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 		for err == nil && len(entries) == 0 && !time.Now().Before(nextClaim) {
 			entries, cursor, err = s.claim(rctx, cursor, n)
 			if err == nil && len(entries) == 0 && cursor == claimStart {
-				nextClaim = time.Now().Add(s.claimEvery)
+				now := time.Now()
+				nextClaim = now.Add(s.claimEvery)
+				if !now.Before(nextSweep) {
+					s.sweep(rctx)
+					nextSweep = now.Add(s.sweepEvery)
+				}
 			}
 		}
 		if err == nil && len(entries) == 0 {
@@ -148,6 +167,28 @@ func (s *subscriber) Close() error {
 		return fmt.Errorf("redisstream: subscriber %s: delete consumer %s: %w", s.conf.Name, s.consumer, err)
 	}
 	return nil
+}
+
+// sweep deletes the consumers of the group that have no pending entries and were idle for
+// staleAfter, such as those of instances that crashed before Close could delete them. It keeps its
+// own consumer and the retry consumer. Deleting a consumer that is still alive is harmless: Redis
+// creates it again on its next read or claim. Every deletion goes through delConsumerScript, so a
+// consumer that took entries since XINFO is kept. A failed sweep is left to the next one.
+func (s *subscriber) sweep(ctx context.Context) {
+	info, err := s.client.XInfoConsumers(ctx, s.conf.Stream, s.conf.Group).Result()
+	if err != nil {
+		return
+	}
+	pipe := s.client.Pipeline()
+	for _, c := range info {
+		if c.Pending == 0 && c.Idle > s.staleAfter && c.Name != s.consumer && c.Name != retryConsumer {
+			// EVAL rather than Run, whose fallback from EVALSHA does not work in a pipeline.
+			delConsumerScript.Eval(ctx, pipe, []string{s.conf.Stream}, s.conf.Group, c.Name)
+		}
+	}
+	if pipe.Len() > 0 {
+		_, _ = pipe.Exec(ctx)
+	}
 }
 
 // claim claims up to n entries of the group that were idle for ClaimIdle, scanning the pending
