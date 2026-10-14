@@ -36,6 +36,7 @@ const (
 // A topic or subscription is an ID in ProjectID, or a full name such as
 // projects/<project>/topics/<topic> for one in another project.
 type Config struct {
+	// Name identifies the resource and names the broker in logs. Required.
 	Name string
 	// ProjectID is the project of the topics and subscriptions. Default: the GOOGLE_CLOUD_PROJECT
 	// environment variable, or the project of the credentials. The emulator needs it set.
@@ -52,7 +53,8 @@ type Config struct {
 	// Subscriptions are created when they do not exist, after their dead-letter topic and
 	// subscription. An existing subscription must have the configured settings.
 	Subscriptions []SubscriptionConfig
-	Subscribers   []SubscriberConfig
+	// Subscribers are the subscribers the worker consumer names.
+	Subscribers []SubscriberConfig
 }
 
 // Sanitize returns a copy of c with defaults applied. It never modifies the slices of c.
@@ -73,6 +75,8 @@ func (c Config) Sanitize() Config {
 	return c
 }
 
+// New validates the config, creates the client, and creates or checks the topics and subscriptions
+// within DeclareTimeout. A failure closes the client. Its Resource is a *Broker.
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
@@ -104,11 +108,14 @@ func (c Config) validate() error {
 	return nil
 }
 
+// TopicConfig is a topic New creates when it does not exist.
 type TopicConfig struct {
 	// Name is the topic.
 	Name string
 }
 
+// SubscriptionConfig is a subscription New creates when it does not exist. When it exists, New
+// checks that it has these settings.
 type SubscriptionConfig struct {
 	// Name is the subscription.
 	Name string
@@ -264,6 +271,7 @@ func (d DeadLetterConfig) validate(subscription string) error {
 	return nil
 }
 
+// SubscriberConfig configures the subscriber of the worker.SubscriberConfig of the same Name.
 type SubscriberConfig struct {
 	// Name matches worker.SubscriberConfig.Name.
 	Name string

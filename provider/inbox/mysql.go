@@ -22,6 +22,7 @@ func NewMySQL(db *sql.DB) *MySQL {
 	return &MySQL{db: db}
 }
 
+// Status returns the status of the message for the subscriber, and false when the inbox has no row for it.
 func (m *MySQL) Status(
 	ctx context.Context,
 	messageID string,
@@ -55,6 +56,8 @@ func (m *MySQL) Status(
 	return status, true, nil
 }
 
+// IncrementAttempt counts an attempt at a waiting message and returns the count, inserting the
+// message on its first attempt. It returns ErrNotWaiting once the message left waiting.
 func (m *MySQL) IncrementAttempt(
 	ctx context.Context,
 	messageID string,
@@ -154,6 +157,8 @@ func (m *MySQL) IncrementAttempt(
 	return attempts, nil
 }
 
+// MarkCompleted moves the waiting message to completed. It fails unless it moved the message itself,
+// as the package documentation explains.
 func (m *MySQL) MarkCompleted(
 	ctx context.Context,
 	messageID string,
@@ -168,6 +173,7 @@ func (m *MySQL) MarkCompleted(
 	)
 }
 
+// MarkFailed moves the waiting message to failed. Repeating it succeeds.
 func (m *MySQL) MarkFailed(
 	ctx context.Context,
 	messageID string,
@@ -182,6 +188,7 @@ func (m *MySQL) MarkFailed(
 	)
 }
 
+// MarkRejected moves the waiting message to rejected. Repeating it succeeds.
 func (m *MySQL) MarkRejected(
 	ctx context.Context,
 	messageID string,
@@ -252,6 +259,8 @@ func (m *MySQL) markStatus(
 	return unmoved(current, exists, target, repeatable)
 }
 
+// DeleteBefore deletes up to limit completed and rejected messages last updated before before, and
+// returns how many it deleted.
 func (m *MySQL) DeleteBefore(
 	ctx context.Context,
 	before time.Time,

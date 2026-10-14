@@ -106,6 +106,8 @@ func (m *MySQL) Claim(
 	return messages, nil
 }
 
+// Complete marks the messages of successfulIDs processed and releases the other messages of the
+// claim, so that the next claim takes them again, in one transaction.
 func (m *MySQL) Complete(
 	ctx context.Context,
 	claimID string,
@@ -175,6 +177,8 @@ func (m *MySQL) Complete(
 	})
 }
 
+// DeleteProcessedBefore deletes up to limit messages processed before before, and returns how many
+// it deleted.
 func (m *MySQL) DeleteProcessedBefore(
 	ctx context.Context,
 	before time.Time,

@@ -29,13 +29,15 @@ const (
 // connection or key error fails the bootstrap instead of the first publish or read. It needs
 // Redis 6.2 or newer.
 type Config struct {
+	// Name identifies the resource and names the broker in logs. Required.
 	Name string
 	// Redis is the connection of the broker, which opens a client of its own: blocking reads hold
 	// a connection each, so they never take connections from the pool of the application's
 	// providers. Its Name is not used.
 	Redis redisdb.Config
 	// Streams are the streams the broker trims and the consumer groups it creates.
-	Streams     []StreamConfig
+	Streams []StreamConfig
+	// Subscribers are the subscribers the worker consumer names.
 	Subscribers []SubscriberConfig
 }
 
@@ -56,6 +58,8 @@ func (c Config) Sanitize() Config {
 	return c
 }
 
+// New validates the config, connects to Redis and creates the missing consumer groups. A failure
+// closes the client. Its Resource is a *Broker.
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
@@ -92,6 +96,7 @@ func (c Config) validate() error {
 	return nil
 }
 
+// StreamConfig is a stream the broker trims, and the consumer groups New creates on it.
 type StreamConfig struct {
 	// Name is the key of the stream.
 	Name string
@@ -128,6 +133,7 @@ type GroupConfig struct {
 	StartID string
 }
 
+// SubscriberConfig configures the subscriber of the worker.SubscriberConfig of the same Name.
 type SubscriberConfig struct {
 	// Name matches worker.SubscriberConfig.Name.
 	Name string

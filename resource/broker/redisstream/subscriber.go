@@ -40,6 +40,8 @@ redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
 return 1
 `)
 
+// Subscriber is the worker.ISubscriber of a SubscriberConfig. It reads and claims as a consumer of its
+// own, which Close deletes from the group when it holds no pending entries.
 type Subscriber struct {
 	conf    SubscriberConfig
 	client  redis.UniversalClient

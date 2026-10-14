@@ -13,6 +13,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Broker is the resource New returns and its worker.IBroker Value. It owns its Redis client.
 type Broker struct {
 	name string
 	// conn is the redisdb resource of the client, which closes it.
@@ -51,6 +52,7 @@ func newBroker(cfg Config) (_ *Broker, err error) {
 	return b, nil
 }
 
+// Name returns Config.Name.
 func (b *Broker) Name() string {
 	return b.name
 }
@@ -81,6 +83,7 @@ func (b *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	return s, nil
 }
 
+// Value returns the broker as a worker.IBroker.
 func (b *Broker) Value() any {
 	return worker.IBroker(b)
 }

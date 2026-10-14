@@ -1,3 +1,5 @@
+// Package ratelimit implements http.IRateLimiter on Redis, so that the limits of http.RateLimitWith hold
+// across every instance of an application.
 package ratelimit
 
 import (
@@ -63,6 +65,8 @@ func NewRedis(cl redis.UniversalClient) *Redis {
 	return &Redis{cl: cl}
 }
 
+// Allow counts a request under key at rate, in one script on Redis. When Redis fails, Allow returns the
+// error, and http.RateLimitConfig.FailOpen decides whether the request is admitted.
 func (r *Redis) Allow(ctx context.Context, key string, rate http.Rate) (http.RateLimitResult, error) {
 	if rate.Limit <= 0 || rate.Period <= 0 {
 		return http.RateLimitResult{}, errInvalidRate

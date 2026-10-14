@@ -39,6 +39,7 @@ var (
 // New connects and declares every exchange, queue, binding and dead-letter queue, so a topology
 // error fails the bootstrap instead of the first publish or consume.
 type Config struct {
+	// Name identifies the resource and names the connection in the RabbitMQ management UI. Required.
 	Name string
 	// Addr is the broker host. Default: localhost.
 	Addr string
@@ -50,9 +51,11 @@ type Config struct {
 	// VHost is the virtual host. Default: /.
 	VHost string
 	// Recovery reconnects after the connection or a channel is lost. Enabled by default.
-	Recovery    RecoveryConfig
-	Exchanges   []ExchangeConfig
-	Queues      []QueueConfig
+	Recovery RecoveryConfig
+	// Exchanges are declared first, then Queues with their bindings.
+	Exchanges []ExchangeConfig
+	Queues    []QueueConfig
+	// Publishers and Subscribers are the publishers and subscribers the worker servers name.
 	Publishers  []PublisherConfig
 	Subscribers []SubscriberConfig
 }
@@ -85,6 +88,7 @@ func (c Config) Sanitize() Config {
 	return c
 }
 
+// New connects and declares the topology. A failure closes the connection. Its Resource is a *Broker.
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
@@ -151,6 +155,7 @@ type RecoveryConfig struct {
 	RetryInterval time.Duration
 }
 
+// Sanitize returns a copy of r with defaults applied.
 func (r RecoveryConfig) Sanitize() RecoveryConfig {
 	if r.MaxRetries == 0 {
 		r.MaxRetries = math.MaxInt
@@ -161,6 +166,8 @@ func (r RecoveryConfig) Sanitize() RecoveryConfig {
 	return r
 }
 
+// ExchangeConfig declares an exchange. Its fields are the arguments of the AMQP exchange.declare
+// method, such as Kind amqp.ExchangeTopic.
 type ExchangeConfig struct {
 	Name       string
 	Kind       string
@@ -171,6 +178,8 @@ type ExchangeConfig struct {
 	Args       map[string]any
 }
 
+// QueueConfig declares a queue and its bindings. Name, Durable, AutoDelete, Exclusive, NoWait and Args
+// are the arguments of the AMQP queue.declare method.
 type QueueConfig struct {
 	Name       string
 	Durable    bool
@@ -337,6 +346,7 @@ func (r RetryConfig) queues(queue string) []retryQueue {
 	}
 }
 
+// BindingConfig binds its queue to Exchange, as the AMQP queue.bind method does.
 type BindingConfig struct {
 	Exchange   string
 	RoutingKey string
@@ -344,6 +354,7 @@ type BindingConfig struct {
 	Args       map[string]any
 }
 
+// PublisherConfig configures the publisher that a worker.ProducerConfig publisher of the same Name uses.
 type PublisherConfig struct {
 	// Name matches worker.PublisherConfig.Name.
 	Name string
@@ -354,6 +365,7 @@ type PublisherConfig struct {
 	DeliveryMode uint8
 }
 
+// Sanitize returns a copy of p with defaults applied.
 func (p PublisherConfig) Sanitize() PublisherConfig {
 	if p.DeliveryMode == 0 {
 		p.DeliveryMode = amqp.Persistent
@@ -361,6 +373,9 @@ func (p PublisherConfig) Sanitize() PublisherConfig {
 	return p
 }
 
+// SubscriberConfig configures the subscriber of the worker.SubscriberConfig of the same Name, which
+// consumes Queue. AutoAck, Exclusive, NoLocal, NoWait and Args are the arguments of the AMQP
+// basic.consume method. Leave AutoAck off: the worker acknowledges every message itself.
 type SubscriberConfig struct {
 	// Name matches worker.SubscriberConfig.Name.
 	Name  string

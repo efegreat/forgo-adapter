@@ -18,10 +18,13 @@ func NewMySQL(db *sql.DB) *MySQL {
 	return &MySQL{db: db}
 }
 
+// Get reads the row of name. Without one, it returns version 0.
 func (m *MySQL) Get(ctx context.Context, name string) ([]byte, uint64, error) {
 	return get(ctx, m.db, `SELECT data, version FROM live_configs WHERE name = ?`, name)
 }
 
+// Set inserts the row of name when version is 0, and otherwise updates it only while it holds version.
+// When no row changed, it returns forgo.ErrLiveConfigConflict.
 func (m *MySQL) Set(ctx context.Context, name string, data []byte, version uint64) error {
 	// data is sent as text: MySQL cannot create a JSON value from a []byte, whose character set is binary.
 	if version == 0 {

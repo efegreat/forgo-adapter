@@ -33,6 +33,7 @@ func NewRedisCache(cl redis.UniversalClient) *RedisCache {
 	return &RedisCache{cl: cl}
 }
 
+// Get reads the document cached under KeyPrefix+name.
 func (r *RedisCache) Get(ctx context.Context, name string) ([]byte, bool, error) {
 	data, err := r.cl.HGet(ctx, KeyPrefix+name, "data").Bytes()
 	if errors.Is(err, redis.Nil) {
@@ -44,6 +45,7 @@ func (r *RedisCache) Get(ctx context.Context, name string) ([]byte, bool, error)
 	return data, true, nil
 }
 
+// Set caches the document of name in one script, unless the entry holds the same or a newer version.
 func (r *RedisCache) Set(ctx context.Context, name string, data []byte, version uint64) error {
 	if err := setScript.Run(ctx, r.cl, []string{KeyPrefix + name}, version, data).Err(); err != nil {
 		return fmt.Errorf("liveconfig: cache set %q: %w", name, err)

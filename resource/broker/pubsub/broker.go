@@ -15,6 +15,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Broker is the resource New returns and its worker.IBroker Value. Its publishers share one client
+// publisher per topic, which batches their messages.
 type Broker struct {
 	conf   Config
 	client *gpubsub.Client
@@ -71,6 +73,7 @@ func resolveSubscriber(cfg Config, project string, s SubscriberConfig) Subscribe
 	return s
 }
 
+// Name returns Config.Name.
 func (b *Broker) Name() string {
 	return b.conf.Name
 }
@@ -100,6 +103,7 @@ func (b *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	return s, nil
 }
 
+// Value returns the broker as a worker.IBroker.
 func (b *Broker) Value() any {
 	return worker.IBroker(b)
 }

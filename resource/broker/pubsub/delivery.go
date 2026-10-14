@@ -13,6 +13,7 @@ import (
 	gpubsub "cloud.google.com/go/pubsub/v2"
 )
 
+// Delivery is the worker.IDelivery of a Pub/Sub message.
 type Delivery struct {
 	msg *gpubsub.Message
 	wm  worker.Message
@@ -46,6 +47,7 @@ func newDelivery(m *gpubsub.Message, deadLetter *deadLetter) *Delivery {
 	return d
 }
 
+// Message returns the message, with the identity its attributes carry.
 func (d *Delivery) Message() worker.Message {
 	return d.wm
 }
