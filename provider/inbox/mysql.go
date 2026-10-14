@@ -24,6 +24,12 @@ func NewMySQL(db *sql.DB) *MySQL {
 	return &MySQL{db: db}
 }
 
+// readCommitted is the isolation of the transaction IncrementAttempt begins. Under REPEATABLE READ,
+// the SELECT … FOR UPDATE of a message without a row locks the gap where its row would go, and two
+// first attempts whose rows go in the same gap, as consecutive UUIDv7 message IDs do, deadlock on
+// their inserts. A storage that joins the caller's transaction keeps the caller's isolation.
+var readCommitted = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+
 // Status returns the status of the message for the subscriber, and false when the inbox has no row for it.
 func (m *MySQL) Status(
 	ctx context.Context,
@@ -67,7 +73,7 @@ func (m *MySQL) IncrementAttempt(
 ) (int, error) {
 	var attempts int
 
-	err := sqltx.Run(ctx, m.db, func(ctx context.Context) error {
+	err := sqltx.RunWith(ctx, m.db, readCommitted, func(ctx context.Context) error {
 		tx := sqltx.From(ctx, m.db)
 
 		var status worker.InboxStatus

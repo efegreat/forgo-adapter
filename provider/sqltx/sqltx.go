@@ -38,12 +38,19 @@ func From(ctx context.Context, db *sql.DB) Executor {
 //
 // When ctx already carries a transaction on db, fn joins it: Run neither begins nor ends a
 // transaction, and the outermost Run decides whether everything commits.
-func Run(ctx context.Context, db *sql.DB, fn func(ctx context.Context) error) (err error) {
+func Run(ctx context.Context, db *sql.DB, fn func(ctx context.Context) error) error {
+	return RunWith(ctx, db, nil, fn)
+}
+
+// RunWith is Run with the options of the transaction it begins, such as its isolation level. When
+// ctx already carries a transaction on db, fn joins it and opts are ignored: the outermost call
+// chose them.
+func RunWith(ctx context.Context, db *sql.DB, opts *sql.TxOptions, fn func(ctx context.Context) error) (err error) {
 	if _, ok := ctx.Value(txKey{db}).(*sql.Tx); ok {
 		return fn(ctx)
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("sqltx: begin: %w", err)
 	}
