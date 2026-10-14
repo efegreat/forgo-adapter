@@ -211,7 +211,10 @@ func (p *Postgres) markStatus(
 // DeleteBefore deletes up to limit completed and rejected messages last updated before before, and
 // returns how many it deleted. Rows that another cleanup holds are skipped. Rows are read in the
 // order of the inbox_events_cleanup index, (status, updated_at), so that a batch stops at its limit
-// without sorting the expired rows or reading the failed ones, which are kept.
+// without sorting the expired rows or reading the failed ones, which are kept. Their ctids are
+// collected into an array first, so that the delete finds the rows by their ctid. A join on the
+// primary key would scan the whole table in a generic plan, which does not know the limit. A row
+// keeps its ctid while the statement holds its lock.
 func (p *Postgres) DeleteBefore(
 	ctx context.Context,
 	before time.Time,
@@ -220,19 +223,16 @@ func (p *Postgres) DeleteBefore(
 	result, err := sqltx.From(ctx, p.db).ExecContext(
 		ctx,
 		`
-		WITH candidates AS (
-			SELECT message_id, subscriber_name
+		DELETE FROM inbox_events
+		WHERE ctid = ANY(ARRAY(
+			SELECT ctid
 			FROM inbox_events
 			WHERE status IN ($1, $2)
 			  AND updated_at < $3
 			ORDER BY status, updated_at
 			LIMIT $4
 			FOR UPDATE SKIP LOCKED
-		)
-		DELETE FROM inbox_events AS i
-		USING candidates AS c
-		WHERE i.message_id = c.message_id
-		  AND i.subscriber_name = c.subscriber_name
+		))
 		`,
 		worker.InboxCompleted,
 		worker.InboxRejected,
