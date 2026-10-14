@@ -301,6 +301,41 @@ func TestWrapperInterfaces(t *testing.T) {
 	}
 }
 
+func TestDriverConn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		conn driver.Conn
+	}{
+		{"basic", &basicConn{}},
+		{"resetter", &resetConn{}},
+		{"validator", &validConn{}},
+		{"both", &fullConn{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged, ctx, _ := openFake(t, tc.conn, LoggerConfig{})
+			plain := sql.OpenDB(dsnConnector{driver: connDriver{func() driver.Conn { return tc.conn }}})
+			t.Cleanup(func() { _ = plain.Close() })
+
+			for _, db := range []*sql.DB{logged, plain} {
+				c, err := db.Conn(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = c.Raw(func(driverConn any) error {
+					if got := DriverConn(driverConn); got != tc.conn {
+						t.Errorf("DriverConn(%T) = %T, want the driver's %T", driverConn, got, tc.conn)
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = c.Close()
+			}
+		})
+	}
+}
+
 func implements[I any](v any) bool {
 	_, ok := v.(I)
 	return ok
