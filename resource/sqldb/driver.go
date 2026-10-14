@@ -77,6 +77,30 @@ func wrapConn(cn driver.Conn, log *queryLog) driver.Conn {
 	return c
 }
 
+// DriverConn returns the driver's connection behind driverConn, the value sql.Conn.Raw passes to
+// its function. With Logger enabled, that value is the log's connection, so the type a driver
+// documents for Raw, such as pgx's *stdlib.Conn, is only reached through DriverConn:
+//
+//	err := conn.Raw(func(driverConn any) error {
+//		pg := sqldb.DriverConn(driverConn).(*stdlib.Conn).Conn()
+//		_, err := pg.CopyFrom(ctx, pgx.Identifier{"users"}, columns, rows)
+//		return err
+//	})
+//
+// Any other value is returned as is, so the same code works with the log off. Statements run on the
+// driver's connection are not logged.
+func DriverConn(driverConn any) any {
+	if c, ok := driverConn.(interface{ unwrap() driver.Conn }); ok {
+		return c.unwrap()
+	}
+	return driverConn
+}
+
+// unwrap is promoted to every variant of conn, which DriverConn relies on.
+func (c *conn) unwrap() driver.Conn {
+	return c.Conn
+}
+
 type (
 	resettingConn  struct{ *conn }
 	validatingConn struct{ *conn }

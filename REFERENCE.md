@@ -196,7 +196,17 @@ Off, nothing wraps the driver. On, a statement costs two clock reads. A line wri
 
 ##### Drivers
 
-The log wraps the connections of the driver and implements exactly the optional `database/sql/driver` interfaces the driver does, so `database/sql` behaves as without it. `db.Driver()` still returns the driver, so forgo's `migration.DetectDialect` finds the dialect. The function given to `sql.Conn.Raw` receives the wrapper's connection rather than the driver's.
+The log wraps the connections of the driver and implements exactly the optional `database/sql/driver` interfaces the driver does, so `database/sql` behaves as without it. `db.Driver()` still returns the driver, so forgo's `migration.DetectDialect` finds the dialect. The function given to `sql.Conn.Raw` receives the wrapper's connection rather than the driver's. `sqldb.DriverConn` returns the driver's, and any other value as is, so code that calls it works with the log on or off:
+
+```go
+err := conn.Raw(func(driverConn any) error {
+	pg := sqldb.DriverConn(driverConn).(*stdlib.Conn).Conn() // pgx
+	_, err := pg.CopyFrom(ctx, pgx.Identifier{"users"}, columns, rows)
+	return err
+})
+```
+
+Statements run on the driver's connection are not logged. A library that calls `Raw` itself and expects the driver's type fails with the log on, since it does not know `DriverConn`.
 
 ### redisdb
 
