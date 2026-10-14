@@ -52,21 +52,11 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 
 ## Installation
 
-Go 1.27 or newer. forgo and forgo-adapter are private and untagged until their first release, so point your `go.mod` at local checkouts of both:
+Go 1.27 or newer.
 
+```sh
+go get github.com/efegreat/forgo-adapter
 ```
-require (
-	github.com/efegreat/forgo v0.0.0
-	github.com/efegreat/forgo-adapter v0.0.0
-)
-
-replace (
-	github.com/efegreat/forgo => ../forgo
-	github.com/efegreat/forgo-adapter => ../forgo-adapter
-)
-```
-
-Once they are released, drop the `replace` directives and run `go get github.com/efegreat/forgo-adapter`. While the repositories stay private, set `GOPRIVATE=github.com/efegreat/*` so Go fetches them with your git credentials instead of the public proxy.
 
 ---
 
@@ -916,14 +906,17 @@ var (
 
 // cmd/worker/main.go
 func main() {
-	forgo.NewApp(
+	app := forgo.NewApp(
 		forgo.WithName("shop-worker"),
 		forgo.WithLogger(config.Logger),
 		forgo.WithResources(config.DB, config.Redis, config.Broker),
 		forgo.WithProviders(config.Adapters...),
 		forgo.WithProviders(config.Services...),
 		forgo.WithServers(config.Consumer, config.Producer),
-	).Run()
+	)
+	if err := app.Run(); err != nil { // logged; main picks the exit code
+		os.Exit(1)
+	}
 }
 ```
 

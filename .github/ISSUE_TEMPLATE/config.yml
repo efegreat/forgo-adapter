@@ -1,0 +1,10 @@
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/efegreat/forgo-adapter/security/advisories/new
+    about: Report vulnerabilities privately, never in a public issue.
+  - name: forgo issue
+    url: https://github.com/efegreat/forgo/issues/new/choose
+    about: Servers, middlewares, the bootstrap and the contracts the adapters implement live in forgo.
+  - name: Documentation
+    url: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md
+    about: The complete usage guide.

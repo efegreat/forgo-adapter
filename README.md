@@ -2,6 +2,11 @@
 
 **Ready-made infrastructure for [forgo](https://github.com/efegreat/forgo): databases, brokers, storages, locks and rate limits you configure instead of write.**
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/efegreat/forgo-adapter.svg)](https://pkg.go.dev/github.com/efegreat/forgo-adapter)
+[![CI](https://github.com/efegreat/forgo-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/efegreat/forgo-adapter/actions/workflows/ci.yml)
+[![Go 1.27+](https://img.shields.io/badge/go-1.27%2B-00ADD8)](https://go.dev/dl/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 [Forgo](https://github.com/efegreat/forgo) defines contracts such as `worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `http.IRateLimiter`, `forgo.LiveConfigStore` and `forgo.LiveConfigCache`, and never depends on a concrete database, broker or cache. This library implements those contracts for common infrastructure. Resources are config values, and providers are constructors you hand to the bootstrap.
 
 ```go
@@ -32,7 +37,9 @@ app := forgo.NewApp(
 	),
 	forgo.WithServers(config.Consumer, config.Producer),
 )
-app.Run()
+if err := app.Run(); err != nil { // logged; main picks the exit code
+	os.Exit(1)
+}
 ```
 
 ## What's in the box
@@ -59,26 +66,25 @@ app.Run()
 
 ## Installation
 
-forgo-adapter requires Go 1.27 or newer. forgo and forgo-adapter are private and untagged until their first release, so point your `go.mod` at local checkouts of both:
+forgo-adapter requires Go 1.27 or newer.
 
+```sh
+go get github.com/efegreat/forgo-adapter
 ```
-require (
-	github.com/efegreat/forgo v0.0.0
-	github.com/efegreat/forgo-adapter v0.0.0
-)
-
-replace (
-	github.com/efegreat/forgo => ../forgo
-	github.com/efegreat/forgo-adapter => ../forgo-adapter
-)
-```
-
-Once they are released, drop the `replace` directives and run `go get github.com/efegreat/forgo-adapter`. While the repositories stay private, set `GOPRIVATE=github.com/efegreat/*` so Go fetches them with your git credentials instead of the public proxy.
 
 Import the SQL driver you use in `main`, for example `_ "github.com/lib/pq"`.
 
 ## Documentation
 
 - **[REFERENCE.md](REFERENCE.md)** is the complete usage guide: every config field and default, how each adapter maps onto forgo, dead-letter queues, lock and rate-limit semantics.
+- **[pkg.go.dev](https://pkg.go.dev/github.com/efegreat/forgo-adapter)** has the API documentation of every package, with examples.
 - **[AGENTS.md](AGENTS.md)** is the guide for contributors and coding agents working on this library.
 - forgo's own [REFERENCE.md](https://github.com/efegreat/forgo/blob/main/REFERENCE.md) covers the worker, the storage contracts and table schemas, locks and the rate limit middleware that these adapters plug into.
+
+## Contributing
+
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md), and report vulnerabilities privately as [SECURITY.md](SECURITY.md) describes.
+
+## License
+
+forgo-adapter is released under the [MIT License](LICENSE).

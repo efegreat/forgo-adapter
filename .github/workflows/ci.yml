@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  # Weekly, so that a vulnerability found since the last push fails the build.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: forgo-adapter
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: forgo-adapter
+          persist-credentials: false
+
+      # Until forgo is released, go.mod replaces it with a checkout next to this one.
+      - name: Check for a local forgo
+        id: forgo
+        run: |
+          if grep -q '=> ../forgo$' go.mod; then
+            echo "local=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out forgo
+        if: steps.forgo.outputs.local == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: efegreat/forgo
+          path: forgo
+          # Reading a private forgo needs a FORGO_TOKEN secret with read access to it.
+          token: ${{ secrets.FORGO_TOKEN || github.token }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: forgo-adapter/go.mod
+          cache-dependency-path: forgo-adapter/go.sum
+          check-latest: true
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: go mod tidy -diff
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      # Reports only the vulnerabilities that the adapters' code can reach, in the Go release
+      # setup-go installed and in the required modules.
+      - name: Govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+  # Pushing a v* tag releases it once every check passes on the tagged commit.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Modules that depend on this one ignore its replace directives, so a release that replaces
+      # forgo would not build for them.
+      - name: Check that go.mod requires a released forgo
+        run: |
+          if grep -q '=> ../forgo$' go.mod; then
+            echo "go.mod replaces forgo with ../forgo. Require a released forgo version before tagging."
+            exit 1
+          fi
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=
+          case "$TAG" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $prerelease
+
+      # pkg.go.dev lists a version once the module proxy has fetched it, and the proxy fetches it
+      # only when someone asks for it. It fetches public modules only.
+      - name: Publish the version to the Go module proxy
+        if: ${{ !github.event.repository.private }}
+        run: curl -fsS "https://proxy.golang.org/github.com/efegreat/forgo-adapter/@v/$TAG.info"
