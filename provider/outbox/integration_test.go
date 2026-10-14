@@ -158,6 +158,76 @@ func TestIntegrationCompleteReleasesFailures(t *testing.T) {
 	}
 }
 
+// TestIntegrationCompleteDoesNotBlockInserts checks that a release on MySQL leaves the application's
+// inserts alone. The release of the claim with the smallest processing_id reads the index entries
+// right after the place where a new row's entry goes: under REPEATABLE READ, it would lock that gap
+// until it commits. Another transaction holds the last row of the claim, so that the release waits
+// there with its locks taken while the application inserts.
+func TestIntegrationCompleteDoesNotBlockInserts(t *testing.T) {
+	db := sqltest.MySQL.Open(t)
+	sqltest.MySQL.Reset(t, db, "outbox_events")
+	s := NewMySQL(db)
+	ctx := context.Background()
+	for i := 1; i <= 20; i++ {
+		write(t, sqltest.MySQL, db, worker.Message{ID: fmt.Sprintf("m%02d", i), Name: "n", Payload: []byte(`{}`),
+			Headers: types.NewJSONMap[string](), CreatedAt: time.Now()})
+	}
+	if got := claimIDs(t, s, "c1", time.Now().Add(-time.Minute), 3); !reflect.DeepEqual(got, []string{"m01", "m02", "m03"}) {
+		t.Fatalf("Claim = %v", got)
+	}
+
+	holder, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback() }()
+	if _, err := holder.ExecContext(ctx, `SELECT id FROM outbox_events WHERE id = 'm03' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+
+	completed := make(chan error, 1)
+	go func() { completed <- s.Complete(ctx, "c1", nil) }()
+	waitForLockWait(t, db)
+
+	app, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = app.Close() }()
+	if _, err := app.ExecContext(ctx, `SET SESSION innodb_lock_wait_timeout = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecContext(ctx, `INSERT INTO outbox_events (id, name, payload) VALUES ('m99', 'n', '{}')`); err != nil {
+		t.Errorf("application insert during a release: %v", err)
+	}
+
+	if err := holder.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-completed; err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+}
+
+// waitForLockWait waits until a transaction on db waits for a row lock. InnoDB refreshes
+// information_schema.innodb_trx only when it was not read for 100ms, so faster polling would read the
+// same snapshot forever.
+func waitForLockWait(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		var waiting int
+		err := db.QueryRowContext(context.Background(),
+			`SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_state = 'LOCK WAIT'`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			return
+		}
+	}
+	t.Fatal("no transaction waits for a lock")
+}
+
 // checkMessage compares a claimed message with the one written. The databases normalize JSON, so
 // payloads are compared as values.
 func checkMessage(t *testing.T, got, want worker.Message) {

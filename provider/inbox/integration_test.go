@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,6 +84,39 @@ func TestIntegrationTransitions(t *testing.T) {
 			}
 			if err := s.MarkRejected(ctx, "unknown", sub); !errors.Is(err, sql.ErrNoRows) {
 				t.Fatalf("MarkRejected of an unknown message = %v, want sql.ErrNoRows", err)
+			}
+		})
+	}
+}
+
+// TestIntegrationConcurrentFirstAttempts runs the first attempts of new messages at once, as
+// consumers handling new messages concurrently do. Their UUIDv7 IDs put their rows next to each
+// other: under MySQL's REPEATABLE READ, the transactions of IncrementAttempt deadlock on them.
+func TestIntegrationConcurrentFirstAttempts(t *testing.T) {
+	for _, d := range sqltest.Dialects {
+		t.Run(d.Name, func(t *testing.T) {
+			db := d.Open(t)
+			d.Reset(t, db, "inbox_events")
+			s := storage(d, db)
+
+			const workers, perWorker = 8, 25
+			var failed atomic.Int64
+			var firstErr sync.Once
+			var wg sync.WaitGroup
+			for range workers {
+				wg.Go(func() {
+					for range perWorker {
+						id := worker.NewMessage("n", "", "", nil).ID
+						if got, err := s.IncrementAttempt(context.Background(), id, sub); err != nil || got != 1 {
+							failed.Add(1)
+							firstErr.Do(func() { t.Errorf("IncrementAttempt = %d, %v; want 1", got, err) })
+						}
+					}
+				})
+			}
+			wg.Wait()
+			if n := failed.Load(); n > 0 {
+				t.Fatalf("%d of %d first attempts failed", n, workers*perWorker)
 			}
 		})
 	}

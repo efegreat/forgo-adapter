@@ -130,7 +130,9 @@ CREATE TABLE outbox_events (
     processing_at TIMESTAMPTZ,
     processed_at  TIMESTAMPTZ
 )`,
-			`CREATE INDEX outbox_events_pending ON outbox_events (processed_at, processing_at)`,
+			`CREATE INDEX outbox_events_pending ON outbox_events (id) WHERE processed_at IS NULL`,
+			`CREATE INDEX outbox_events_claim ON outbox_events (processing_id) WHERE processing_id IS NOT NULL`,
+			`CREATE INDEX outbox_events_processed ON outbox_events (processed_at, id) WHERE processed_at IS NOT NULL`,
 		},
 		"inbox_events": {`
 CREATE TABLE inbox_events (
@@ -142,7 +144,7 @@ CREATE TABLE inbox_events (
     updated_at      TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (message_id, subscriber_name)
 )`,
-			`CREATE INDEX inbox_events_cleanup ON inbox_events (updated_at)`,
+			`CREATE INDEX inbox_events_cleanup ON inbox_events (status, updated_at)`,
 		},
 		"live_configs": {`
 CREATE TABLE live_configs (
@@ -165,8 +167,9 @@ CREATE TABLE outbox_events (
     processing_id VARCHAR(255),
     processing_at DATETIME(6),
     processed_at  DATETIME(6),
-    INDEX outbox_events_pending (processed_at, processing_at)
-)`},
+    INDEX outbox_events_processed (processed_at, id),
+    INDEX outbox_events_claim (processing_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_bin`},
 		"inbox_events": {`
 CREATE TABLE inbox_events (
     message_id      VARCHAR(255) NOT NULL,
@@ -176,14 +179,14 @@ CREATE TABLE inbox_events (
     created_at      DATETIME(6)  NOT NULL,
     updated_at      DATETIME(6)  NOT NULL,
     PRIMARY KEY (message_id, subscriber_name),
-    INDEX inbox_events_cleanup (updated_at)
-)`},
+    INDEX inbox_events_cleanup (status, updated_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_bin`},
 		"live_configs": {`
 CREATE TABLE live_configs (
     name       VARCHAR(255)    NOT NULL PRIMARY KEY,
     data       JSON            NOT NULL,
     version    BIGINT UNSIGNED NOT NULL,
     updated_at DATETIME(6)     NOT NULL
-)`},
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_bin`},
 	},
 }

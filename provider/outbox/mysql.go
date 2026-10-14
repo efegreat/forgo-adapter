@@ -25,6 +25,13 @@ func NewMySQL(db *sql.DB) *MySQL {
 	return &MySQL{db: db}
 }
 
+// readCommitted is the isolation of the transactions Claim and Complete begin. Under REPEATABLE READ,
+// InnoDB also locks the gaps between the index records a locking statement reads, and the gap at the
+// end of the unprocessed rows is where the application inserts new ones: a claim that reads up to
+// it, or a release of the claim with the smallest processing_id, would block those inserts until it
+// commits. A storage that joins the caller's transaction keeps the caller's isolation.
+var readCommitted = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+
 // Claim selects the messages and stamps them in one transaction. Claims are stamped and expired on
 // the database clock (see claimAge), in UTC so that neither the session time zone nor its daylight
 // saving changes move them.
@@ -34,7 +41,7 @@ func (m *MySQL) Claim(
 ) ([]worker.Message, error) {
 	var messages []worker.Message
 
-	err := sqltx.Run(ctx, m.db, func(ctx context.Context) error {
+	err := sqltx.RunWith(ctx, m.db, readCommitted, func(ctx context.Context) error {
 		tx := sqltx.From(ctx, m.db)
 
 		rows, err := tx.QueryContext(
@@ -115,7 +122,7 @@ func (m *MySQL) Complete(
 	claimID string,
 	successfulIDs []string,
 ) error {
-	return sqltx.Run(ctx, m.db, func(ctx context.Context) error {
+	return sqltx.RunWith(ctx, m.db, readCommitted, func(ctx context.Context) error {
 		tx := sqltx.From(ctx, m.db)
 
 		if len(successfulIDs) > 0 {

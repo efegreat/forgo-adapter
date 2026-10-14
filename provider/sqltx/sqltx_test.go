@@ -3,7 +3,9 @@ package sqltx
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -101,6 +103,53 @@ func TestRunJoinsTransaction(t *testing.T) {
 	})
 	if err == nil || err.Error() != "handler failed" {
 		t.Fatalf("Do = %v", err)
+	}
+}
+
+// optsConnector records the options of the transactions begun on its connections, which sqlmock
+// ignores.
+type optsConnector struct{ began []driver.TxOptions }
+
+func (c *optsConnector) Connect(context.Context) (driver.Conn, error) { return optsConn{c}, nil }
+func (c *optsConnector) Driver() driver.Driver                        { return nil }
+
+type optsConn struct{ c *optsConnector }
+
+func (optsConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not supported") }
+func (optsConn) Close() error                        { return nil }
+func (optsConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
+
+func (c optsConn) BeginTx(_ context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	c.c.began = append(c.c.began, opts)
+	return optsTx{}, nil
+}
+
+type optsTx struct{}
+
+func (optsTx) Commit() error   { return nil }
+func (optsTx) Rollback() error { return nil }
+
+func TestRunWithBeginsWithOptions(t *testing.T) {
+	c := &optsConnector{}
+	db := sql.OpenDB(c)
+	t.Cleanup(func() { _ = db.Close() })
+
+	readCommitted := &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+	err := RunWith(context.Background(), db, readCommitted, func(ctx context.Context) error {
+		// A nested call joins the transaction and ignores its own options.
+		serializable := &sql.TxOptions{Isolation: sql.LevelSerializable}
+		return RunWith(ctx, db, serializable, func(context.Context) error { return nil })
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(context.Background(), db, func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []driver.TxOptions{{Isolation: driver.IsolationLevel(sql.LevelReadCommitted)}, {}}
+	if !slices.Equal(c.began, want) {
+		t.Fatalf("began transactions with %+v, want %+v", c.began, want)
 	}
 }
 
