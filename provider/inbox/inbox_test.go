@@ -372,7 +372,7 @@ func TestDeleteBefore(t *testing.T) {
 	before := time.Now().Add(-maxTTL)
 	queries := map[string]string{
 		// Both read in the order of the inbox_events_cleanup index, (status, updated_at).
-		"postgres": `WITH candidates AS .+ORDER BY status, updated_at\s+LIMIT \$4.+DELETE FROM inbox_events AS i`,
+		"postgres": `DELETE FROM inbox_events\s+WHERE ctid = ANY\(ARRAY\(\s+SELECT ctid\s+FROM inbox_events.+ORDER BY status, updated_at\s+LIMIT \$4\s+FOR UPDATE SKIP LOCKED\s+\)\)`,
 		// MySQL compares an age with its own UTC clock, so the driver's loc cannot move the cutoff.
 		"mysql": `DELETE FROM inbox_events\s+WHERE status IN \(\?, \?\)\s+AND updated_at < UTC_TIMESTAMP\(6\) - INTERVAL \? MICROSECOND\s+ORDER BY status, updated_at\s+LIMIT \?`,
 	}

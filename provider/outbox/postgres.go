@@ -27,6 +27,10 @@ func NewPostgres(db *sql.DB) *Postgres {
 // Claim claims the messages in one UPDATE … RETURNING. It runs in a transaction so a failure while
 // reading the claimed rows releases them right away instead of after ClaimTTL. Claims are stamped
 // and expired on the database clock (see claimAge).
+//
+// The IDs of the claimed rows are collected into an array before the update, which then reads them
+// through the primary key. A join with them, as in WITH … UPDATE … FROM, would scan the whole table
+// in a generic plan, which does not know the limit and expects many rows.
 func (p *Postgres) Claim(
 	ctx context.Context,
 	claim worker.Claim,
@@ -37,7 +41,11 @@ func (p *Postgres) Claim(
 		rows, err := sqltx.From(ctx, p.db).QueryContext(
 			ctx,
 			`
-			WITH claimed AS (
+			UPDATE outbox_events
+			SET
+				processing_id = $3,
+				processing_at = CURRENT_TIMESTAMP
+			WHERE id = ANY(ARRAY(
 				SELECT id
 				FROM outbox_events
 				WHERE processed_at IS NULL
@@ -48,21 +56,15 @@ func (p *Postgres) Claim(
 				ORDER BY id
 				LIMIT $2
 				FOR UPDATE SKIP LOCKED
-			)
-			UPDATE outbox_events AS o
-			SET
-				processing_id = $3,
-				processing_at = CURRENT_TIMESTAMP
-			FROM claimed
-			WHERE o.id = claimed.id
+			))
 			RETURNING
-				o.id,
-				o.name,
-				o.payload,
-				o.headers,
-				o.created_at,
-				o.message_key,
-				o.destination
+				id,
+				name,
+				payload,
+				headers,
+				created_at,
+				message_key,
+				destination
 			`,
 			claimAge(claim).Seconds(),
 			claim.Limit,
@@ -157,15 +159,17 @@ func (p *Postgres) DeleteProcessedBefore(
 	before time.Time,
 	limit int,
 ) (int64, error) {
-	// PostgreSQL doesn't support DELETE ... LIMIT directly, so select a
-	// limited batch first and delete those rows through DELETE ... USING.
+	// PostgreSQL has no DELETE … LIMIT, so the IDs of a limited batch are
+	// collected into an array first, and the delete reads them through the
+	// primary key, in generic plans too (see Claim).
 	//
 	// SKIP LOCKED also means multiple outbox instances may perform cleanup
 	// without waiting on one another.
 	result, err := sqltx.From(ctx, p.db).ExecContext(
 		ctx,
 		`
-		WITH deleted AS (
+		DELETE FROM outbox_events
+		WHERE id = ANY(ARRAY(
 			SELECT id
 			FROM outbox_events
 			WHERE processed_at IS NOT NULL
@@ -173,10 +177,7 @@ func (p *Postgres) DeleteProcessedBefore(
 			ORDER BY processed_at, id
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
-		)
-		DELETE FROM outbox_events AS o
-		USING deleted
-		WHERE o.id = deleted.id
+		))
 		`,
 		before,
 		limit,

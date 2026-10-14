@@ -109,8 +109,10 @@ func assertClaimed(t *testing.T, got []worker.Message) {
 const (
 	// Claims are stamped and expired on the database clock: the queries compare processing_at with
 	// the database's time minus the claim age, never with a time from the application.
-	pgClaim = `WITH claimed AS .+processing_at < CURRENT_TIMESTAMP - make_interval\(secs => \$1\).+` +
-		`FOR UPDATE SKIP LOCKED.+UPDATE outbox_events AS o\s+SET\s+processing_id = \$3,\s+processing_at = CURRENT_TIMESTAMP\s+.+RETURNING`
+	// The claimed IDs are collected with ARRAY(…), so that generic plans read them by primary key.
+	pgClaim = `UPDATE outbox_events\s+SET\s+processing_id = \$3,\s+processing_at = CURRENT_TIMESTAMP\s+` +
+		`WHERE id = ANY\(ARRAY\(\s+SELECT id\s+FROM outbox_events.+` +
+		`processing_at < CURRENT_TIMESTAMP - make_interval\(secs => \$1\).+FOR UPDATE SKIP LOCKED\s+\)\)\s+RETURNING`
 	mysqlClaim = `SELECT\s+id,.+FROM outbox_events.+processing_at < UTC_TIMESTAMP\(6\) - INTERVAL \? MICROSECOND.+FOR UPDATE SKIP LOCKED`
 	mysqlMark  = `UPDATE outbox_events\s+SET\s+processing_id = \?,\s+processing_at = UTC_TIMESTAMP\(6\)\s+WHERE processed_at IS NULL\s+AND id IN \(\?,\?\)`
 	release    = `UPDATE outbox_events\s+SET\s+processing_id = NULL,\s+processing_at = NULL\s+WHERE processing_id = (\$1|\?)`
@@ -306,7 +308,7 @@ func TestDeleteProcessedBefore(t *testing.T) {
 	}{
 		{
 			name:   "postgres",
-			query:  `WITH deleted AS .+processed_at IS NOT NULL.+DELETE FROM outbox_events AS o`,
+			query:  `DELETE FROM outbox_events\s+WHERE id = ANY\(ARRAY\(\s+SELECT id\s+FROM outbox_events\s+WHERE processed_at IS NOT NULL.+FOR UPDATE SKIP LOCKED\s+\)\)`,
 			cutoff: before,
 			delete: func(db *sql.DB) (int64, error) {
 				return NewPostgres(db).DeleteProcessedBefore(context.Background(), before, 100)
