@@ -19,18 +19,18 @@ var (
 	errClosed = errors.New("pubsub: broker is closed")
 )
 
-// Publisher publishes to the topic of each message. Publish returns once Pub/Sub has stored the
+// publisher publishes to the topic of each message. Publish returns once Pub/Sub has stored the
 // message. The outbox only marks a message processed after that.
 //
-// Every Publisher of a broker shares one client publisher per topic, so the publishes the worker
+// Every publisher of a broker shares one client publisher per topic, so the publishes the worker
 // runs in parallel are sent to Pub/Sub in batches.
-type Publisher struct {
+type publisher struct {
 	topics *topics
 }
 
 // Publish sends msg to the topic msg.Destination with the ordering key msg.Key, and waits until
 // Pub/Sub has stored it or ctx ends.
-func (p *Publisher) Publish(ctx context.Context, msg worker.Message) error {
+func (p *publisher) Publish(ctx context.Context, msg worker.Message) error {
 	if msg.Destination == "" {
 		return fmt.Errorf("%w: %s", errNoTopic, msg.ID)
 	}
@@ -41,7 +41,7 @@ func (p *Publisher) Publish(ctx context.Context, msg worker.Message) error {
 }
 
 // Close does nothing: the client publishers belong to the broker, which stops them on Close.
-func (p *Publisher) Close() error {
+func (p *publisher) Close() error {
 	return nil
 }
 

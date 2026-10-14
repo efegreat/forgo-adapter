@@ -15,8 +15,8 @@ import (
 // ended.
 var errReceiveStopped = errors.New("pubsub: receiving stopped before the subscriber was stopped")
 
-// Subscriber is the worker.ISubscriber of a SubscriberConfig.
-type Subscriber struct {
+// subscriber is the worker.ISubscriber of a SubscriberConfig.
+type subscriber struct {
 	conf SubscriberConfig
 	sub  *gpubsub.Subscriber
 	// deadLetter publishes the messages Reject drops. Nil acknowledges them instead.
@@ -26,7 +26,7 @@ type Subscriber struct {
 // Consume receives from the subscription and hands every message to state.Handler, with at most
 // state.Concurrency in flight. It returns once ctx ends and every handler finished, or with the
 // error that stopped receiving, such as a missing subscription or missing permissions.
-func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
+func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
 	concurrency := max(state.Concurrency, 1)
 	s.sub.ReceiveSettings.MaxOutstandingMessages = maxOutstanding(s.conf.MaxOutstandingMessages, concurrency)
 
@@ -51,7 +51,7 @@ func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 }
 
 // Close does nothing: Consume stops receiving when its context ends.
-func (s *Subscriber) Close() error {
+func (s *subscriber) Close() error {
 	return nil
 }
 

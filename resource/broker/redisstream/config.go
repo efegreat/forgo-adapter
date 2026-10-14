@@ -59,7 +59,7 @@ func (c Config) Sanitize() Config {
 }
 
 // New validates the config, connects to Redis and creates the missing consumer groups. A failure
-// closes the client. Its Resource is a *Broker.
+// closes the client.
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {

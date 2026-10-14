@@ -40,9 +40,9 @@ redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
 return 1
 `)
 
-// Subscriber is the worker.ISubscriber of a SubscriberConfig. It reads and claims as a consumer of its
+// subscriber is the worker.ISubscriber of a SubscriberConfig. It reads and claims as a consumer of its
 // own, which Close deletes from the group when it holds no pending entries.
-type Subscriber struct {
+type subscriber struct {
 	conf    SubscriberConfig
 	client  redis.UniversalClient
 	streams *streams
@@ -60,14 +60,14 @@ type Subscriber struct {
 	errorWait  time.Duration
 }
 
-func newSubscriber(client redis.UniversalClient, streams *streams, conf SubscriberConfig, consumer string) *Subscriber {
-	return &Subscriber{
+func newSubscriber(client redis.UniversalClient, streams *streams, conf SubscriberConfig, consumer string) *subscriber {
+	return &subscriber{
 		conf:       conf,
 		client:     client,
 		streams:    streams,
 		consumer:   consumer,
 		reading:    []string{conf.Stream, ">"},
-		inflight:   inflight{deliveries: make(map[*Delivery]struct{})},
+		inflight:   inflight{deliveries: make(map[*delivery]struct{})},
 		block:      readBlock,
 		claimEvery: claimInterval,
 		beat:       conf.ClaimIdle / 3,
@@ -84,7 +84,7 @@ func newSubscriber(client redis.UniversalClient, streams *streams, conf Subscrib
 // It returns once ctx ends and every handler finished, or with the error that stopped it, such as
 // a deleted group. While Redis cannot be reached or fails over, it keeps trying, with a pause of a
 // second after every failure.
-func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
+func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
 	concurrency := max(state.Concurrency, 1)
 	slots := process.NewChannelSemaphore(concurrency)
 	var handlers sync.WaitGroup
@@ -143,7 +143,7 @@ func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 // it. A consumer that still has pending entries, such as one whose acknowledgement failed, is kept,
 // because deleting it would drop its entries from the group: the other consumers claim them once
 // they were idle for ClaimIdle. Close must follow Consume.
-func (s *Subscriber) Close() error {
+func (s *subscriber) Close() error {
 	if err := delConsumerScript.Run(context.Background(), s.client, []string{s.conf.Stream}, s.conf.Group, s.consumer).Err(); err != nil {
 		return fmt.Errorf("redisstream: subscriber %s: delete consumer %s: %w", s.conf.Name, s.consumer, err)
 	}
@@ -153,7 +153,7 @@ func (s *Subscriber) Close() error {
 // claim claims up to n entries of the group that were idle for ClaimIdle, scanning the pending
 // entries from cursor. It returns the cursor of the next scan, which is claimStart once the scan
 // reached the end.
-func (s *Subscriber) claim(ctx context.Context, cursor string, n int) ([]redis.XMessage, string, error) {
+func (s *subscriber) claim(ctx context.Context, cursor string, n int) ([]redis.XMessage, string, error) {
 	entries, next, err := s.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 		Stream:   s.conf.Stream,
 		Group:    s.conf.Group,
@@ -169,7 +169,7 @@ func (s *Subscriber) claim(ctx context.Context, cursor string, n int) ([]redis.X
 }
 
 // read reads up to n new entries, waiting up to s.block for the first one.
-func (s *Subscriber) read(ctx context.Context, n int) ([]redis.XMessage, error) {
+func (s *subscriber) read(ctx context.Context, n int) ([]redis.XMessage, error) {
 	res, err := s.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    s.conf.Group,
 		Consumer: s.consumer,
@@ -191,7 +191,7 @@ func (s *Subscriber) read(ctx context.Context, n int) ([]redis.XMessage, error) 
 
 // heartbeat refreshes the entries being handled every s.beat until stop is called, which waits for
 // it.
-func (s *Subscriber) heartbeat() (stop func()) {
+func (s *subscriber) heartbeat() (stop func()) {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -216,7 +216,7 @@ func (s *Subscriber) heartbeat() (stop func()) {
 // their idle time without counting a delivery (JUSTID), so no other consumer claims them however
 // long their handlers run. A failed refresh is repeated on the next beat: an entry is only claimed
 // once it was not refreshed for ClaimIdle.
-func (s *Subscriber) refresh() {
+func (s *subscriber) refresh() {
 	ctx, cancel := context.WithTimeout(context.Background(), s.beat)
 	defer cancel()
 	s.inflight.locked(func(ids []string) {
@@ -237,11 +237,11 @@ func (s *Subscriber) refresh() {
 // before the handler that retried it returned and removed its own delivery.
 type inflight struct {
 	mu         sync.Mutex
-	deliveries map[*Delivery]struct{}
+	deliveries map[*delivery]struct{}
 	ids        []string
 }
 
-func (f *inflight) add(d *Delivery) {
+func (f *inflight) add(d *delivery) {
 	f.mu.Lock()
 	f.deliveries[d] = struct{}{}
 	f.mu.Unlock()
@@ -250,7 +250,7 @@ func (f *inflight) add(d *Delivery) {
 // remove stops refreshing the entry of d. It waits for a refresh in progress, so that a refresh
 // never claims an entry that was settled after the refresh took its ID, such as a retry handed to
 // the retry consumer.
-func (f *inflight) remove(d *Delivery) {
+func (f *inflight) remove(d *delivery) {
 	f.mu.Lock()
 	delete(f.deliveries, d)
 	f.mu.Unlock()

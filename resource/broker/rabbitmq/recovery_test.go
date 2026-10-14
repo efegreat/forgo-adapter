@@ -107,12 +107,12 @@ func TestAckGuardInvalidateWaitsForInFlightAck(t *testing.T) {
 func TestDeliveryAcknowledgements(t *testing.T) {
 	tests := []struct {
 		name   string
-		settle func(*Delivery) error
+		settle func(*delivery) error
 		want   string
 	}{
-		{name: "complete", settle: func(d *Delivery) error { return d.Complete(context.Background()) }, want: "ack 7 multiple=false"},
-		{name: "retry", settle: func(d *Delivery) error { return d.Retry(context.Background(), 1) }, want: "nack 7 multiple=false requeue=true"},
-		{name: "reject", settle: func(d *Delivery) error { return d.Reject(context.Background()) }, want: "reject 7 requeue=false"},
+		{name: "complete", settle: func(d *delivery) error { return d.Complete(context.Background()) }, want: "ack 7 multiple=false"},
+		{name: "retry", settle: func(d *delivery) error { return d.Retry(context.Background(), 1) }, want: "nack 7 multiple=false requeue=true"},
+		{name: "reject", settle: func(d *delivery) error { return d.Reject(context.Background()) }, want: "reject 7 requeue=false"},
 	}
 
 	for _, tt := range tests {
@@ -144,7 +144,7 @@ func TestRecoveryHooks(t *testing.T) {
 	sub, pub, unowned := new(amqp.Channel), new(amqp.Channel), new(amqp.Channel)
 	guard := &ackGuard{}
 	next := &recordingRecovery{}
-	b := &Broker{owned: map[*amqp.Channel]*ackGuard{sub: guard, pub: nil}}
+	b := &broker{owned: map[*amqp.Channel]*ackGuard{sub: guard, pub: nil}}
 	hooks := &recoveryHooks{broker: b, next: next}
 
 	hooks.OnChannelClose(unowned, &amqp.Error{Code: 404})
@@ -185,7 +185,7 @@ func reported(l *consumerLoss) bool {
 }
 
 func TestRecoveryReportsLostConsumer(t *testing.T) {
-	b := &Broker{consumers: make(map[string]*consumerLoss)}
+	b := &broker{consumers: make(map[string]*consumerLoss)}
 	hooks := &recoveryHooks{broker: b}
 	tag, lost := b.addConsumer("billing")
 	otherTag, other := b.addConsumer("billing")

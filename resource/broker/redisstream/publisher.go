@@ -14,14 +14,14 @@ import (
 // errNoStream is returned for a message without a Destination, which names its stream.
 var errNoStream = errors.New("redisstream: message has no Destination stream")
 
-// Publisher adds every message to the stream its Destination names. Publish returns once Redis has
+// publisher adds every message to the stream its Destination names. Publish returns once Redis has
 // added the entry. The outbox only marks a message processed after that.
-type Publisher struct {
+type publisher struct {
 	streams *streams
 }
 
 // Publish adds msg to the stream msg.Destination, which Redis creates when it does not exist.
-func (p *Publisher) Publish(ctx context.Context, msg worker.Message) error {
+func (p *publisher) Publish(ctx context.Context, msg worker.Message) error {
 	if msg.Destination == "" {
 		return fmt.Errorf("%w: %s", errNoStream, msg.ID)
 	}
@@ -32,7 +32,7 @@ func (p *Publisher) Publish(ctx context.Context, msg worker.Message) error {
 }
 
 // Close does nothing: the client belongs to the broker.
-func (p *Publisher) Close() error {
+func (p *publisher) Close() error {
 	return nil
 }
 

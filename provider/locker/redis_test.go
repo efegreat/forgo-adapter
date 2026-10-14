@@ -96,6 +96,24 @@ func TestRedisUnlockNotHeld(t *testing.T) {
 	}
 }
 
+func TestRedisRejectsTTLWithoutExpiry(t *testing.T) {
+	ctx := context.Background()
+	cl, m := newTestClient(t)
+	l := NewRedis(cl)
+
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		if ok, err := l.Lock(ctx, "job", ttl); ok || !errors.Is(err, errInvalidTTL) {
+			t.Fatalf("Lock(%v) = %v, %v; want false, errInvalidTTL", ttl, ok, err)
+		}
+		if ok, err := l.WaitLock(ctx, "job", 3, time.Millisecond, ttl); ok || !errors.Is(err, errInvalidTTL) {
+			t.Fatalf("WaitLock(%v) = %v, %v; want false, errInvalidTTL", ttl, ok, err)
+		}
+	}
+	if m.Exists("job") {
+		t.Fatal("a lock without a TTL was stored")
+	}
+}
+
 // TestRedisContext checks that Lock and Unlock run on the caller's context, so that a canceled
 // operation does not wait for Redis.
 func TestRedisContext(t *testing.T) {

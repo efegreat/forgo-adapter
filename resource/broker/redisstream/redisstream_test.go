@@ -18,10 +18,10 @@ import (
 )
 
 var (
-	_ worker.IBroker     = (*Broker)(nil)
-	_ worker.IPublisher  = (*Publisher)(nil)
-	_ worker.ISubscriber = (*Subscriber)(nil)
-	_ worker.IDelivery   = (*Delivery)(nil)
+	_ worker.IBroker     = (*broker)(nil)
+	_ worker.IPublisher  = (*publisher)(nil)
+	_ worker.ISubscriber = (*subscriber)(nil)
+	_ worker.IDelivery   = (*delivery)(nil)
 )
 
 // t0 is the clock of the miniredis servers of the tests that control idle times.
@@ -38,14 +38,14 @@ func fake(t *testing.T) (*miniredis.Miniredis, *redis.Client, Config) {
 }
 
 // open builds the broker of cfg and closes it when the test ends.
-func open(t *testing.T, cfg Config) *Broker {
+func open(t *testing.T, cfg Config) *broker {
 	t.Helper()
 	res, err := cfg.New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = res.Close() })
-	return res.(*Broker)
+	return res.(*broker)
 }
 
 // topology is a stream orders with the group billing, read by the subscriber billing.
@@ -56,14 +56,14 @@ func topology(cfg Config, sub SubscriberConfig) Config {
 	return cfg
 }
 
-// subscriber returns the subscriber name of b, timed for tests.
-func subscriber(t *testing.T, b *Broker, name string) *Subscriber {
+// openSubscriber returns the subscriber name of b, timed for tests.
+func openSubscriber(t *testing.T, b *broker, name string) *subscriber {
 	t.Helper()
 	s, err := b.NewSubscriber(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sub := s.(*Subscriber)
+	sub := s.(*subscriber)
 	sub.block, sub.claimEvery, sub.beat, sub.errorWait = 20*time.Millisecond, 10*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond
 	return sub
 }
@@ -73,7 +73,7 @@ var errConsumeHangs = errors.New("Consume did not return")
 
 // consume consumes s in the background. stop ends it and returns the error of Consume. done is
 // closed when Consume returns, also on its own.
-func consume(t *testing.T, s *Subscriber, concurrency int, handle func(context.Context, worker.IDelivery)) (stop func() error, done <-chan struct{}) {
+func consume(t *testing.T, s *subscriber, concurrency int, handle func(context.Context, worker.IDelivery)) (stop func() error, done <-chan struct{}) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	returned := make(chan struct{})
@@ -138,7 +138,7 @@ func eventually(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-func publish(t *testing.T, b *Broker, msg worker.Message) {
+func publish(t *testing.T, b *broker, msg worker.Message) {
 	t.Helper()
 	p, err := b.NewPublisher("any")
 	if err != nil {
@@ -341,11 +341,11 @@ func TestNewSubscriber(t *testing.T) {
 		t.Fatalf("NewSubscriber(shipping) = %v", err)
 	}
 
-	s := subscriber(t, b, "billing")
+	s := openSubscriber(t, b, "billing")
 	if got := consumers(t, cl); !reflect.DeepEqual(got, map[string]int64{s.consumer: 0}) {
 		t.Fatalf("consumers = %v", got)
 	}
-	if other := subscriber(t, b, "billing"); other.consumer == s.consumer {
+	if other := openSubscriber(t, b, "billing"); other.consumer == s.consumer {
 		t.Fatal("two subscribers share a consumer name")
 	}
 }
@@ -360,7 +360,7 @@ func TestPublishConsume(t *testing.T) {
 	publish(t, b, msg)
 
 	ch, handle := deliveries()
-	stop, _ := consume(t, subscriber(t, b, "billing"), 1, handle)
+	stop, _ := consume(t, openSubscriber(t, b, "billing"), 1, handle)
 	d := next(t, ch)
 	got := d.Message()
 	if got.ID != msg.ID || got.Name != msg.Name || string(got.Payload) != `{"id":1}` || got.Key != "order-1" || got.Destination != "orders" || !got.CreatedAt.Equal(msg.CreatedAt) {
@@ -524,7 +524,7 @@ func TestRetry(t *testing.T) {
 		publish(t, b, msg)
 
 		ch, handle := deliveries()
-		s := subscriber(t, b, "billing")
+		s := openSubscriber(t, b, "billing")
 		consume(t, s, 1, handle)
 		if err := next(t, ch).Retry(context.Background(), 1); err != nil {
 			t.Fatal(err)
@@ -552,7 +552,7 @@ func TestRetry(t *testing.T) {
 		publish(t, b, msg)
 
 		ch, handle := deliveries()
-		s := subscriber(t, b, "billing")
+		s := openSubscriber(t, b, "billing")
 		consume(t, s, 1, handle)
 		// Attempt 2 waits twice Initial: the entry is idle for ClaimIdle minus 20s.
 		if err := next(t, ch).Retry(context.Background(), 2); err != nil {
@@ -581,7 +581,7 @@ func TestReject(t *testing.T) {
 		publish(t, b, worker.NewMessage("order.placed", "", "orders", nil))
 
 		ch, handle := deliveries()
-		consume(t, subscriber(t, b, "billing"), 1, handle)
+		consume(t, openSubscriber(t, b, "billing"), 1, handle)
 		if err := next(t, ch).Reject(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -602,7 +602,7 @@ func TestReject(t *testing.T) {
 		}
 
 		ch, handle := deliveries()
-		consume(t, subscriber(t, b, "billing"), 1, handle)
+		consume(t, openSubscriber(t, b, "billing"), 1, handle)
 		if err := next(t, ch).Reject(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -629,7 +629,7 @@ func TestReject(t *testing.T) {
 		}
 
 		ch, handle := deliveries()
-		consume(t, subscriber(t, b, "billing"), 1, handle)
+		consume(t, openSubscriber(t, b, "billing"), 1, handle)
 		err := next(t, ch).Reject(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "redisstream: dead-letter "+msg.ID+" to orders:billing:dlq, delivering it again") {
 			t.Fatalf("Reject() = %v", err)
@@ -653,7 +653,7 @@ func TestConsumeConcurrency(t *testing.T) {
 
 	var running, peak, handled atomic.Int32
 	gate := make(chan struct{})
-	consume(t, subscriber(t, b, "billing"), 2, func(ctx context.Context, d worker.IDelivery) {
+	consume(t, openSubscriber(t, b, "billing"), 2, func(ctx context.Context, d worker.IDelivery) {
 		n := running.Add(1)
 		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
 		}
@@ -683,7 +683,7 @@ func TestConsumeWaitsForHandlers(t *testing.T) {
 
 	started, release := make(chan struct{}), make(chan struct{})
 	var completeErr error
-	stop, _ := consume(t, subscriber(t, b, "billing"), 1, func(ctx context.Context, d worker.IDelivery) {
+	stop, _ := consume(t, openSubscriber(t, b, "billing"), 1, func(ctx context.Context, d worker.IDelivery) {
 		close(started)
 		<-release
 		// The worker handles a message on a context that outlives Consume's.
@@ -722,7 +722,7 @@ func TestConsumeClaimsAbandoned(t *testing.T) {
 	}
 
 	ch, handle := deliveries()
-	s := subscriber(t, b, "billing")
+	s := openSubscriber(t, b, "billing")
 	consume(t, s, 1, handle)
 	none(t, ch)
 	m.SetTime(t0.Add(time.Minute))
@@ -741,7 +741,7 @@ func TestHeartbeat(t *testing.T) {
 	publish(t, b, worker.NewMessage("order.placed", "", "orders", nil))
 
 	started, release := make(chan struct{}), make(chan struct{})
-	consume(t, subscriber(t, b, "billing"), 1, func(ctx context.Context, d worker.IDelivery) {
+	consume(t, openSubscriber(t, b, "billing"), 1, func(ctx context.Context, d worker.IDelivery) {
 		close(started)
 		<-release
 		_ = d.Complete(ctx)
@@ -767,7 +767,7 @@ func TestConsumeErrors(t *testing.T) {
 		_, cl, cfg := fake(t)
 		b := open(t, topology(cfg, SubscriberConfig{}))
 		_, handle := deliveries()
-		stop, done := consume(t, subscriber(t, b, "billing"), 1, handle)
+		stop, done := consume(t, openSubscriber(t, b, "billing"), 1, handle)
 		time.Sleep(50 * time.Millisecond)
 		if err := cl.XGroupDestroy(context.Background(), "orders", "billing").Err(); err != nil {
 			t.Fatal(err)
@@ -786,7 +786,7 @@ func TestConsumeErrors(t *testing.T) {
 		m, _, cfg := fake(t)
 		b := open(t, topology(cfg, SubscriberConfig{}))
 		ch, handle := deliveries()
-		_, done := consume(t, subscriber(t, b, "billing"), 1, handle)
+		_, done := consume(t, openSubscriber(t, b, "billing"), 1, handle)
 		m.SetError("LOADING Redis is loading the dataset in memory")
 		time.Sleep(100 * time.Millisecond)
 		m.SetError("")
@@ -806,7 +806,7 @@ func TestConsumeErrors(t *testing.T) {
 		m, _, cfg := fake(t)
 		b := open(t, topology(cfg, SubscriberConfig{}))
 		ch, handle := deliveries()
-		consume(t, subscriber(t, b, "billing"), 1, handle)
+		consume(t, openSubscriber(t, b, "billing"), 1, handle)
 		time.Sleep(50 * time.Millisecond)
 		m.Close()
 		time.Sleep(100 * time.Millisecond)
@@ -829,7 +829,7 @@ func TestClose(t *testing.T) {
 		b := open(t, topology(cfg, SubscriberConfig{}))
 		publish(t, b, worker.NewMessage("order.placed", "", "orders", nil))
 		ch, handle := deliveries()
-		s := subscriber(t, b, "billing")
+		s := openSubscriber(t, b, "billing")
 		stop, _ := consume(t, s, 1, handle)
 		if err := next(t, ch).Complete(context.Background()); err != nil {
 			t.Fatal(err)
@@ -850,7 +850,7 @@ func TestClose(t *testing.T) {
 		b := open(t, topology(cfg, SubscriberConfig{}))
 		publish(t, b, worker.NewMessage("order.placed", "", "orders", nil))
 		ch, handle := deliveries()
-		s := subscriber(t, b, "billing")
+		s := openSubscriber(t, b, "billing")
 		stop, _ := consume(t, s, 1, handle)
 		next(t, ch) // left unsettled, like a failed acknowledgement
 		if err := stop(); err != nil {

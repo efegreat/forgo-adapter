@@ -20,6 +20,45 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The integration tests run against these services. Without their URLs they skip.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: forgo
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: forgo
+          MYSQL_DATABASE: forgo
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pforgo"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 60
+      rabbitmq:
+        image: rabbitmq:4
+        env:
+          # guest may only connect from localhost, and the tests reach the container through a port.
+          RABBITMQ_DEFAULT_USER: forgo
+          RABBITMQ_DEFAULT_PASS: forgo
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+    env:
+      ADAPTER_TEST_POSTGRES_DSN: postgres://postgres:forgo@127.0.0.1:5432/postgres?sslmode=disable
+      ADAPTER_TEST_MYSQL_DSN: root:forgo@tcp(127.0.0.1:3306)/forgo
+      ADAPTER_TEST_RABBITMQ_URL: amqp://forgo:forgo@127.0.0.1:5672/
     defaults:
       run:
         working-directory: forgo-adapter

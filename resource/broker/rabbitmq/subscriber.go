@@ -22,8 +22,8 @@ type consumeChannel interface {
 	Close() error
 }
 
-// Subscriber is the worker.ISubscriber of a SubscriberConfig. It consumes on a channel of its own.
-type Subscriber struct {
+// subscriber is the worker.ISubscriber of a SubscriberConfig. It consumes on a channel of its own.
+type subscriber struct {
 	conf SubscriberConfig
 	ch   consumeChannel
 	// tag is the consumer tag, under which the recovery reports a failed re-subscription to lost.
@@ -38,14 +38,14 @@ type Subscriber struct {
 // with at most state.Concurrency in flight. It returns once ctx ends and every handler finished,
 // or with an error once the consumer is gone: the delivery channel closed, or the recovery could
 // not re-subscribe the consumer.
-func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
+func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
 	if err := s.ch.Qos(prefetch(s.conf.Prefetch, state.Concurrency), 0, false); err != nil {
 		return fmt.Errorf("rabbitmq: subscriber %s: set prefetch: %w", s.conf.Name, err)
 	}
 	msgs, err := s.ch.Consume(
 		s.conf.Queue,
 		s.tag,
-		s.conf.AutoAck,
+		false, // the worker settles every message
 		s.conf.Exclusive,
 		s.conf.NoLocal,
 		s.conf.NoWait,
@@ -88,7 +88,7 @@ func (s *Subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 }
 
 // Close closes the subscriber's channel, and the publisher of its queue's retry queues.
-func (s *Subscriber) Close() error {
+func (s *subscriber) Close() error {
 	if s.release != nil {
 		s.release()
 	}

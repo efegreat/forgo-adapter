@@ -15,8 +15,8 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// Delivery is the worker.IDelivery of an AMQP delivery.
-type Delivery struct {
+// delivery is the worker.IDelivery of an AMQP delivery.
+type delivery struct {
 	delivery amqp.Delivery
 	msg      worker.Message
 	// guard and gen drop acknowledgements once the channel that delivered the message was lost.
@@ -26,50 +26,45 @@ type Delivery struct {
 	retry *retrier
 }
 
-// NewDelivery wraps an AMQP delivery. Header values that are not strings are converted by
-// headerValue. Messages published without the identity headers, for example by another producer,
-// take their ID from the message_id property and their name from the type property.
-func NewDelivery(delivery amqp.Delivery) *Delivery {
+// newDelivery wraps raw, an AMQP delivery of a subscriber channel that guard protects against
+// recovery, and whose queue has the retry queues of retry, if any. Header values that are not
+// strings are converted by headerValue. Messages published without the identity headers, for
+// example by another producer, take their ID from the message_id property and their name from the
+// type property.
+func newDelivery(raw amqp.Delivery, guard *ackGuard, retry *retrier) *delivery {
 	headers := types.NewJSONMap[string]()
-	for k, v := range delivery.Headers {
+	for k, v := range raw.Headers {
 		headers.Set(k, headerValue(v))
 	}
-	if _, ok := headers.Get(worker.MessageIDHeader); !ok && delivery.MessageId != "" {
-		headers.Set(worker.MessageIDHeader, delivery.MessageId)
+	if _, ok := headers.Get(worker.MessageIDHeader); !ok && raw.MessageId != "" {
+		headers.Set(worker.MessageIDHeader, raw.MessageId)
 	}
-	if _, ok := headers.Get(worker.MessageNameHeader); !ok && delivery.Type != "" {
-		headers.Set(worker.MessageNameHeader, delivery.Type)
+	if _, ok := headers.Get(worker.MessageNameHeader); !ok && raw.Type != "" {
+		headers.Set(worker.MessageNameHeader, raw.Type)
 	}
 
-	return &Delivery{
-		delivery: delivery,
-		msg:      worker.NewMessageFromDelivery(delivery.RoutingKey, delivery.Exchange, delivery.Body, headers),
+	return &delivery{
+		delivery: raw,
+		msg:      worker.NewMessageFromDelivery(raw.RoutingKey, raw.Exchange, raw.Body, headers),
+		guard:    guard,
+		gen:      guard.generation(),
+		retry:    retry,
 	}
-}
-
-// newDelivery is NewDelivery for a subscriber channel guarded against recovery, whose queue has the
-// retry queues of retry, if any.
-func newDelivery(delivery amqp.Delivery, guard *ackGuard, retry *retrier) *Delivery {
-	d := NewDelivery(delivery)
-	d.guard = guard
-	d.gen = guard.generation()
-	d.retry = retry
-	return d
 }
 
 // Message returns the message, with the identity its headers carry.
-func (d *Delivery) Message() worker.Message {
+func (d *delivery) Message() worker.Message {
 	return d.msg
 }
 
 // Complete acknowledges the message.
-func (d *Delivery) Complete(context.Context) error {
+func (d *delivery) Complete(context.Context) error {
 	return d.settle(func() error { return d.delivery.Ack(false) })
 }
 
 // Retry redelivers the message after the delay of the retry queue for attempt when its queue has
 // Retry, and at once otherwise.
-func (d *Delivery) Retry(ctx context.Context, attempt int) error {
+func (d *delivery) Retry(ctx context.Context, attempt int) error {
 	if d.retry == nil {
 		return d.requeue()
 	}
@@ -77,25 +72,22 @@ func (d *Delivery) Retry(ctx context.Context, attempt int) error {
 }
 
 // requeue returns the message to its queue, which redelivers it at once.
-func (d *Delivery) requeue() error {
+func (d *delivery) requeue() error {
 	return d.settle(func() error { return d.delivery.Nack(false, true) })
 }
 
 // Reject discards the message, or dead-letters it when its queue has DeadLetter enabled.
-func (d *Delivery) Reject(context.Context) error {
+func (d *delivery) Reject(context.Context) error {
 	return d.settle(func() error { return d.delivery.Reject(false) })
 }
 
 // stale reports whether the channel that delivered the message was lost since it arrived.
-func (d *Delivery) stale() bool {
-	return d.guard != nil && d.guard.generation() != d.gen
+func (d *delivery) stale() bool {
+	return d.guard.generation() != d.gen
 }
 
 // settle sends an acknowledgement unless the delivery's channel was lost since it arrived.
-func (d *Delivery) settle(ack func() error) error {
-	if d.guard == nil {
-		return ack()
-	}
+func (d *delivery) settle(ack func() error) error {
 	return d.guard.settle(d.gen, ack)
 }
 

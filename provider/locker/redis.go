@@ -16,6 +16,10 @@ import (
 // elapsed before the operation finished, and another process may have acquired it since.
 var ErrNotHeld = errors.New("locker: lock is not held")
 
+// errInvalidTTL is returned for a lock without a positive TTL. SET NX without an expiry would hold
+// the key until someone deletes it, even after the process holding it crashed.
+var errInvalidTTL = errors.New("locker: ttl must be positive")
+
 // unlockScript deletes the lock only while it still holds this process's token, so a lock that
 // expired and was acquired by another process is never released by this one.
 var unlockScript = redis.NewScript(`
@@ -40,8 +44,12 @@ func NewRedis(cl redis.UniversalClient) *Redis {
 	return &Redis{cl: cl, token: rand.Text()}
 }
 
-// Lock tries once to acquire key for ttl and reports whether it was acquired.
+// Lock tries once to acquire key for ttl and reports whether it was acquired. A ttl that is not
+// positive is an error.
 func (r *Redis) Lock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, fmt.Errorf("locker: lock %s for %s: %w", key, ttl, errInvalidTTL)
+	}
 	ok, err := r.cl.SetNX(ctx, key, r.token, ttl).Result()
 	if err != nil {
 		return false, fmt.Errorf("locker: lock %s: %w", key, err)

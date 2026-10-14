@@ -55,7 +55,7 @@ func TestPrefetch(t *testing.T) {
 func TestSubscriberConsume(t *testing.T) {
 	ch := &fakeConsumeChannel{msgs: make(chan amqp.Delivery, 3)}
 	guard := &ackGuard{}
-	s := &Subscriber{conf: SubscriberConfig{Name: "billing", Queue: "billing"}, ch: ch, guard: guard, lost: newConsumerLoss()}
+	s := &subscriber{conf: SubscriberConfig{Name: "billing", Queue: "billing"}, ch: ch, guard: guard, lost: newConsumerLoss()}
 
 	ack := &fakeAcknowledger{}
 	var (
@@ -114,7 +114,7 @@ func TestSubscriberConsumeErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := &Subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: tt.ch, guard: &ackGuard{}, lost: newConsumerLoss()}
+			s := &subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: tt.ch, guard: &ackGuard{}, lost: newConsumerLoss()}
 			err := s.Consume(context.Background(), worker.ConsumerState{Concurrency: 1, Handler: func(context.Context, worker.IDelivery) {}})
 			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
 				t.Fatalf("Consume = %v, want %v", err, tt.wantErr)
@@ -129,7 +129,7 @@ func TestSubscriberConsumeErrors(t *testing.T) {
 func TestSubscriberDropsAcksAcrossRecovery(t *testing.T) {
 	ch := &fakeConsumeChannel{msgs: make(chan amqp.Delivery, 1)}
 	guard := &ackGuard{}
-	s := &Subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: ch, guard: guard, lost: newConsumerLoss()}
+	s := &subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: ch, guard: guard, lost: newConsumerLoss()}
 
 	ack := &fakeAcknowledger{}
 	received := make(chan worker.IDelivery, 1)
@@ -161,7 +161,7 @@ func TestSubscriberStopsWhenConsumerLost(t *testing.T) {
 	// The delivery channel stays open: the recovery reopened the channel without the consumer.
 	ch := &fakeConsumeChannel{msgs: make(chan amqp.Delivery)}
 	lost := newConsumerLoss()
-	s := &Subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: ch, tag: "forgo-s-1", guard: &ackGuard{}, lost: lost}
+	s := &subscriber{conf: SubscriberConfig{Name: "s", Queue: "q"}, ch: ch, tag: "forgo-s-1", guard: &ackGuard{}, lost: lost}
 
 	done := make(chan error, 1)
 	go func() {
@@ -230,7 +230,7 @@ func TestPublisherAwait(t *testing.T) {
 			if tt.closed {
 				close(returns)
 			}
-			p := &Publisher{returns: returns}
+			p := &publisher{returns: returns}
 
 			err := p.await(context.Background(), tt.conf, "id")
 			if tt.wantErr == nil && err != nil {
@@ -247,7 +247,7 @@ func TestPublisherAwait(t *testing.T) {
 }
 
 func TestPublisherWithoutMandatoryIgnoresReturns(t *testing.T) {
-	p := &Publisher{} // nil returns: never mandatory
+	p := &publisher{} // nil returns: never mandatory
 	if err := p.await(context.Background(), settledConfirmation{ack: true}, "id"); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestPublisherDropsStaleReturns(t *testing.T) {
 	returns := make(chan amqp.Return, returnBuffer)
 	returns <- amqp.Return{MessageId: "timed-out"}
 	returns <- amqp.Return{MessageId: "timed-out-too"}
-	p := &Publisher{returns: returns}
+	p := &publisher{returns: returns}
 
 	p.dropReturns()
 	if len(returns) != 0 {
@@ -287,7 +287,7 @@ func (c *recordingPublishChannel) Close() error { return nil }
 
 func TestPublisherPublish(t *testing.T) {
 	ch := &recordingPublishChannel{}
-	p := &Publisher{conf: PublisherConfig{Mandatory: true, DeliveryMode: amqp.Persistent}, ch: ch}
+	p := &publisher{conf: PublisherConfig{Mandatory: true, DeliveryMode: amqp.Persistent}, ch: ch}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()

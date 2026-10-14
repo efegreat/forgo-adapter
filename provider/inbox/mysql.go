@@ -12,7 +12,9 @@ import (
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
-// MySQL is a worker.InboxStorage on the inbox_events table of a MySQL 8 database.
+// MySQL is a worker.InboxStorage on the inbox_events table of a MySQL 8 database. It stamps rows
+// with UTC_TIMESTAMP(6) and ages them on the database clock, so that neither the session time zone,
+// its daylight saving changes nor the driver's loc moves the cleanup cutoff.
 type MySQL struct {
 	db *sql.DB
 }
@@ -102,7 +104,7 @@ func (m *MySQL) IncrementAttempt(
 					created_at,
 					updated_at
 				)
-				VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))
+				VALUES (?, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
 				`,
 				messageID,
 				subscriberName,
@@ -133,7 +135,7 @@ func (m *MySQL) IncrementAttempt(
 				UPDATE inbox_events
 				SET
 					attempts = ?,
-					updated_at = CURRENT_TIMESTAMP(6)
+					updated_at = UTC_TIMESTAMP(6)
 				WHERE message_id = ?
 				  AND subscriber_name = ?
 				`,
@@ -216,7 +218,7 @@ func (m *MySQL) markStatus(
 		UPDATE inbox_events
 		SET
 			status = ?,
-			updated_at = CURRENT_TIMESTAMP(6)
+			updated_at = UTC_TIMESTAMP(6)
 		WHERE message_id = ?
 		  AND subscriber_name = ?
 		  AND status = ?
@@ -260,7 +262,8 @@ func (m *MySQL) markStatus(
 }
 
 // DeleteBefore deletes up to limit completed and rejected messages last updated before before, and
-// returns how many it deleted.
+// returns how many it deleted. before is turned into an age, which the database compares with its
+// own clock.
 func (m *MySQL) DeleteBefore(
 	ctx context.Context,
 	before time.Time,
@@ -271,13 +274,13 @@ func (m *MySQL) DeleteBefore(
 		`
 		DELETE FROM inbox_events
 		WHERE status IN (?, ?)
-		  AND updated_at < ?
+		  AND updated_at < UTC_TIMESTAMP(6) - INTERVAL ? MICROSECOND
 		ORDER BY updated_at
 		LIMIT ?
 		`,
 		worker.InboxCompleted,
 		worker.InboxRejected,
-		before,
+		time.Since(before).Microseconds(),
 		limit,
 	)
 	if err != nil {

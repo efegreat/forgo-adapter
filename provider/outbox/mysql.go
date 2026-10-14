@@ -13,7 +13,9 @@ import (
 )
 
 // MySQL is a worker.OutboxStorage on the outbox_events table of a MySQL 8 database.
-// Statements join the transaction a sqltx.Transactor put in the context.
+// Statements join the transaction a sqltx.Transactor put in the context. It stamps rows with
+// UTC_TIMESTAMP(6) and ages them on the database clock, so that neither the session time zone nor
+// the driver's loc moves a claim or the cleanup.
 type MySQL struct {
 	db *sql.DB
 }
@@ -117,13 +119,9 @@ func (m *MySQL) Complete(
 		tx := sqltx.From(ctx, m.db)
 
 		if len(successfulIDs) > 0 {
-			args := make([]any, 0, len(successfulIDs)+2)
+			args := make([]any, 0, len(successfulIDs)+1)
 
-			args = append(
-				args,
-				time.Now().UTC(),
-				claimID,
-			)
+			args = append(args, claimID)
 
 			for _, id := range successfulIDs {
 				args = append(args, id)
@@ -134,7 +132,7 @@ func (m *MySQL) Complete(
 				`
 				UPDATE outbox_events
 				SET
-					processed_at = ?,
+					processed_at = UTC_TIMESTAMP(6),
 					processing_id = NULL,
 					processing_at = NULL
 				WHERE processing_id = ?
@@ -178,7 +176,7 @@ func (m *MySQL) Complete(
 }
 
 // DeleteProcessedBefore deletes up to limit messages processed before before, and returns how many
-// it deleted.
+// it deleted. before is turned into an age, which the database compares with its own clock.
 func (m *MySQL) DeleteProcessedBefore(
 	ctx context.Context,
 	before time.Time,
@@ -189,11 +187,11 @@ func (m *MySQL) DeleteProcessedBefore(
 		`
 		DELETE FROM outbox_events
 		WHERE processed_at IS NOT NULL
-		  AND processed_at < ?
+		  AND processed_at < UTC_TIMESTAMP(6) - INTERVAL ? MICROSECOND
 		ORDER BY processed_at, id
 		LIMIT ?
 		`,
-		before,
+		time.Since(before).Microseconds(),
 		limit,
 	)
 	if err != nil {

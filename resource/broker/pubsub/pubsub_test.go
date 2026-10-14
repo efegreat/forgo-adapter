@@ -25,10 +25,10 @@ import (
 )
 
 var (
-	_ worker.IBroker     = (*Broker)(nil)
-	_ worker.IPublisher  = (*Publisher)(nil)
-	_ worker.ISubscriber = (*Subscriber)(nil)
-	_ worker.IDelivery   = (*Delivery)(nil)
+	_ worker.IBroker     = (*broker)(nil)
+	_ worker.IPublisher  = (*publisher)(nil)
+	_ worker.ISubscriber = (*subscriber)(nil)
+	_ worker.IDelivery   = (*delivery)(nil)
 )
 
 const project = "proj"
@@ -49,14 +49,14 @@ func fake(t *testing.T, opts ...pstest.ServerReactorOption) (*pstest.Server, Con
 }
 
 // open builds the broker of cfg and closes it when the test ends.
-func open(t *testing.T, cfg Config) *Broker {
+func open(t *testing.T, cfg Config) *broker {
 	t.Helper()
 	res, err := cfg.New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = res.Close() })
-	return res.(*Broker)
+	return res.(*broker)
 }
 
 // topology is a topic orders with the subscription billing.
@@ -73,7 +73,7 @@ var errConsumeHangs = errors.New("Consume did not return")
 
 // consume consumes the subscriber name of b in the background. stop ends it and returns the
 // error of Consume.
-func consume(t *testing.T, b *Broker, name string, concurrency int, handle func(context.Context, worker.IDelivery)) (stop func() error) {
+func consume(t *testing.T, b *broker, name string, concurrency int, handle func(context.Context, worker.IDelivery)) (stop func() error) {
 	t.Helper()
 	s, err := b.NewSubscriber(name)
 	if err != nil {
@@ -159,7 +159,7 @@ func acks(srv *pstest.Server, id string) int {
 	return 0
 }
 
-func publish(t *testing.T, b *Broker, msg worker.Message) {
+func publish(t *testing.T, b *broker, msg worker.Message) {
 	t.Helper()
 	p, err := b.NewPublisher("any")
 	if err != nil {
@@ -611,7 +611,7 @@ func TestConsumeConcurrency(t *testing.T) {
 
 	eventually(t, "two handlers", func() bool { return running.Load() == 2 })
 	// Set before receiving started, which happened before the handlers ran.
-	if got := s.(*Subscriber).sub.ReceiveSettings.MaxOutstandingMessages; got != 10 {
+	if got := s.(*subscriber).sub.ReceiveSettings.MaxOutstandingMessages; got != 10 {
 		t.Fatalf("MaxOutstandingMessages = %d, want 10", got)
 	}
 	time.Sleep(100 * time.Millisecond) // give a third handler the chance to start
@@ -677,7 +677,7 @@ func TestConsumeMissingSubscription(t *testing.T) {
 	}
 }
 
-func TestNewDelivery(t *testing.T) {
+func TestDeliveryMessage(t *testing.T) {
 	published := time.Unix(1700000000, 123)
 	m := &gpubsub.Message{
 		ID:          "server-id",
@@ -687,7 +687,7 @@ func TestNewDelivery(t *testing.T) {
 		OrderingKey: "order-1",
 	}
 
-	got := NewDelivery(m).Message()
+	got := newDelivery(m, nil).Message()
 
 	if got.ID != "server-id" || got.Name != "unknown" || !got.CreatedAt.Equal(published) || got.Key != "order-1" || got.Destination != "" {
 		t.Fatalf("message = %+v", got)
@@ -696,12 +696,12 @@ func TestNewDelivery(t *testing.T) {
 		t.Fatalf("tenant header = %q", tenant)
 	}
 	if len(m.Attributes) != 1 {
-		t.Fatalf("NewDelivery modified the attributes: %v", m.Attributes)
+		t.Fatalf("newDelivery modified the attributes: %v", m.Attributes)
 	}
 
 	// The identity attributes win over the fallbacks.
 	m.Attributes = map[string]string{worker.MessageIDHeader: "id", worker.MessageNameHeader: "order.placed", worker.MessageTimestampHeader: "5"}
-	got = NewDelivery(m).Message()
+	got = newDelivery(m, nil).Message()
 	if got.ID != "id" || got.Name != "order.placed" || got.CreatedAt.UnixNano() != 5 {
 		t.Fatalf("message = %+v", got)
 	}
@@ -734,7 +734,7 @@ func TestMessage(t *testing.T) {
 func TestDeadLetterMessage(t *testing.T) {
 	m := &gpubsub.Message{ID: "server-id", Data: []byte("{}"), Attributes: map[string]string{"tenant": "acme"}, OrderingKey: "order-1"}
 
-	got := deadLetterMessage(NewDelivery(m))
+	got := deadLetterMessage(newDelivery(m, nil))
 
 	want := map[string]string{"tenant": "acme", worker.MessageIDHeader: "server-id"}
 	if !reflect.DeepEqual(got.Attributes, want) || got.OrderingKey != "order-1" || string(got.Data) != "{}" {

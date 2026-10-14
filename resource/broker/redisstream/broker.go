@@ -13,8 +13,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Broker is the resource New returns and its worker.IBroker Value. It owns its Redis client.
-type Broker struct {
+// broker is the resource New returns and its worker.IBroker Value. It owns its Redis client.
+type broker struct {
 	name string
 	// conn is the redisdb resource of the client, which closes it.
 	conn        forgo.Resource
@@ -23,7 +23,7 @@ type Broker struct {
 	subscribers map[string]SubscriberConfig
 }
 
-func newBroker(cfg Config) (_ *Broker, err error) {
+func newBroker(cfg Config) (_ *broker, err error) {
 	conn, err := cfg.Redis.New()
 	if err != nil {
 		return nil, fmt.Errorf("redisstream: %w", err)
@@ -39,7 +39,7 @@ func newBroker(cfg Config) (_ *Broker, err error) {
 		return nil, err
 	}
 
-	b := &Broker{
+	b := &broker{
 		name:        cfg.Name,
 		conn:        conn,
 		client:      client,
@@ -53,25 +53,25 @@ func newBroker(cfg Config) (_ *Broker, err error) {
 }
 
 // Name returns Config.Name.
-func (b *Broker) Name() string {
+func (b *broker) Name() string {
 	return b.name
 }
 
 // NewDefaultPublisher returns a publisher. Redis Streams publishers have no settings of their own.
-func (b *Broker) NewDefaultPublisher() (worker.IPublisher, error) {
-	return &Publisher{streams: b.streams}, nil
+func (b *broker) NewDefaultPublisher() (worker.IPublisher, error) {
+	return &publisher{streams: b.streams}, nil
 }
 
 // NewPublisher returns a publisher for any name. Redis Streams publishers have no settings of their
 // own.
-func (b *Broker) NewPublisher(string) (worker.IPublisher, error) {
-	return &Publisher{streams: b.streams}, nil
+func (b *broker) NewPublisher(string) (worker.IPublisher, error) {
+	return &publisher{streams: b.streams}, nil
 }
 
 // NewSubscriber returns the subscriber name, which reads as a consumer of its own. Creating the
 // consumer checks that the stream and the group exist, so a missing one fails the server at
 // startup.
-func (b *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
+func (b *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	conf, ok := b.subscribers[name]
 	if !ok {
 		return nil, fmt.Errorf("redisstream: subscriber config not found for name: %s", name)
@@ -84,12 +84,12 @@ func (b *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 }
 
 // Value returns the broker as a worker.IBroker.
-func (b *Broker) Value() any {
+func (b *broker) Value() any {
 	return worker.IBroker(b)
 }
 
 // Close closes the client.
-func (b *Broker) Close() error {
+func (b *broker) Close() error {
 	return b.conn.Close()
 }
 

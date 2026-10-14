@@ -34,10 +34,10 @@ type confirmation interface {
 	WaitContext(ctx context.Context) (bool, error)
 }
 
-// Publisher publishes on a channel in confirm mode. Publish returns once the broker has taken
+// publisher publishes on a channel in confirm mode. Publish returns once the broker has taken
 // responsibility for the message: written it to disk for a persistent message on a durable queue,
 // or routed it. The outbox only marks a message processed after that.
-type Publisher struct {
+type publisher struct {
 	conf PublisherConfig
 	ch   publishChannel
 	// returns receives unroutable mandatory messages. It is nil unless conf.Mandatory is set.
@@ -50,12 +50,12 @@ type Publisher struct {
 
 // Publish sends msg to the exchange msg.Destination with the routing key msg.Key and waits for
 // the broker's confirm until ctx ends.
-func (p *Publisher) Publish(ctx context.Context, msg worker.Message) error {
+func (p *publisher) Publish(ctx context.Context, msg worker.Message) error {
 	return p.publish(ctx, msg.Destination, msg.Key, publishing(msg, p.conf.DeliveryMode), msg.ID)
 }
 
 // publish sends msg, whose message ID is id, and waits for the broker's confirm until ctx ends.
-func (p *Publisher) publish(ctx context.Context, exchange, key string, msg amqp.Publishing, id string) error {
+func (p *publisher) publish(ctx context.Context, exchange, key string, msg amqp.Publishing, id string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -71,7 +71,7 @@ func (p *Publisher) publish(ctx context.Context, exchange, key string, msg amqp.
 }
 
 // await waits for the confirm of the message with the given ID.
-func (p *Publisher) await(ctx context.Context, c confirmation, id string) error {
+func (p *publisher) await(ctx context.Context, c confirmation, id string) error {
 	acked, err := c.WaitContext(ctx)
 	if err != nil {
 		return fmt.Errorf("rabbitmq: wait for the confirm of %s: %w", id, err)
@@ -99,7 +99,7 @@ func (p *Publisher) await(ctx context.Context, c confirmation, id string) error 
 }
 
 // dropReturns discards returns of earlier publishes that stopped waiting before their confirm.
-func (p *Publisher) dropReturns() {
+func (p *publisher) dropReturns() {
 	for {
 		select {
 		case _, ok := <-p.returns:
@@ -113,7 +113,7 @@ func (p *Publisher) dropReturns() {
 }
 
 // Close closes the publisher's channel.
-func (p *Publisher) Close() error {
+func (p *publisher) Close() error {
 	if p.release != nil {
 		p.release()
 	}
