@@ -38,9 +38,10 @@ func TestIntegrationBroker(t *testing.T) {
 		Username:  uri.Username,
 		Password:  uri.Password,
 		VHost:     uri.Vhost,
-		Exchanges: []ExchangeConfig{{Name: name, Kind: amqp.ExchangeTopic}},
+		Exchanges: []ExchangeConfig{{Name: name, Kind: amqp.ExchangeTopic, Durable: true}},
 		Queues: []QueueConfig{{
 			Name:       name,
+			Durable:    true, // RabbitMQ 4 refuses transient queues that are not exclusive
 			Bindings:   []BindingConfig{{Exchange: name, RoutingKey: "order.*"}},
 			DeadLetter: DeadLetterConfig{Enabled: true},
 			Retry:      retry,

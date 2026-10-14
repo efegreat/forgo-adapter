@@ -211,7 +211,7 @@ var Broker = rabbitmq.Config{
 | `VHost` | `/` | Virtual host. |
 | `Recovery` | enabled, unlimited retries every 5s | Automatic reconnection, see [Recovery](#recovery). |
 | `Exchanges` | | Exchanges to declare: `Name`, `Kind`, `Durable`, `AutoDelete`, `Internal`, `NoWait`, `Args`. |
-| `Queues` | | Queues to declare: `Name`, `Durable`, `AutoDelete`, `Exclusive`, `NoWait`, `Args`, `Bindings`, `DeadLetter` and `Retry`. |
+| `Queues` | | Queues to declare: `Name`, `Durable`, `AutoDelete`, `Exclusive`, `NoWait`, `Args`, `Bindings`, `DeadLetter` and `Retry`. Set `Durable` unless the queue is `Exclusive`: RabbitMQ 4 refuses other transient queues by default. |
 | `Publishers` | | Named publishers, see below. |
 | `Subscribers` | | Named subscribers, see below. |
 

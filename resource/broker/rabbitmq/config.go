@@ -187,7 +187,8 @@ type ExchangeConfig struct {
 }
 
 // QueueConfig declares a queue and its bindings. Name, Durable, AutoDelete, Exclusive, NoWait and Args
-// are the arguments of the AMQP queue.declare method.
+// are the arguments of the AMQP queue.declare method. Set Durable unless the queue is Exclusive:
+// RabbitMQ 4 refuses other transient queues by default (the deprecated transient_nonexcl_queues).
 type QueueConfig struct {
 	Name       string
 	Durable    bool
