@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -90,8 +91,9 @@ func TestIntegrationTransitions(t *testing.T) {
 }
 
 // TestIntegrationConcurrentFirstAttempts runs the first attempts of new messages at once, as
-// consumers handling new messages concurrently do. Their UUIDv7 IDs put their rows next to each
-// other: under MySQL's REPEATABLE READ, the transactions of IncrementAttempt deadlock on them.
+// consumers handling new messages concurrently do. Their UUIDv7 IDs put their rows in the same gap
+// of the primary key, where transactions that read a missing row FOR UPDATE and then insert it
+// deadlock under MySQL's REPEATABLE READ.
 func TestIntegrationConcurrentFirstAttempts(t *testing.T) {
 	for _, d := range sqltest.Dialects {
 		t.Run(d.Name, func(t *testing.T) {
@@ -117,6 +119,54 @@ func TestIntegrationConcurrentFirstAttempts(t *testing.T) {
 			wg.Wait()
 			if n := failed.Load(); n > 0 {
 				t.Fatalf("%d of %d first attempts failed", n, workers*perWorker)
+			}
+		})
+	}
+}
+
+// TestIntegrationConcurrentDuplicateAttempts runs deliveries of the same new message at once, as a
+// redelivery racing the first delivery does. Every attempt counts once: the deliveries of a message
+// get the counts 1 to n between them.
+func TestIntegrationConcurrentDuplicateAttempts(t *testing.T) {
+	for _, d := range sqltest.Dialects {
+		t.Run(d.Name, func(t *testing.T) {
+			db := d.Open(t)
+			d.Reset(t, db, "inbox_events")
+			s := storage(d, db)
+
+			const deliveries, messages = 8, 25
+			want := make([]int, deliveries)
+			for i := range want {
+				want[i] = i + 1
+			}
+			for range messages {
+				id := worker.NewMessage("n", "", "", nil).ID
+				start := make(chan struct{})
+				counts := make(chan int, deliveries)
+				var wg sync.WaitGroup
+				for range deliveries {
+					wg.Go(func() {
+						<-start
+						got, err := s.IncrementAttempt(context.Background(), id, sub)
+						if err != nil {
+							t.Errorf("IncrementAttempt: %v", err)
+						}
+						counts <- got
+					})
+				}
+				close(start)
+				wg.Wait()
+				close(counts)
+				got := slices.Sorted(func(yield func(int) bool) {
+					for c := range counts {
+						if !yield(c) {
+							return
+						}
+					}
+				})
+				if !slices.Equal(got, want) {
+					t.Fatalf("deliveries of one message got the counts %v, want %v", got, want)
+				}
 			}
 		})
 	}

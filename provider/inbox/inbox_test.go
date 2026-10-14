@@ -291,26 +291,29 @@ func TestPostgresIncrementAttempt(t *testing.T) {
 
 func TestMySQLIncrementAttempt(t *testing.T) {
 	const (
-		lockRow = `SELECT\s+status,\s+attempts\s+FROM inbox_events\s+WHERE message_id = \?\s+AND subscriber_name = \?\s+FOR UPDATE`
-		insert  = `INSERT INTO inbox_events.+VALUES \(\?, \?, \?, \?, UTC_TIMESTAMP\(6\), UTC_TIMESTAMP\(6\)\)`
-		update  = `UPDATE inbox_events\s+SET\s+attempts = \?,\s+updated_at = UTC_TIMESTAMP\(6\)`
+		upsert = `INSERT INTO inbox_events.+VALUES \(\?, \?, \?, 1, UTC_TIMESTAMP\(6\), UTC_TIMESTAMP\(6\)\)\s+` +
+			`ON DUPLICATE KEY UPDATE\s+attempts = IF\(status = \?, attempts \+ 1, attempts\),\s+` +
+			`updated_at = IF\(status = \?, UTC_TIMESTAMP\(6\), updated_at\)`
+		read = `SELECT\s+status,\s+attempts\s+FROM inbox_events\s+WHERE message_id = \?\s+AND subscriber_name = \?`
 	)
 	attemptRows := func(status worker.InboxStatus, attempts int) *sqlmock.Rows {
 		return sqlmock.NewRows([]string{"status", "attempts"}).AddRow(status, attempts)
 	}
+	waiting := worker.InboxWaiting
 
 	tests := []struct {
 		name    string
 		expect  func(sqlmock.Sqlmock)
 		want    int
-		wantErr error
+		wantErr string
+		wantIs  error
 	}{
 		{
 			name: "first attempt",
 			expect: func(m sqlmock.Sqlmock) {
 				m.ExpectBegin()
-				m.ExpectQuery(lockRow).WithArgs(msgID, sub).WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}))
-				m.ExpectExec(insert).WithArgs(msgID, sub, worker.InboxWaiting, 1).WillReturnResult(sqlmock.NewResult(0, 1))
+				m.ExpectExec(upsert).WithArgs(msgID, sub, waiting, waiting, waiting).WillReturnResult(sqlmock.NewResult(0, 1))
+				m.ExpectQuery(read).WithArgs(msgID, sub).WillReturnRows(attemptRows(waiting, 1))
 				m.ExpectCommit()
 			},
 			want: 1,
@@ -319,8 +322,8 @@ func TestMySQLIncrementAttempt(t *testing.T) {
 			name: "next attempt",
 			expect: func(m sqlmock.Sqlmock) {
 				m.ExpectBegin()
-				m.ExpectQuery(lockRow).WillReturnRows(attemptRows(worker.InboxWaiting, 2))
-				m.ExpectExec(update).WithArgs(3, msgID, sub).WillReturnResult(sqlmock.NewResult(0, 1))
+				m.ExpectExec(upsert).WillReturnResult(sqlmock.NewResult(0, 2))
+				m.ExpectQuery(read).WillReturnRows(attemptRows(waiting, 3))
 				m.ExpectCommit()
 			},
 			want: 3,
@@ -329,10 +332,31 @@ func TestMySQLIncrementAttempt(t *testing.T) {
 			name: "not waiting",
 			expect: func(m sqlmock.Sqlmock) {
 				m.ExpectBegin()
-				m.ExpectQuery(lockRow).WillReturnRows(attemptRows(worker.InboxCompleted, 1))
+				m.ExpectExec(upsert).WillReturnResult(sqlmock.NewResult(0, 0))
+				m.ExpectQuery(read).WillReturnRows(attemptRows(worker.InboxCompleted, 1))
 				m.ExpectRollback()
 			},
-			wantErr: ErrNotWaiting,
+			wantErr: ErrNotWaiting.Error(),
+			wantIs:  ErrNotWaiting,
+		},
+		{
+			name: "upsert error",
+			expect: func(m sqlmock.Sqlmock) {
+				m.ExpectBegin()
+				m.ExpectExec(upsert).WillReturnError(errors.New("lock wait timeout"))
+				m.ExpectRollback()
+			},
+			wantErr: "inbox: increment attempt: lock wait timeout",
+		},
+		{
+			name: "read error",
+			expect: func(m sqlmock.Sqlmock) {
+				m.ExpectBegin()
+				m.ExpectExec(upsert).WillReturnResult(sqlmock.NewResult(0, 1))
+				m.ExpectQuery(read).WillReturnError(errors.New("connection reset"))
+				m.ExpectRollback()
+			},
+			wantErr: "inbox: read attempt: connection reset",
 		},
 	}
 
@@ -342,8 +366,17 @@ func TestMySQLIncrementAttempt(t *testing.T) {
 			tt.expect(mock)
 
 			got, err := NewMySQL(db).IncrementAttempt(context.Background(), msgID, sub)
-			if !errors.Is(err, tt.wantErr) || (tt.wantErr == nil && err != nil) || got != tt.want {
-				t.Fatalf("IncrementAttempt = %d, %v; want %d, %v", got, err, tt.want, tt.wantErr)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) || got != 0 {
+					t.Fatalf("IncrementAttempt = %d, %v; want 0, %q", got, err, tt.wantErr)
+				}
+				if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+					t.Fatalf("IncrementAttempt err = %v, want %v", err, tt.wantIs)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("IncrementAttempt = %d, %v; want %d", got, err, tt.want)
 			}
 		})
 	}
@@ -352,8 +385,9 @@ func TestMySQLIncrementAttempt(t *testing.T) {
 func TestMySQLIncrementAttemptJoinsTransaction(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT\s+status,\s+attempts`).WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}))
 	mock.ExpectExec(`INSERT INTO inbox_events`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT\s+status,\s+attempts`).WillReturnRows(
+		sqlmock.NewRows([]string{"status", "attempts"}).AddRow(worker.InboxWaiting, 1))
 	mock.ExpectCommit()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
