@@ -76,7 +76,7 @@ func (c Config) Sanitize() Config {
 }
 
 // New validates the config, creates the client, and creates or checks the topics and subscriptions
-// within DeclareTimeout. A failure closes the client. Its Resource is a *Broker.
+// within DeclareTimeout. A failure closes the client.
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {

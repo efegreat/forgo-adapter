@@ -13,18 +13,19 @@ import (
 	gpubsub "cloud.google.com/go/pubsub/v2"
 )
 
-// Delivery is the worker.IDelivery of a Pub/Sub message.
-type Delivery struct {
+// delivery is the worker.IDelivery of a Pub/Sub message.
+type delivery struct {
 	msg *gpubsub.Message
 	wm  worker.Message
 	// deadLetter publishes the message on Reject. Nil acknowledges it instead.
 	deadLetter *deadLetter
 }
 
-// NewDelivery wraps a Pub/Sub message. Messages published without the identity attributes, for
-// example by another producer, take their ID from the message ID Pub/Sub assigned and their
-// creation time from the time Pub/Sub received them.
-func NewDelivery(m *gpubsub.Message) *Delivery {
+// newDelivery wraps a Pub/Sub message of a subscriber whose rejected messages go to deadLetter, if
+// any. Messages published without the identity attributes, for example by another producer, take
+// their ID from the message ID Pub/Sub assigned and their creation time from the time Pub/Sub
+// received them.
+func newDelivery(m *gpubsub.Message, deadLetter *deadLetter) *delivery {
 	headers := types.NewJSONMapWithData(m.Attributes)
 	if _, ok := headers.Get(worker.MessageIDHeader); !ok && m.ID != "" {
 		headers.Set(worker.MessageIDHeader, m.ID)
@@ -33,42 +34,36 @@ func NewDelivery(m *gpubsub.Message) *Delivery {
 		headers.Set(worker.MessageTimestampHeader, strconv.FormatInt(m.PublishTime.UnixNano(), 10))
 	}
 
-	return &Delivery{
+	return &delivery{
 		msg: m,
 		// Pub/Sub does not tell a subscriber which topic a message was published to.
-		wm: worker.NewMessageFromDelivery(m.OrderingKey, "", m.Data, headers),
+		wm:         worker.NewMessageFromDelivery(m.OrderingKey, "", m.Data, headers),
+		deadLetter: deadLetter,
 	}
 }
 
-// newDelivery is NewDelivery for a subscriber whose rejected messages go to deadLetter, if any.
-func newDelivery(m *gpubsub.Message, deadLetter *deadLetter) *Delivery {
-	d := NewDelivery(m)
-	d.deadLetter = deadLetter
-	return d
-}
-
 // Message returns the message, with the identity its attributes carry.
-func (d *Delivery) Message() worker.Message {
+func (d *delivery) Message() worker.Message {
 	return d.wm
 }
 
 // Complete acknowledges the message. With exactly-once delivery, it waits until Pub/Sub confirmed
 // the acknowledgement or ctx ends.
-func (d *Delivery) Complete(ctx context.Context) error {
+func (d *delivery) Complete(ctx context.Context) error {
 	return d.settle(ctx, "acknowledge", d.msg.AckWithResult())
 }
 
 // Retry makes Pub/Sub deliver the message again, after the delay of the subscription's retry
 // policy, if it has one. The attempt is not used: Pub/Sub derives the delay from its own count of
 // deliveries.
-func (d *Delivery) Retry(ctx context.Context, _ int) error {
+func (d *delivery) Retry(ctx context.Context, _ int) error {
 	return d.nack(ctx)
 }
 
 // Reject publishes the message to the dead-letter topic and acknowledges it, or only acknowledges
 // it when there is no dead-letter topic. If the copy cannot be published, the message is delivered
 // again instead of being acknowledged.
-func (d *Delivery) Reject(ctx context.Context) error {
+func (d *delivery) Reject(ctx context.Context) error {
 	if d.deadLetter == nil {
 		return d.Complete(ctx)
 	}
@@ -79,13 +74,13 @@ func (d *Delivery) Reject(ctx context.Context) error {
 	return d.Complete(ctx)
 }
 
-func (d *Delivery) nack(ctx context.Context) error {
+func (d *delivery) nack(ctx context.Context) error {
 	return d.settle(ctx, "nack", d.msg.NackWithResult())
 }
 
 // settle waits for the result of an acknowledgement, which is ready at once without exactly-once
 // delivery.
-func (d *Delivery) settle(ctx context.Context, action string, r *gpubsub.AckResult) error {
+func (d *delivery) settle(ctx context.Context, action string, r *gpubsub.AckResult) error {
 	st, err := r.Get(ctx)
 	if err == nil && st != gpubsub.AcknowledgeStatusSuccess {
 		err = fmt.Errorf("status %d", st)
@@ -105,7 +100,7 @@ type deadLetter struct {
 // deadLetterMessage copies a delivery for the dead-letter topic. The copy keeps the data, the
 // attributes and the ordering key, and carries the message ID in its identity attribute, so a
 // message that arrived without one keeps the ID it was given.
-func deadLetterMessage(d *Delivery) *gpubsub.Message {
+func deadLetterMessage(d *delivery) *gpubsub.Message {
 	attributes := make(map[string]string, len(d.msg.Attributes)+1)
 	maps.Copy(attributes, d.msg.Attributes)
 	attributes[worker.MessageIDHeader] = d.wm.ID

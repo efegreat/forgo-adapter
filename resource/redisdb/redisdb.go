@@ -95,7 +95,7 @@ func (c Config) Sanitize() Config {
 }
 
 // New validates the config, creates the client and pings Redis within ConnectTimeout, so that an
-// unreachable deployment stops the application before it serves. Its Resource is a *Redis.
+// unreachable deployment stops the application before it serves.
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
@@ -111,7 +111,7 @@ func (c Config) New() (forgo.Resource, error) {
 		return nil, errors.Join(fmt.Errorf("redisdb: ping %s: %w", cfg.target(), err), client.Close())
 	}
 
-	return &Redis{name: cfg.Name, client: client}, nil
+	return &resource{name: cfg.Name, client: client}, nil
 }
 
 func (c Config) validate() error {
@@ -178,23 +178,23 @@ func (c Config) target() string {
 	return addrs
 }
 
-// Redis is the resource New returns. Its Value is the redis.UniversalClient.
-type Redis struct {
+// resource is the forgo.Resource New returns. Its Value is the redis.UniversalClient.
+type resource struct {
 	name   string
 	client redis.UniversalClient
 }
 
 // Name returns Config.Name.
-func (r *Redis) Name() string {
+func (r *resource) Name() string {
 	return r.name
 }
 
 // Value returns the client: a *redis.Client or a *redis.ClusterClient, as Config describes.
-func (r *Redis) Value() any {
+func (r *resource) Value() any {
 	return r.client
 }
 
 // Close closes the client and its connections.
-func (r *Redis) Close() error {
+func (r *resource) Close() error {
 	return r.client.Close()
 }

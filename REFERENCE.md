@@ -205,7 +205,8 @@ var Broker = rabbitmq.Config{
 | --- | --- | --- |
 | `Name` | | The resource name, also shown as the connection name in the RabbitMQ management UI. |
 | `Addr` | `localhost` | Broker host. |
-| `Port` | `5672` | Broker port. |
+| `Port` | `5672`, or `5671` with `TLSConfig` | Broker port. |
+| `TLSConfig` | plaintext | Connects with TLS (`amqps`) when set. The certificate is verified against `Addr` unless it sets a `ServerName`. |
 | `Username`, `Password` | client default (`guest`) | PLAIN credentials. They are passed to the client directly, so special characters need no escaping. |
 | `VHost` | `/` | Virtual host. |
 | `Recovery` | enabled, unlimited retries every 5s | Automatic reconnection, see [Recovery](#recovery). |
@@ -213,6 +214,8 @@ var Broker = rabbitmq.Config{
 | `Queues` | | Queues to declare: `Name`, `Durable`, `AutoDelete`, `Exclusive`, `NoWait`, `Args`, `Bindings`, `DeadLetter` and `Retry`. |
 | `Publishers` | | Named publishers, see below. |
 | `Subscribers` | | Named subscribers, see below. |
+
+Without `TLSConfig`, the credentials and every message travel in clear text. Managed brokers usually accept only TLS, on port 5671. Their certificates are publicly trusted, so an empty config is enough: `TLSConfig: &tls.Config{}`. `New` copies the config before the client sees it, so a shared `tls.Config` stays as it is.
 
 `New` connects, then declares every exchange, then every queue with its bindings. A queue's dead-letter exchange and queue are declared just before the queue itself, and its retry queues just after it. Any failure closes the connection and fails the bootstrap. The channel the topology was declared on stays open, because the client only redeclares the topology recorded on open channels after a reconnect. Declarations are idempotent, but redeclaring an existing exchange or queue with different properties or arguments is refused by RabbitMQ with `PRECONDITION_FAILED`.
 
@@ -244,8 +247,7 @@ A publisher sends one message at a time and waits for its confirm. Raise the wor
 | `Name` | | Matches `worker.SubscriberConfig.Name`. |
 | `Queue` | | The queue to consume. It must exist when the server starts. |
 | `Prefetch` | the worker subscriber's `Concurrency` | How many unacknowledged messages RabbitMQ sends this consumer. The default keeps every handler slot busy and leaves the rest of the backlog in the queue for other instances. Raise it a little to hide network latency. A negative value removes the limit. At most 65535. |
-| `AutoAck` | `false` | Leave it off: the worker acknowledges every message itself. |
-| `Exclusive`, `NoLocal`, `NoWait`, `Args` | | AMQP consume options. |
+| `Exclusive`, `NoLocal`, `NoWait`, `Args` | | AMQP consume options. There is no automatic acknowledgement: the worker settles every message itself. |
 
 The worker's `SubscriberConfig.Concurrency` bounds how many messages are handled at once. A subscriber consumes under the consumer tag `forgo-<Name>-<n>`, which tells subscribers apart in the management UI.
 
@@ -773,11 +775,11 @@ forgo.WithProviders(
 | Constructor | Database | Notes |
 | --- | --- | --- |
 | `inbox.NewPostgres(*sql.DB)` | PostgreSQL | `INSERT … ON CONFLICT` increments attempts in one statement. |
-| `inbox.NewMySQL(*sql.DB)` | MySQL 8 | Locks the row with `SELECT … FOR UPDATE`. Timestamps are `CURRENT_TIMESTAMP(6)`, so use `DATETIME(6)` columns. |
+| `inbox.NewMySQL(*sql.DB)` | MySQL 8 | Locks the row with `SELECT … FOR UPDATE`. Stamps rows with `UTC_TIMESTAMP(6)` and deletes them by their age on the database clock. |
 | `outbox.NewPostgres(*sql.DB)` | PostgreSQL | Claims with `FOR UPDATE SKIP LOCKED`. Stamps and expires claims with `CURRENT_TIMESTAMP`. |
-| `outbox.NewMySQL(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED`. Stamps and expires claims with `UTC_TIMESTAMP(6)`, so `processing_at` holds UTC, unaffected by the session time zone. |
+| `outbox.NewMySQL(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED`. Stamps claims and processed rows with `UTC_TIMESTAMP(6)`, and expires and deletes them by their age on the database clock. |
 
-Both outboxes time claims on the database clock alone: a claim expires once its `processing_at` is `ClaimTTL` older than the database's current time. Clock skew between producer instances, or between them and the database, does not change `ClaimTTL`.
+Both outboxes time claims on the database clock alone: a claim expires once its `processing_at` is `ClaimTTL` older than the database's current time. Clock skew between producer instances, or between them and the database, does not change `ClaimTTL`. On MySQL, every timestamp the storages write is UTC, whatever the session time zone and the driver's `loc`, and the cleanups compare ages on the database clock too. Create the tables with the schema forgo's REFERENCE.md gives for your database, including the `inbox_events_cleanup` index, without which every cleanup batch scans the whole inbox.
 
 A message only leaves *waiting*. Moving it out of another terminal state fails with `inbox.ErrNotWaiting`. Repeating `MarkFailed` or `MarkRejected` on a message already in that state succeeds. `MarkCompleted` is strict: it succeeds only when it moves the message out of *waiting* itself. When two deliveries of one message run at once, for example after a channel was lost while a handler ran, the one that completes second fails with `inbox.ErrNotWaiting`. Its transaction then rolls back its handler's writes instead of committing them a second time, and its redelivery is skipped as completed. Several producer instances can run against one outbox, because a claim skips the rows another claim has locked.
 
@@ -796,7 +798,7 @@ forgo.WithProviders(locker.NewRedis),
 
 | Method | Behavior |
 | --- | --- |
-| `Lock(ctx, key, ttl)` | `SET key token NX PX ttl`, once, without waiting. Returns whether the lock was acquired, and an error only when Redis fails. |
+| `Lock(ctx, key, ttl)` | `SET key token NX PX ttl`, once, without waiting. Returns whether the lock was acquired, and an error when Redis fails or `ttl` is not positive: a lock without an expiry would outlive a crash of its holder. |
 | `WaitLock(ctx, key, attempts, delay, ttl)` | Tries up to `attempts` times (at least once), waiting `delay` between tries but not after the last one. Returns `ctx.Err()` when `ctx` ends first. forgo's servers never call it; it is for application code that waits for a lock. |
 | `Unlock(ctx, key)` | Deletes the key only while it still holds this process's token. Otherwise returns `locker.ErrNotHeld` and leaves the key alone. |
 
@@ -856,6 +858,7 @@ forgo.WithProviders(
 - **Text parameters.** Documents are sent as text, because a JSON column rejects `[]byte` from some drivers: lib/pq sends it as `bytea`, and MySQL refuses JSON from the binary character set.
 - **Newest version wins.** The cache compares versions in the script, so a save whose cache write arrives late never replaces a newer one. Versions are compared as Lua numbers, exact up to 2^53.
 - **Keys.** Stored as `liveconfig:<name>` (`liveconfig.KeyPrefix`). Each entry is a single key, so the cache works on Redis Cluster. Configure Redis without eviction for these keys: an evicted entry is read from the store on every `Load` until the config is saved again.
+- **One namespace per Redis.** Applications that share a Redis share these keys. When two of them have a config of the same name, the one at the higher version wins: the other's saves are refused by the version check, and its `Load` returns a document of the other application without an error. Give such configs names that are unique across the applications, or give each application a Redis database of its own.
 
 ---
 
@@ -936,6 +939,6 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | `sqltx:` | Beginning, committing or rolling back a transaction. Errors returned by your function pass through unchanged. |
 | `inbox:` | Inbox queries. `inbox.ErrNotWaiting` when a message left the waiting status. |
 | `outbox:` | Outbox queries. |
-| `locker:` | Redis errors. `locker.ErrNotHeld` from `Unlock`. |
+| `locker:` | A TTL that is not positive, and Redis errors. `locker.ErrNotHeld` from `Unlock`. |
 | `ratelimit:` | An invalid `Rate` and Redis errors. |
 | `liveconfig:` | Live config queries and Redis errors. Conflicting saves return forgo's `forgo.ErrLiveConfigConflict`. |

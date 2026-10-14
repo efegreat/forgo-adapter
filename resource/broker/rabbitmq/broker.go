@@ -23,9 +23,9 @@ const (
 	maxConsumerTag = 255
 )
 
-// Broker is the resource New returns and its worker.IBroker Value. It holds one connection, and a
+// broker is the resource New returns and its worker.IBroker Value. It holds one connection, and a
 // channel for every publisher and subscriber.
-type Broker struct {
+type broker struct {
 	conf        Config
 	subscribers map[string]SubscriberConfig
 	publishers  map[string]PublisherConfig
@@ -45,17 +45,17 @@ type Broker struct {
 }
 
 // Name returns Config.Name.
-func (r *Broker) Name() string {
+func (r *broker) Name() string {
 	return r.conf.Name
 }
 
 // NewDefaultPublisher returns a publisher of persistent messages that needs no PublisherConfig.
-func (r *Broker) NewDefaultPublisher() (worker.IPublisher, error) {
+func (r *broker) NewDefaultPublisher() (worker.IPublisher, error) {
 	return r.newPublisher(PublisherConfig{Name: defaultPublisherName}.Sanitize())
 }
 
 // NewPublisher returns a publisher with the PublisherConfig named name.
-func (r *Broker) NewPublisher(name string) (worker.IPublisher, error) {
+func (r *broker) NewPublisher(name string) (worker.IPublisher, error) {
 	conf, ok := r.publishers[name]
 	if !ok {
 		return nil, fmt.Errorf("rabbitmq: publisher config not found for name: %s", name)
@@ -64,7 +64,7 @@ func (r *Broker) NewPublisher(name string) (worker.IPublisher, error) {
 }
 
 // newPublisher opens a channel in confirm mode, so Publish returns once the broker has the message.
-func (r *Broker) newPublisher(conf PublisherConfig) (*Publisher, error) {
+func (r *broker) newPublisher(conf PublisherConfig) (*publisher, error) {
 	ch, err := r.conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq: open publisher channel: %w", err)
@@ -73,7 +73,7 @@ func (r *Broker) newPublisher(conf PublisherConfig) (*Publisher, error) {
 		return nil, errors.Join(fmt.Errorf("rabbitmq: enable publisher confirms: %w", err), ch.Close())
 	}
 
-	p := &Publisher{conf: conf, ch: ch}
+	p := &publisher{conf: conf, ch: ch}
 	if conf.Mandatory {
 		p.returns = ch.NotifyReturn(make(chan amqp.Return, returnBuffer))
 	}
@@ -84,7 +84,7 @@ func (r *Broker) newPublisher(conf PublisherConfig) (*Publisher, error) {
 
 // NewSubscriber opens the subscriber's channel and checks that its queue exists. Consumption
 // starts in Consume, once the worker's concurrency sets the default prefetch.
-func (r *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
+func (r *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	conf, ok := r.subscribers[name]
 	if !ok {
 		return nil, fmt.Errorf("rabbitmq: subscriber config not found for name: %s", name)
@@ -108,7 +108,7 @@ func (r *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 		return nil, errors.Join(fmt.Errorf("rabbitmq: subscriber %s: %w", name, err), ch.Close())
 	}
 	tag, lost := r.addConsumer(name)
-	return &Subscriber{
+	return &subscriber{
 		conf:  conf,
 		ch:    ch,
 		tag:   tag,
@@ -123,7 +123,7 @@ func (r *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 }
 
 // newRetrier returns the retrier of a queue that has Retry, with a publisher of its own, or nil.
-func (r *Broker) newRetrier(queue string) (*retrier, error) {
+func (r *broker) newRetrier(queue string) (*retrier, error) {
 	queues := retryQueues(r.conf, queue)
 	if len(queues) == 0 {
 		return nil, nil
@@ -148,28 +148,28 @@ func retryQueues(cfg Config, queue string) []retryQueue {
 }
 
 // Value returns the broker as a worker.IBroker.
-func (r *Broker) Value() any {
+func (r *broker) Value() any {
 	return worker.IBroker(r)
 }
 
 // Close closes the connection and with it every channel. It also stops a recovery in progress.
-func (r *Broker) Close() error {
+func (r *broker) Close() error {
 	return r.conn.Close()
 }
 
-func (r *Broker) own(ch *amqp.Channel, guard *ackGuard) {
+func (r *broker) own(ch *amqp.Channel, guard *ackGuard) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.owned[ch] = guard
 }
 
-func (r *Broker) disown(ch *amqp.Channel) {
+func (r *broker) disown(ch *amqp.Channel) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.owned, ch)
 }
 
-func (r *Broker) owner(ch *amqp.Channel) (*ackGuard, bool) {
+func (r *broker) owner(ch *amqp.Channel) (*ackGuard, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	guard, ok := r.owned[ch]
@@ -178,7 +178,7 @@ func (r *Broker) owner(ch *amqp.Channel) (*ackGuard, bool) {
 
 // addConsumer returns a new consumer tag for the subscriber name, and the loss the recovery
 // reports to when it cannot re-subscribe that consumer.
-func (r *Broker) addConsumer(name string) (string, *consumerLoss) {
+func (r *broker) addConsumer(name string) (string, *consumerLoss) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.consumerSeq++
@@ -188,14 +188,14 @@ func (r *Broker) addConsumer(name string) (string, *consumerLoss) {
 	return tag, lost
 }
 
-func (r *Broker) removeConsumer(tag string) {
+func (r *broker) removeConsumer(tag string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.consumers, tag)
 }
 
 // consumerLost reports err to the subscriber that consumes under tag, unless it is closed.
-func (r *Broker) consumerLost(tag string, err error) {
+func (r *broker) consumerLost(tag string, err error) {
 	r.mu.Lock()
 	lost, ok := r.consumers[tag]
 	r.mu.Unlock()
@@ -215,7 +215,7 @@ func consumerTag(name string, seq uint64) string {
 }
 
 // invalidateAll marks the deliveries of every subscriber channel as stale.
-func (r *Broker) invalidateAll() {
+func (r *broker) invalidateAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, guard := range r.owned {
@@ -225,7 +225,7 @@ func (r *Broker) invalidateAll() {
 	}
 }
 
-func (r *Broker) init() (err error) {
+func (r *broker) init() (err error) {
 	cfg := amqp.Config{
 		Vhost:      r.conf.VHost,
 		Properties: amqp.NewConnectionProperties(),
@@ -241,8 +241,15 @@ func (r *Broker) init() (err error) {
 		cfg.Properties.SetClientConnectionName(r.conf.Name)
 	}
 
+	scheme := "amqp://"
+	if r.conf.TLSConfig != nil {
+		scheme = "amqps://"
+		// The client writes ServerName into the TLS config it is given, which belongs to the caller.
+		cfg.TLSClientConfig = r.conf.TLSConfig.Clone()
+	}
+
 	// Credentials and the vhost travel in cfg, so the URL needs no escaping.
-	conn, err := amqp.DialConfig("amqp://"+net.JoinHostPort(r.conf.Addr, r.conf.Port)+"/", cfg)
+	conn, err := amqp.DialConfig(scheme+net.JoinHostPort(r.conf.Addr, r.conf.Port)+"/", cfg)
 	if err != nil {
 		return fmt.Errorf("rabbitmq: connect: %w", err)
 	}

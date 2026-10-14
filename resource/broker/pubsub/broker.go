@@ -15,9 +15,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Broker is the resource New returns and its worker.IBroker Value. Its publishers share one client
+// broker is the resource New returns and its worker.IBroker Value. Its publishers share one client
 // publisher per topic, which batches their messages.
-type Broker struct {
+type broker struct {
 	conf   Config
 	client *gpubsub.Client
 	topics *topics
@@ -26,7 +26,7 @@ type Broker struct {
 	subscribers map[string]SubscriberConfig
 }
 
-func newBroker(cfg Config) (_ *Broker, err error) {
+func newBroker(cfg Config) (_ *broker, err error) {
 	// The client keeps the context it is created with for its credentials, so it must outlive New.
 	client, err := gpubsub.NewClient(context.Background(), cfg.ProjectID, cfg.Options...)
 	if err != nil {
@@ -44,7 +44,7 @@ func newBroker(cfg Config) (_ *Broker, err error) {
 		return nil, err
 	}
 
-	b := &Broker{
+	b := &broker{
 		conf:        cfg,
 		client:      client,
 		topics:      newTopics(client),
@@ -74,29 +74,29 @@ func resolveSubscriber(cfg Config, project string, s SubscriberConfig) Subscribe
 }
 
 // Name returns Config.Name.
-func (b *Broker) Name() string {
+func (b *broker) Name() string {
 	return b.conf.Name
 }
 
 // NewDefaultPublisher returns a publisher. Pub/Sub publishers have no settings of their own.
-func (b *Broker) NewDefaultPublisher() (worker.IPublisher, error) {
-	return &Publisher{topics: b.topics}, nil
+func (b *broker) NewDefaultPublisher() (worker.IPublisher, error) {
+	return &publisher{topics: b.topics}, nil
 }
 
 // NewPublisher returns a publisher for any name. Pub/Sub publishers have no settings of their own.
-func (b *Broker) NewPublisher(string) (worker.IPublisher, error) {
-	return &Publisher{topics: b.topics}, nil
+func (b *broker) NewPublisher(string) (worker.IPublisher, error) {
+	return &publisher{topics: b.topics}, nil
 }
 
 // NewSubscriber returns the subscriber name. It does not check that its subscription exists,
 // because the subscriber role cannot read subscriptions: receiving from a missing one fails
 // instead.
-func (b *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
+func (b *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	conf, ok := b.subscribers[name]
 	if !ok {
 		return nil, fmt.Errorf("pubsub: subscriber config not found for name: %s", name)
 	}
-	s := &Subscriber{conf: conf, sub: b.client.Subscriber(conf.Subscription)}
+	s := &subscriber{conf: conf, sub: b.client.Subscriber(conf.Subscription)}
 	if conf.DeadLetterTopic != "" {
 		s.deadLetter = &deadLetter{topics: b.topics, topic: conf.DeadLetterTopic}
 	}
@@ -104,12 +104,12 @@ func (b *Broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 }
 
 // Value returns the broker as a worker.IBroker.
-func (b *Broker) Value() any {
+func (b *broker) Value() any {
 	return worker.IBroker(b)
 }
 
 // Close sends the messages still being published, then closes the client.
-func (b *Broker) Close() error {
+func (b *broker) Close() error {
 	b.topics.stop()
 	return b.client.Close()
 }

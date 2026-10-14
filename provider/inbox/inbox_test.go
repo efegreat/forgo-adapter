@@ -3,6 +3,7 @@ package inbox
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"strings"
 	"testing"
@@ -45,6 +46,11 @@ func newMock(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 	return db, mock
 }
 
+// argFunc adapts a function to sqlmock.Argument.
+type argFunc func(driver.Value) bool
+
+func (f argFunc) Match(v driver.Value) bool { return f(v) }
+
 func statusRows(status ...worker.InboxStatus) *sqlmock.Rows {
 	rows := sqlmock.NewRows([]string{"status"})
 	for _, s := range status {
@@ -83,7 +89,7 @@ var dialects = []dialect{
 			if moved {
 				affected = 1
 			}
-			m.ExpectExec(`UPDATE inbox_events\s+SET\s+status = \?`).
+			m.ExpectExec(`UPDATE inbox_events\s+SET\s+status = \?,\s+updated_at = UTC_TIMESTAMP\(6\)`).
 				WithArgs(target, msgID, sub, worker.InboxWaiting).
 				WillReturnResult(sqlmock.NewResult(0, affected))
 		},
@@ -286,8 +292,8 @@ func TestPostgresIncrementAttempt(t *testing.T) {
 func TestMySQLIncrementAttempt(t *testing.T) {
 	const (
 		lockRow = `SELECT\s+status,\s+attempts\s+FROM inbox_events\s+WHERE message_id = \?\s+AND subscriber_name = \?\s+FOR UPDATE`
-		insert  = `INSERT INTO inbox_events`
-		update  = `UPDATE inbox_events\s+SET\s+attempts = \?`
+		insert  = `INSERT INTO inbox_events.+VALUES \(\?, \?, \?, \?, UTC_TIMESTAMP\(6\), UTC_TIMESTAMP\(6\)\)`
+		update  = `UPDATE inbox_events\s+SET\s+attempts = \?,\s+updated_at = UTC_TIMESTAMP\(6\)`
 	)
 	attemptRows := func(status worker.InboxStatus, attempts int) *sqlmock.Rows {
 		return sqlmock.NewRows([]string{"status", "attempts"}).AddRow(status, attempts)
@@ -362,17 +368,27 @@ func TestMySQLIncrementAttemptJoinsTransaction(t *testing.T) {
 }
 
 func TestDeleteBefore(t *testing.T) {
-	before := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	const maxTTL = 30 * 24 * time.Hour
+	before := time.Now().Add(-maxTTL)
 	queries := map[string]string{
 		"postgres": `WITH candidates AS .+DELETE FROM inbox_events AS i`,
-		"mysql":    `DELETE FROM inbox_events\s+WHERE status IN \(\?, \?\)`,
+		// MySQL compares an age with its own UTC clock, so the driver's loc cannot move the cutoff.
+		"mysql": `DELETE FROM inbox_events\s+WHERE status IN \(\?, \?\)\s+AND updated_at < UTC_TIMESTAMP\(6\) - INTERVAL \? MICROSECOND`,
+	}
+	cutoffs := map[string]sqlmock.Argument{
+		"postgres": argFunc(func(v driver.Value) bool { got, ok := v.(time.Time); return ok && got.Equal(before) }),
+		"mysql": argFunc(func(v driver.Value) bool {
+			us, ok := v.(int64)
+			age := time.Duration(us) * time.Microsecond
+			return ok && age >= maxTTL && age < maxTTL+5*time.Second
+		}),
 	}
 
 	for _, d := range dialects {
 		t.Run(d.name, func(t *testing.T) {
 			db, mock := newMock(t)
 			mock.ExpectExec(queries[d.name]).
-				WithArgs(worker.InboxCompleted, worker.InboxRejected, before, 100).
+				WithArgs(worker.InboxCompleted, worker.InboxRejected, cutoffs[d.name], 100).
 				WillReturnResult(sqlmock.NewResult(0, 42))
 
 			got, err := d.storage(db).DeleteBefore(context.Background(), before, 100)

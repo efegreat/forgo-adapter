@@ -52,7 +52,7 @@ func (s Config) Sanitize() Config {
 }
 
 // New opens the database and pings it within ConnectTimeout, so that an unreachable database or a
-// wrong DSN stops the application before it serves. Its Resource is a *SQLDB.
+// wrong DSN stops the application before it serves.
 func (s Config) New() (forgo.Resource, error) {
 	cfg := s.Sanitize()
 
@@ -72,29 +72,29 @@ func (s Config) New() (forgo.Resource, error) {
 		return nil, errors.Join(fmt.Errorf("sqldb: ping %s: %w", cfg.Name, err), db.Close())
 	}
 
-	return &SQLDB{
+	return &resource{
 		name: cfg.Name,
 		db:   db,
 	}, nil
 }
 
-// SQLDB is the resource New returns. Its Value is the *sql.DB.
-type SQLDB struct {
+// resource is the forgo.Resource New returns. Its Value is the *sql.DB.
+type resource struct {
 	name string
 	db   *sql.DB
 }
 
 // Name returns Config.Name.
-func (s *SQLDB) Name() string {
+func (s *resource) Name() string {
 	return s.name
 }
 
 // Value returns the *sql.DB.
-func (s *SQLDB) Value() any {
+func (s *resource) Value() any {
 	return s.db
 }
 
 // Close closes the *sql.DB.
-func (s *SQLDB) Close() error {
+func (s *resource) Close() error {
 	return s.db.Close()
 }

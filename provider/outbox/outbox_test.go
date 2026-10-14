@@ -234,8 +234,8 @@ func TestComplete(t *testing.T) {
 				return NewMySQL(db).Complete(ctx, claim.ID, ids)
 			},
 			markDone: func(m sqlmock.Sqlmock, ids []string) {
-				m.ExpectExec(`SET\s+processed_at = \?,.+WHERE processing_id = \?.+AND id IN \(\?,\?\)`).
-					WithArgs(sqlmock.AnyArg(), claim.ID, ids[0], ids[1]).
+				m.ExpectExec(`SET\s+processed_at = UTC_TIMESTAMP\(6\),.+WHERE processing_id = \?.+AND id IN \(\?,\?\)`).
+					WithArgs(claim.ID, ids[0], ids[1]).
 					WillReturnResult(sqlmock.NewResult(0, 2))
 			},
 		},
@@ -296,22 +296,27 @@ func TestComplete(t *testing.T) {
 }
 
 func TestDeleteProcessedBefore(t *testing.T) {
-	before := created.Add(-30 * 24 * time.Hour)
+	const maxTTL = 30 * 24 * time.Hour
+	before := time.Now().Add(-maxTTL)
 	tests := []struct {
 		name   string
 		query  string
+		cutoff any
 		delete func(*sql.DB) (int64, error)
 	}{
 		{
-			name:  "postgres",
-			query: `WITH deleted AS .+processed_at IS NOT NULL.+DELETE FROM outbox_events AS o`,
+			name:   "postgres",
+			query:  `WITH deleted AS .+processed_at IS NOT NULL.+DELETE FROM outbox_events AS o`,
+			cutoff: before,
 			delete: func(db *sql.DB) (int64, error) {
 				return NewPostgres(db).DeleteProcessedBefore(context.Background(), before, 100)
 			},
 		},
 		{
-			name:  "mysql",
-			query: `DELETE FROM outbox_events\s+WHERE processed_at IS NOT NULL\s+AND processed_at < \?.+LIMIT \?`,
+			// MySQL compares an age with its own UTC clock, so the driver's loc cannot move the cutoff.
+			name:   "mysql",
+			query:  `DELETE FROM outbox_events\s+WHERE processed_at IS NOT NULL\s+AND processed_at < UTC_TIMESTAMP\(6\) - INTERVAL \? MICROSECOND.+LIMIT \?`,
+			cutoff: microsecondsAge(maxTTL),
 			delete: func(db *sql.DB) (int64, error) {
 				return NewMySQL(db).DeleteProcessedBefore(context.Background(), before, 100)
 			},
@@ -321,7 +326,7 @@ func TestDeleteProcessedBefore(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			db, mock := newMock(t)
-			mock.ExpectExec(tt.query).WithArgs(before, 100).WillReturnResult(sqlmock.NewResult(0, 100))
+			mock.ExpectExec(tt.query).WithArgs(tt.cutoff, 100).WillReturnResult(sqlmock.NewResult(0, 100))
 			got, err := tt.delete(db)
 			if err != nil || got != 100 {
 				t.Fatalf("DeleteProcessedBefore = %d, %v; want 100", got, err)

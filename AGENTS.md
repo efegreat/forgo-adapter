@@ -34,7 +34,8 @@ forgo's four goals carry over:
 | `provider/locker/` | `operation.ILocker` on Redis. Token-guarded unlock script, `ErrNotHeld`. |
 | `provider/ratelimit/` | `http.IRateLimiter` on Redis. GCRA Lua script on the server clock, `KeyPrefix`. |
 | `provider/liveconfig/` | `forgo.LiveConfigStore` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`) on the `live_configs` table, with versioned conditional saves. `liveconfig.go`: the shared `get` and `applied`. `redis.go`: `forgo.LiveConfigCache` on Redis, version-guarded Lua `Set`, `KeyPrefix`. |
-| `.github/` | The CI workflow (lint, tests, govulncheck, releases on `v*` tags), Dependabot, and the issue and pull request templates. |
+| `internal/sqltest/` | The databases of the integration tests: `Dialect.Open` opens PostgreSQL or MySQL from the environment or skips, `Reset` creates a table with the schema of forgo's REFERENCE.md, `Ago` is a time on the database clock. Imported by tests only. |
+| `.github/` | The CI workflow (lint, tests with PostgreSQL, MySQL and RabbitMQ services, govulncheck, releases on `v*` tags), Dependabot, and the issue and pull request templates. |
 
 ## Invariants
 
@@ -42,10 +43,11 @@ Do not break these without an explicit decision from the maintainer.
 
 ### Resources
 
-- `Config` is a value type with value receivers. `Sanitize()` returns a copy with defaults. It **never writes into the caller's slices or maps**, because configs are package-level vars shared by several apps and tests. Build new slices, and clone maps before adding keys (see `QueueConfig.args`). The same holds for what `New` hands to a client: the go-redis cluster client appends discovered nodes to its seed list, so `redisdb` clones `Addrs`.
+- `Config` is a value type with value receivers. `Sanitize()` returns a copy with defaults. It **never writes into the caller's slices or maps**, because configs are package-level vars shared by several apps and tests. Build new slices, and clone maps before adding keys (see `QueueConfig.args`). The same holds for what `New` hands to a client: the go-redis cluster client appends discovered nodes to its seed list, so `redisdb` clones `Addrs`, and amqp091-go writes `ServerName` into its TLS config, so `rabbitmq` clones `TLSConfig`.
 - `New()` follows this order: `Sanitize` → `validate` (no network) → connect → verify (ping, declare). On any failure after connecting, close what was opened and join the close error with `errors.Join`.
 - `Value()` returns the concrete client (`*sql.DB`, the `*redis.Client` or `*redis.ClusterClient` of `redis.NewUniversalClient`) or, for brokers, the forgo interface (`worker.IBroker(r)`). Bootstrap binds the dynamic type of `Value()` and matches by assignability. Document in REFERENCE.md what providers should request.
 - `Close()` releases everything `New` opened.
+- The resource types (`sqldb`'s and `redisdb`'s `resource`, the brokers' `broker`) and the brokers' `publisher`, `subscriber` and `delivery` are unexported. `New` returns a `forgo.Resource` and the brokers return forgo's interfaces, so nobody needs to name them, and v1 does not freeze them.
 
 ### Providers
 
@@ -56,7 +58,7 @@ Do not break these without an explicit decision from the maintainer.
 ### RabbitMQ
 
 - Published messages carry `worker.MessageIDHeader`, `MessageNameHeader` and `MessageTimestampHeader`, written from the `Message` fields over any user header of the same name. The consumer inbox depends on a stable ID across redeliveries.
-- `NewDelivery` keeps every header. `headerValue` converts values that are not strings to text, and tables and arrays to JSON, because `Message.Headers` holds strings only. Retry copies are built from the raw `amqp.Delivery` headers, never from `Message.Headers`, so they keep the AMQP types.
+- `newDelivery` keeps every header. `headerValue` converts values that are not strings to text, and tables and arrays to JSON, because `Message.Headers` holds strings only. Retry copies are built from the raw `amqp.Delivery` headers, never from `Message.Headers`, so they keep the AMQP types.
 - `Delivery`: `Complete` = ack, `Retry` = nack with requeue, `Reject` = reject without requeue. The dead-letter feature relies on `Reject` never requeueing. When the queue has `Retry`, `Retry` instead publishes a confirmed copy to the retry queue for its attempt and then acks through the `ackGuard`. It checks staleness before publishing, so a stale delivery is not duplicated, and it falls back to nack with requeue when the publish fails, so the message is never held or lost. The retry publisher is behind the `confirmedPublisher` interface for tests.
 - `declare` declares a queue's retry queues **after** the queue. They are durable, and dead-letter through the default exchange (`x-dead-letter-exchange: ""`) with the queue's name as routing key, so an expired retry returns to that queue only. Their names derive from the delays, so changing `Retry` declares new ones and never redeclares an existing queue with other arguments.
 - `declare` declares a queue's dead-letter exchange and queue **before** the queue. Dead-letter exchanges are durable direct exchanges and dead-letter queues are durable. Conflicts between `DeadLetter` and `x-dead-letter-*` in `Args` are rejected in `validate`.
@@ -99,7 +101,8 @@ Do not break these without an explicit decision from the maintainer.
 - `liveconfig` sends documents as `string`, never `[]byte`: lib/pq sends `[]byte` as `bytea`, which a `JSONB` column rejects, and MySQL refuses JSON in the binary character set.
 - Each storage implements the contract and the comments in forgo's `server/worker/storage.go` exactly. The table schemas are documented in forgo's REFERENCE.md ("Storage contracts").
 - Claims use `FOR UPDATE SKIP LOCKED`. Status transitions only leave `InboxWaiting`. Repeating `MarkFailed` or `MarkRejected` succeeds, but `MarkCompleted` must succeed only when it moved the row itself (`unmoved` in `provider/inbox/inbox.go`): it runs in the handler's transaction, and a success for a concurrent duplicate would commit the handler's writes twice.
-- Outbox claims are stamped and expired on the database clock only. `Claim` turns `ExpiredBefore` into an age (`claimAge` in `provider/outbox/outbox.go`) and compares `processing_at` with the database time minus that age, so skew between app instances and the database never shifts `ClaimTTL`. Never compare `processing_at` with a time from the app. MySQL uses `UTC_TIMESTAMP(6)`, because `CURRENT_TIMESTAMP` in a `DATETIME` column follows the session time zone and its daylight saving changes.
+- Outbox claims are stamped and expired on the database clock only. `Claim` turns `ExpiredBefore` into an age (`claimAge` in `provider/outbox/outbox.go`) and compares `processing_at` with the database time minus that age, so skew between app instances and the database never shifts `ClaimTTL`. Never compare `processing_at` with a time from the app. The cleanups (`DeleteBefore`, `DeleteProcessedBefore`) turn `before` into an age the same way on MySQL.
+- MySQL storages stamp every row with `UTC_TIMESTAMP(6)`, never `CURRENT_TIMESTAMP` or a time from the app: `CURRENT_TIMESTAMP` in a `DATETIME` column follows the session time zone and its daylight saving changes, and an app time goes through the driver's `loc`.
 - Each dialect lives in its own file. Placeholders differ (`$n` and `?`): keep the helpers local to the file that uses them.
 
 ### Redis
@@ -113,8 +116,9 @@ Do not break these without an explicit decision from the maintainer.
 
 - Errors: prefix with the package (`sqldb:`, `redisdb:`, `rabbitmq:`, `pubsub:`, `redisstream:`, `inbox:`, `outbox:`, `liveconfig:`, `locker:`, `ratelimit:`), wrap with `%w`, and declare sentinels as package-level `var`s.
 - Doc comments on exported identifiers explain the contract and the why. Match the surrounding code.
-- Dependencies: forgo, `github.com/rabbitmq/amqp091-go`, `github.com/redis/go-redis/v9`, `cloud.google.com/go/pubsub/v2` (with `google.golang.org/api/option` for its client options). Test-only: `github.com/alicebob/miniredis/v2`, `github.com/DATA-DOG/go-sqlmock`. A new adapter may add the client library it wraps, and nothing else without a strong reason.
+- Dependencies: forgo, `github.com/rabbitmq/amqp091-go`, `github.com/redis/go-redis/v9`, `cloud.google.com/go/pubsub/v2` (with `google.golang.org/api/option` for its client options). Test-only: `github.com/alicebob/miniredis/v2`, `github.com/DATA-DOG/go-sqlmock`, and the drivers `github.com/lib/pq` and `github.com/go-sql-driver/mysql` of the integration tests. A new adapter may add the client library it wraps, and nothing else without a strong reason.
 - Tests must not need running infrastructure. Use miniredis for Redis (it runs Lua and `TIME`, and `SetTime`/`FastForward` control the clock; stream idle times follow `SetTime`, and `SetError` fakes error replies), sqlmock for SQL (`sqlmock.NewWithDSN` plus `sql.Open("sqlmock", dsn)` exercises `sqldb.New`; storage tests set `SetMaxOpenConns(1)`, so a statement that bypasses an open transaction blocks and fails on the test's deadline), fakes of narrow interfaces for AMQP (`declarer`, `consumeChannel`, `publishChannel`, `confirmation` and `amqp.Acknowledger`), and `pstest` for Pub/Sub, the in-memory server of the client module, which the real client connects to with `option.WithGRPCConn`. Table-driven where possible, passing under `-race`.
+- Integration tests (`TestIntegration…`) run the SQL storages against PostgreSQL and MySQL, and the RabbitMQ broker against RabbitMQ, when `ADAPTER_TEST_POSTGRES_DSN`, `ADAPTER_TEST_MYSQL_DSN` and `ADAPTER_TEST_RABBITMQ_URL` are set, and skip otherwise. CI sets them for its service containers. MySQL runs them in a session time zone behind UTC, so a timestamp that follows the session fails them. They check what sqlmock and the fakes cannot: that the SQL runs, the documented schema, and the broker's own behavior.
 
 ## Workflow
 
@@ -126,7 +130,7 @@ gofmt -l .        # must print nothing
 go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 ```
 
-CI (`.github/workflows/ci.yml`) runs these on every push and pull request, plus `go mod tidy -diff`, govulncheck and `go test` without the race detector. While `go.mod` replaces forgo with `../forgo`, CI checks out forgo's `main` next to this repository, so a change that needs an unmerged forgo change passes once that change is merged.
+CI (`.github/workflows/ci.yml`) runs these on every push and pull request, with the integration tests against PostgreSQL, MySQL and RabbitMQ service containers, plus `go mod tidy -diff`, govulncheck and `go test` without the race detector. While `go.mod` replaces forgo with `../forgo`, CI checks out forgo's `main` next to this repository, so a change that needs an unmerged forgo change passes once that change is merged.
 
 When you change behavior:
 
@@ -167,9 +171,9 @@ Versions follow semantic versioning. `go get` picks the latest tag, and pkg.go.d
 
 When you find one, verify it against the code and add it here with a `file:line` reference. Delete it in the change that fixes it.
 
-- The RabbitMQ adapter is tested against fakes of the client only. Recovery, confirms and dead-lettering have not run against a live broker in this repository's tests.
+- The RabbitMQ integration test covers the topology, confirms, returns, retry queues and dead-lettering on a live broker, but not recovery: a lost connection or channel runs against fakes of the client only.
 - The Pub/Sub adapter is tested against `pstest` only, which applies neither retry-policy delays nor IAM.
 - The Redis Streams adapter is tested against miniredis only, which differs from Redis in ways the tests work around: it counts `XCLAIM … JUSTID` as a delivery, reports `0` instead of `0-0` as a group position, trims `MAXLEN ~` exactly, and keeps its blocking commands canceled after `Restart` (`resource/broker/redisstream/redisstream_test.go`, test `TestConsumeErrors/restart`).
 - A Redis Streams entry whose dead-letter copy cannot be added is claimed again (`resource/broker/redisstream/delivery.go:57`). As with Pub/Sub, a message the inbox already marks *failed* or *rejected* is then acknowledged by the idempotency guard and never reaches the dead-letter stream.
-- The consumers of Redis Streams instances that crashed stay in their group without pending entries, since only `Close` deletes a consumer (`resource/broker/redisstream/subscriber.go:144`).
-- A Pub/Sub message whose dead-letter copy cannot be published is nacked (`resource/broker/pubsub/delivery.go:75`). When the inbox already marks it *failed* or *rejected*, the worker's idempotency guard acknowledges the redelivery, so the message never reaches the dead-letter topic. RabbitMQ dead-letters on the broker and has no such window.
+- The consumers of Redis Streams instances that crashed stay in their group without pending entries, since only `Close` deletes a consumer (`resource/broker/redisstream/subscriber.go:146`).
+- A Pub/Sub message whose dead-letter copy cannot be published is nacked (`resource/broker/pubsub/delivery.go:70`). When the inbox already marks it *failed* or *rejected*, the worker's idempotency guard acknowledges the redelivery, so the message never reaches the dead-letter topic. RabbitMQ dead-letters on the broker and has no such window.

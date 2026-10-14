@@ -11,7 +11,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// confirmedPublisher publishes a message and waits for the broker's confirm. *Publisher is one.
+// confirmedPublisher publishes a message and waits for the broker's confirm. *publisher is one.
 type confirmedPublisher interface {
 	publish(ctx context.Context, exchange, key string, msg amqp.Publishing, id string) error
 	Close() error
@@ -33,7 +33,7 @@ func (r *retrier) queue(attempt int) retryQueue {
 // confirmed the copy. If the copy cannot be published, d is requeued at once instead, so the
 // message is neither lost nor held. A crash between the confirm and the acknowledgement delivers
 // the message twice, which the inbox absorbs.
-func (r *retrier) retry(ctx context.Context, d *Delivery, attempt int) error {
+func (r *retrier) retry(ctx context.Context, d *delivery, attempt int) error {
 	// The broker redelivers a stale delivery itself: a copy would duplicate it.
 	if d.stale() {
 		return errStaleDelivery
@@ -51,7 +51,7 @@ func (r *retrier) retry(ctx context.Context, d *Delivery, attempt int) error {
 // one it was given, and a return of the copy is matched to its publish. Expiration and UserId are
 // dropped: the retry queue decides when the copy expires, and RabbitMQ checks UserId against the
 // user of the connection.
-func retryPublishing(d *Delivery) amqp.Publishing {
+func retryPublishing(d *delivery) amqp.Publishing {
 	src := d.delivery
 	headers := make(amqp.Table, len(src.Headers)+1)
 	maps.Copy(headers, src.Headers)

@@ -1,9 +1,13 @@
 package rabbitmq
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"net/http/httptest"
 	"reflect"
 	"strconv"
 	"strings"
@@ -14,6 +18,13 @@ import (
 	"github.com/efegreat/forgo/types"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+var (
+	_ worker.IBroker     = (*broker)(nil)
+	_ worker.IPublisher  = (*publisher)(nil)
+	_ worker.ISubscriber = (*subscriber)(nil)
+	_ worker.IDelivery   = (*delivery)(nil)
 )
 
 // recorder is a declarer that records every declaration as a line.
@@ -129,6 +140,74 @@ func TestConfigNewFailsBeforeConnecting(t *testing.T) {
 	_, err := Config{Port: "1", Queues: []QueueConfig{{DeadLetter: DeadLetterConfig{Enabled: true}}}}.New()
 	if !errors.Is(err, errDeadLetterUnnamedQueue) {
 		t.Fatalf("New err = %v, want errDeadLetterUnnamedQueue", err)
+	}
+}
+
+func TestConfigSanitizeTLSPort(t *testing.T) {
+	tlsConfig := &tls.Config{}
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{name: "plain", cfg: Config{}, want: "5672"},
+		{name: "tls", cfg: Config{TLSConfig: tlsConfig}, want: "5671"},
+		{name: "tls on another port", cfg: Config{TLSConfig: tlsConfig, Port: "5673"}, want: "5673"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.Sanitize().Port; got != tt.want {
+				t.Fatalf("Port = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNewDialsTLS checks that a TLSConfig makes New dial amqps and verify the certificate against
+// Addr, without writing into the caller's config. The server completes the handshake and closes the
+// connection, so New fails afterwards.
+func TestNewDialsTLS(t *testing.T) {
+	// httptest's certificate is valid for 127.0.0.1.
+	srv := httptest.NewTLSServer(nil)
+	serverConfig := srv.TLS.Clone()
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	srv.Close()
+	serverConfig.NextProtos = nil
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", serverConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	handshakes := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			handshakes <- err
+			return
+		}
+		defer conn.Close()
+		handshakes <- conn.(*tls.Conn).Handshake()
+	}()
+
+	tlsConfig := &tls.Config{RootCAs: roots}
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	_, err = Config{Name: "events", Addr: "127.0.0.1", Port: port, TLSConfig: tlsConfig}.New()
+	if err == nil || !strings.Contains(err.Error(), "rabbitmq: connect") {
+		t.Fatalf("New err = %v, want a connect error once the server closes", err)
+	}
+
+	select {
+	case err := <-handshakes:
+		if err != nil {
+			t.Fatalf("TLS handshake: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server saw no TLS handshake")
+	}
+	if tlsConfig.ServerName != "" {
+		t.Fatalf("New wrote ServerName %q into the caller's TLS config", tlsConfig.ServerName)
 	}
 }
 
@@ -273,14 +352,14 @@ func TestPublishingRoundTrip(t *testing.T) {
 		t.Fatalf("publishing = %+v", p)
 	}
 
-	got := NewDelivery(amqp.Delivery{
+	got := newDelivery(amqp.Delivery{
 		Headers:    p.Headers,
 		MessageId:  p.MessageId,
 		Type:       p.Type,
 		Body:       p.Body,
 		RoutingKey: "order.placed",
 		Exchange:   "shop",
-	}).Message()
+	}, &ackGuard{}, nil).Message()
 	if got.ID != msg.ID || got.Name != msg.Name || !got.CreatedAt.Equal(created) || got.Key != "order.placed" || got.Destination != "shop" {
 		t.Fatalf("consumed message = %+v, want the published identity", got)
 	}
@@ -299,12 +378,12 @@ func TestPublishingWithoutHeadersOrTime(t *testing.T) {
 	}
 }
 
-func TestNewDeliveryFallsBackToProperties(t *testing.T) {
-	got := NewDelivery(amqp.Delivery{
+func TestDeliveryFallsBackToProperties(t *testing.T) {
+	got := newDelivery(amqp.Delivery{
 		MessageId: "external-id",
 		Type:      "invoice.paid",
 		Headers:   amqp.Table{"retries": int32(2), "source": "erp"},
-	}).Message()
+	}, &ackGuard{}, nil).Message()
 
 	if got.ID != "external-id" || got.Name != "invoice.paid" {
 		t.Fatalf("message = %+v, want ID and name from the AMQP properties", got)
@@ -317,9 +396,9 @@ func TestNewDeliveryFallsBackToProperties(t *testing.T) {
 	}
 }
 
-func TestNewDeliveryConvertsHeaderValues(t *testing.T) {
+func TestDeliveryConvertsHeaderValues(t *testing.T) {
 	created := time.Unix(1_700_000_000, 5)
-	got := NewDelivery(amqp.Delivery{
+	got := newDelivery(amqp.Delivery{
 		MessageId: "property-id",
 		Headers: amqp.Table{
 			worker.MessageIDHeader:        int64(42),
@@ -332,7 +411,7 @@ func TestNewDeliveryConvertsHeaderValues(t *testing.T) {
 				"time":         time.Unix(1_700_000_000, 0),
 			}},
 		},
-	}).Message()
+	}, &ackGuard{}, nil).Message()
 
 	if got.ID != "42" || !got.CreatedAt.Equal(created) {
 		t.Fatalf("message = %+v, want the identity from the converted headers", got)

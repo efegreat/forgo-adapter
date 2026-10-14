@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"maps"
@@ -13,9 +14,10 @@ import (
 )
 
 const (
-	defaultAddr  = "localhost"
-	defaultPort  = "5672"
-	defaultVHost = "/"
+	defaultAddr    = "localhost"
+	defaultPort    = "5672"
+	defaultTLSPort = "5671"
+	defaultVHost   = "/"
 
 	deadLetterExchangeArg   = "x-dead-letter-exchange"
 	deadLetterRoutingKeyArg = "x-dead-letter-routing-key"
@@ -43,8 +45,11 @@ type Config struct {
 	Name string
 	// Addr is the broker host. Default: localhost.
 	Addr string
-	// Port is the broker port. Default: 5672.
+	// Port is the broker port. Default: 5672, or 5671 with TLSConfig.
 	Port string
+	// TLSConfig connects with TLS (amqps) when set. The certificate is verified against Addr unless
+	// TLSConfig sets a ServerName. Without it, the credentials and every message travel in clear text.
+	TLSConfig *tls.Config
 	// Username and Password authenticate with PLAIN. Without a Username the client default applies (guest).
 	Username string
 	Password string
@@ -67,6 +72,9 @@ func (c Config) Sanitize() Config {
 	}
 	if c.Port == "" {
 		c.Port = defaultPort
+		if c.TLSConfig != nil {
+			c.Port = defaultTLSPort
+		}
 	}
 	if c.VHost == "" {
 		c.VHost = defaultVHost
@@ -88,25 +96,25 @@ func (c Config) Sanitize() Config {
 	return c
 }
 
-// New connects and declares the topology. A failure closes the connection. Its Resource is a *Broker.
+// New connects and declares the topology. A failure closes the connection.
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 
-	broker := &Broker{
+	b := &broker{
 		conf:        cfg,
 		subscribers: make(map[string]SubscriberConfig, len(cfg.Subscribers)),
 		publishers:  make(map[string]PublisherConfig, len(cfg.Publishers)),
 		owned:       make(map[*amqp.Channel]*ackGuard),
 		consumers:   make(map[string]*consumerLoss),
 	}
-	if err := broker.init(); err != nil {
+	if err := b.init(); err != nil {
 		return nil, err
 	}
 
-	return broker, nil
+	return b, nil
 }
 
 // validate rejects configurations that would otherwise only fail once the broker is reached.
@@ -374,8 +382,8 @@ func (p PublisherConfig) Sanitize() PublisherConfig {
 }
 
 // SubscriberConfig configures the subscriber of the worker.SubscriberConfig of the same Name, which
-// consumes Queue. AutoAck, Exclusive, NoLocal, NoWait and Args are the arguments of the AMQP
-// basic.consume method. Leave AutoAck off: the worker acknowledges every message itself.
+// consumes Queue. Exclusive, NoLocal, NoWait and Args are the arguments of the AMQP basic.consume
+// method. There is no automatic acknowledgement: the worker settles every message itself.
 type SubscriberConfig struct {
 	// Name matches worker.SubscriberConfig.Name.
 	Name  string
@@ -384,7 +392,6 @@ type SubscriberConfig struct {
 	// Concurrency of the worker subscriber, so every handler slot has a message and the rest of
 	// the backlog stays in the queue for other instances. A negative value removes the limit.
 	Prefetch  int
-	AutoAck   bool
 	Exclusive bool
 	NoLocal   bool
 	NoWait    bool

@@ -74,7 +74,7 @@ func (l *consumerLoss) report(err error) {
 // recoveryHooks wraps the client's connection recovery. It runs on the client's close watchers,
 // after the lost channel is closed and before next reopens it.
 type recoveryHooks struct {
-	broker *Broker
+	broker *broker
 	next   amqp.ConnectionRecovery
 }
 
