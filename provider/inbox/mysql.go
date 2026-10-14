@@ -24,10 +24,11 @@ func NewMySQL(db *sql.DB) *MySQL {
 	return &MySQL{db: db}
 }
 
-// readCommitted is the isolation of the transaction IncrementAttempt begins. Under REPEATABLE READ,
-// the SELECT … FOR UPDATE of a message without a row locks the gap where its row would go, and two
-// first attempts whose rows go in the same gap, as consecutive UUIDv7 message IDs do, deadlock on
-// their inserts. A storage that joins the caller's transaction keeps the caller's isolation.
+// readCommitted is the isolation of the transaction IncrementAttempt begins, as of every transaction
+// the MySQL storages begin. Its upsert locks only the message's row at either isolation, but under
+// REPEATABLE READ, a locking read added to the transaction would also lock gaps of the primary key,
+// where consecutive UUIDv7 message IDs put the rows of new messages. A storage that joins the
+// caller's transaction keeps the caller's isolation.
 var readCommitted = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 
 // Status returns the status of the message for the subscriber, and false when the inbox has no row for it.
@@ -65,7 +66,9 @@ func (m *MySQL) Status(
 }
 
 // IncrementAttempt counts an attempt at a waiting message and returns the count, inserting the
-// message on its first attempt. It returns ErrNotWaiting once the message left waiting.
+// message on its first attempt. It returns ErrNotWaiting once the message left waiting. The attempt
+// is counted by one upsert, as in the PostgreSQL inbox: concurrent deliveries of a new message wait
+// for the row the first one inserts, and then count their own attempts on it.
 func (m *MySQL) IncrementAttempt(
 	ctx context.Context,
 	messageID string,
@@ -76,8 +79,38 @@ func (m *MySQL) IncrementAttempt(
 	err := sqltx.RunWith(ctx, m.db, readCommitted, func(ctx context.Context) error {
 		tx := sqltx.From(ctx, m.db)
 
+		// A message that left waiting keeps its row as it is.
+		if _, err := tx.ExecContext(
+			ctx,
+			`
+			INSERT INTO inbox_events (
+				message_id,
+				subscriber_name,
+				status,
+				attempts,
+				created_at,
+				updated_at
+			)
+			VALUES (?, ?, ?, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
+			ON DUPLICATE KEY UPDATE
+				attempts = IF(status = ?, attempts + 1, attempts),
+				updated_at = IF(status = ?, UTC_TIMESTAMP(6), updated_at)
+			`,
+			messageID,
+			subscriberName,
+			worker.InboxWaiting,
+			worker.InboxWaiting,
+			worker.InboxWaiting,
+		); err != nil {
+			return fmt.Errorf(
+				"inbox: increment attempt: %w",
+				err,
+			)
+		}
+
+		// The upsert locked the row until the transaction ends, so this reads what it left.
 		var status worker.InboxStatus
-		err := tx.QueryRowContext(
+		if err := tx.QueryRowContext(
 			ctx,
 			`
 			SELECT
@@ -86,74 +119,21 @@ func (m *MySQL) IncrementAttempt(
 			FROM inbox_events
 			WHERE message_id = ?
 			  AND subscriber_name = ?
-			FOR UPDATE
 			`,
 			messageID,
 			subscriberName,
 		).Scan(
 			&status,
 			&attempts,
-		)
-
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			attempts = 1
-
-			if _, err := tx.ExecContext(
-				ctx,
-				`
-				INSERT INTO inbox_events (
-					message_id,
-					subscriber_name,
-					status,
-					attempts,
-					created_at,
-					updated_at
-				)
-				VALUES (?, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
-				`,
-				messageID,
-				subscriberName,
-				worker.InboxWaiting,
-				attempts,
-			); err != nil {
-				return fmt.Errorf(
-					"inbox: create attempt: %w",
-					err,
-				)
-			}
-
-		case err != nil:
+		); err != nil {
 			return fmt.Errorf(
-				"inbox: lock attempt row: %w",
+				"inbox: read attempt: %w",
 				err,
 			)
+		}
 
-		case status != worker.InboxWaiting:
+		if status != worker.InboxWaiting {
 			return ErrNotWaiting
-
-		default:
-			attempts++
-
-			if _, err := tx.ExecContext(
-				ctx,
-				`
-				UPDATE inbox_events
-				SET
-					attempts = ?,
-					updated_at = UTC_TIMESTAMP(6)
-				WHERE message_id = ?
-				  AND subscriber_name = ?
-				`,
-				attempts,
-				messageID,
-				subscriberName,
-			); err != nil {
-				return fmt.Errorf(
-					"inbox: increment attempt: %w",
-					err,
-				)
-			}
 		}
 
 		return nil
