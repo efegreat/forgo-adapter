@@ -64,7 +64,7 @@ func openSubscriber(t *testing.T, b *broker, name string) *subscriber {
 		t.Fatal(err)
 	}
 	sub := s.(*subscriber)
-	sub.block, sub.claimEvery, sub.beat, sub.errorWait = 20*time.Millisecond, 10*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond
+	sub.block, sub.claimEvery, sub.beat, sub.errorWait, sub.sweepEvery = 20*time.Millisecond, 10*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond
 	return sub
 }
 
@@ -863,6 +863,62 @@ func TestClose(t *testing.T) {
 			t.Fatalf("consumers = %v, want %s with one entry", got, s.consumer)
 		}
 	})
+}
+
+// seen makes miniredis record a consumer as active now, and creates it if needed, as Redis does
+// for every read or claim. miniredis only does it for XCLAIM, and for XAUTOCLAIM when there is
+// something to claim, so seen claims an entry that is not pending.
+func seen(t *testing.T, cl *redis.Client, consumer string) {
+	t.Helper()
+	if err := cl.XClaimJustID(context.Background(), &redis.XClaimArgs{Stream: "orders", Group: "billing", Consumer: consumer, Messages: []string{"0-1"}}).Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSweep(t *testing.T) {
+	m, cl, cfg := fake(t)
+	m.SetTime(t0)
+	b := open(t, topology(cfg, SubscriberConfig{})) // ClaimIdle 1m: stale after 10m
+	publish(t, b, worker.NewMessage("order.placed", "", "orders", nil))
+	s := openSubscriber(t, b, "billing")
+	// A consumer that crashed while it held an entry, which nobody claimed yet.
+	if err := cl.XReadGroup(context.Background(), &redis.XReadGroupArgs{Group: "billing", Consumer: "holding", Streams: []string{"orders", ">"}, Block: -1}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []string{"holding", "crashed", retryConsumer, s.consumer} {
+		seen(t, cl, c)
+	}
+	m.SetTime(t0.Add(5 * time.Minute))
+	seen(t, cl, "recent")
+
+	m.SetTime(t0.Add(11 * time.Minute))
+	s.sweep(context.Background())
+	want := map[string]int64{"holding": 1, "recent": 0, retryConsumer: 0, s.consumer: 0}
+	if got := consumers(t, cl); !reflect.DeepEqual(got, want) {
+		t.Fatalf("consumers = %v, want %v", got, want)
+	}
+}
+
+func TestConsumeSweeps(t *testing.T) {
+	m, cl, cfg := fake(t)
+	m.SetTime(t0)
+	b := open(t, topology(cfg, SubscriberConfig{}))
+	seen(t, cl, "crashed")
+	if _, found := consumers(t, cl)["crashed"]; !found {
+		t.Fatal("no consumer crashed to sweep")
+	}
+
+	_, handle := deliveries()
+	s := openSubscriber(t, b, "billing")
+	consume(t, s, 1, handle)
+	m.SetTime(t0.Add(11 * time.Minute))
+	eventually(t, "the sweep", func() bool {
+		_, found := consumers(t, cl)["crashed"]
+		return !found
+	})
+	if got := consumers(t, cl); !reflect.DeepEqual(got, map[string]int64{s.consumer: 0}) {
+		t.Fatalf("consumers = %v, want only %s", got, s.consumer)
+	}
 }
 
 func TestTransient(t *testing.T) {

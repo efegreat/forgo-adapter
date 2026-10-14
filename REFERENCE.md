@@ -752,7 +752,7 @@ While a handler runs, its subscriber resets the idle time of the entry every `Cl
 
 `ClaimIdle` is also the longest retry delay. Raise it for longer delays, at the price of a slower recovery after a crash. Every subscriber of a group needs the same `ClaimIdle`.
 
-The consumers of instances that crashed stay in the group without pending entries once their entries are claimed. They cost a few bytes each, and `XGROUP DELCONSUMER orders billing <consumer>` deletes one.
+An instance that crashed cannot delete its consumer on shutdown, so the consumer stays in the group once its entries are claimed. Every subscriber therefore sweeps its group about every five minutes (`XINFO CONSUMERS`), and deletes the consumers that have no pending entries and were idle for ten times `ClaimIdle` (ten minutes by default). It keeps its own consumer and `forgo-retry`. A live consumer is never that idle, since it claims about once a second or holds the entries it handles. If one is deleted anyway, for example after a pause of the process, Redis creates it again on its next read. A sweep that fails, for example because the ACL user may not run `XINFO`, is left to the next one.
 
 #### Delayed retries
 
