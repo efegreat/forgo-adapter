@@ -12,17 +12,17 @@ import (
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
-// Mysql is a worker.InboxStorage on the inbox_events table of a MySQL 8 database.
-type Mysql struct {
+// MySQL is a worker.InboxStorage on the inbox_events table of a MySQL 8 database.
+type MySQL struct {
 	db *sql.DB
 }
 
-// NewMysql returns an inbox storage using db, for forgo.WithProviders.
-func NewMysql(db *sql.DB) *Mysql {
-	return &Mysql{db: db}
+// NewMySQL returns an inbox storage using db, for forgo.WithProviders.
+func NewMySQL(db *sql.DB) *MySQL {
+	return &MySQL{db: db}
 }
 
-func (m *Mysql) Status(
+func (m *MySQL) Status(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -55,7 +55,7 @@ func (m *Mysql) Status(
 	return status, true, nil
 }
 
-func (m *Mysql) IncrementAttempt(
+func (m *MySQL) IncrementAttempt(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -154,7 +154,7 @@ func (m *Mysql) IncrementAttempt(
 	return attempts, nil
 }
 
-func (m *Mysql) MarkCompleted(
+func (m *MySQL) MarkCompleted(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -168,7 +168,7 @@ func (m *Mysql) MarkCompleted(
 	)
 }
 
-func (m *Mysql) MarkFailed(
+func (m *MySQL) MarkFailed(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -182,7 +182,7 @@ func (m *Mysql) MarkFailed(
 	)
 }
 
-func (m *Mysql) MarkRejected(
+func (m *MySQL) MarkRejected(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -196,7 +196,7 @@ func (m *Mysql) MarkRejected(
 	)
 }
 
-func (m *Mysql) markStatus(
+func (m *MySQL) markStatus(
 	ctx context.Context,
 	messageID string,
 	subscriberName string,
@@ -252,7 +252,7 @@ func (m *Mysql) markStatus(
 	return unmoved(current, exists, target, repeatable)
 }
 
-func (m *Mysql) DeleteBefore(
+func (m *MySQL) DeleteBefore(
 	ctx context.Context,
 	before time.Time,
 	limit int,

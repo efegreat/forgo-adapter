@@ -18,7 +18,7 @@ import (
 
 var (
 	_ worker.OutboxStorage = (*Postgres)(nil)
-	_ worker.OutboxStorage = (*Mysql)(nil)
+	_ worker.OutboxStorage = (*MySQL)(nil)
 )
 
 var (
@@ -129,27 +129,27 @@ func TestPostgresClaim(t *testing.T) {
 	assertClaimed(t, got)
 }
 
-func TestMysqlClaim(t *testing.T) {
+func TestMySQLClaim(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
 	mock.ExpectQuery(mysqlClaim).WithArgs(microsecondsAge(time.Minute), claim.Limit).WillReturnRows(claimedRows())
 	mock.ExpectExec(mysqlMark).WithArgs(claim.ID, "m1", "m2").WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
 
-	got, err := NewMysql(db).Claim(context.Background(), claimFor(time.Minute))
+	got, err := NewMySQL(db).Claim(context.Background(), claimFor(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertClaimed(t, got)
 }
 
-func TestMysqlClaimNothing(t *testing.T) {
+func TestMySQLClaimNothing(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
 	mock.ExpectQuery(mysqlClaim).WillReturnRows(sqlmock.NewRows(messageColumns))
 	mock.ExpectCommit() // no UPDATE without messages
 
-	got, err := NewMysql(db).Claim(context.Background(), claim)
+	got, err := NewMySQL(db).Claim(context.Background(), claim)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("Claim = %v, %v; want no messages", got, err)
 	}
@@ -194,7 +194,7 @@ func TestClaimFailureReleasesTheClaim(t *testing.T) {
 				m.ExpectExec(mysqlMark).WillReturnError(errors.New("deadlock"))
 				m.ExpectRollback()
 			},
-			claim: func(db *sql.DB) error { _, err := NewMysql(db).Claim(context.Background(), claim); return err },
+			claim: func(db *sql.DB) error { _, err := NewMySQL(db).Claim(context.Background(), claim); return err },
 			want:  "outbox: mark messages claimed: deadlock",
 		},
 	}
@@ -231,7 +231,7 @@ func TestComplete(t *testing.T) {
 		{
 			name: "mysql",
 			complete: func(db *sql.DB, ctx context.Context, ids []string) error {
-				return NewMysql(db).Complete(ctx, claim.ID, ids)
+				return NewMySQL(db).Complete(ctx, claim.ID, ids)
 			},
 			markDone: func(m sqlmock.Sqlmock, ids []string) {
 				m.ExpectExec(`SET\s+processed_at = \?,.+WHERE processing_id = \?.+AND id IN \(\?,\?\)`).
@@ -313,7 +313,7 @@ func TestDeleteProcessedBefore(t *testing.T) {
 			name:  "mysql",
 			query: `DELETE FROM outbox_events\s+WHERE processed_at IS NOT NULL\s+AND processed_at < \?.+LIMIT \?`,
 			delete: func(db *sql.DB) (int64, error) {
-				return NewMysql(db).DeleteProcessedBefore(context.Background(), before, 100)
+				return NewMySQL(db).DeleteProcessedBefore(context.Background(), before, 100)
 			},
 		},
 	}

@@ -65,25 +65,25 @@ func (s Config) New() (forgo.Resource, error) {
 		return nil, errors.Join(fmt.Errorf("sqldb: ping %s: %w", cfg.Name, err), db.Close())
 	}
 
-	return &SqlDB{
+	return &SQLDB{
 		name: cfg.Name,
 		db:   db,
 	}, nil
 }
 
-type SqlDB struct {
+type SQLDB struct {
 	name string
 	db   *sql.DB
 }
 
-func (s *SqlDB) Name() string {
+func (s *SQLDB) Name() string {
 	return s.name
 }
 
-func (s *SqlDB) Value() any {
+func (s *SQLDB) Value() any {
 	return s.db
 }
 
-func (s *SqlDB) Close() error {
+func (s *SQLDB) Close() error {
 	return s.db.Close()
 }

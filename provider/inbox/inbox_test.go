@@ -17,7 +17,7 @@ import (
 
 var (
 	_ worker.InboxStorage = (*Postgres)(nil)
-	_ worker.InboxStorage = (*Mysql)(nil)
+	_ worker.InboxStorage = (*MySQL)(nil)
 )
 
 const (
@@ -77,7 +77,7 @@ var dialects = []dialect{
 	},
 	{
 		name:    "mysql",
-		storage: func(db *sql.DB) worker.InboxStorage { return NewMysql(db) },
+		storage: func(db *sql.DB) worker.InboxStorage { return NewMySQL(db) },
 		expectMark: func(m sqlmock.Sqlmock, target worker.InboxStatus, moved bool) {
 			affected := int64(0)
 			if moved {
@@ -283,7 +283,7 @@ func TestPostgresIncrementAttempt(t *testing.T) {
 	}
 }
 
-func TestMysqlIncrementAttempt(t *testing.T) {
+func TestMySQLIncrementAttempt(t *testing.T) {
 	const (
 		lockRow = `SELECT\s+status,\s+attempts\s+FROM inbox_events\s+WHERE message_id = \?\s+AND subscriber_name = \?\s+FOR UPDATE`
 		insert  = `INSERT INTO inbox_events`
@@ -335,7 +335,7 @@ func TestMysqlIncrementAttempt(t *testing.T) {
 			db, mock := newMock(t)
 			tt.expect(mock)
 
-			got, err := NewMysql(db).IncrementAttempt(context.Background(), msgID, sub)
+			got, err := NewMySQL(db).IncrementAttempt(context.Background(), msgID, sub)
 			if !errors.Is(err, tt.wantErr) || (tt.wantErr == nil && err != nil) || got != tt.want {
 				t.Fatalf("IncrementAttempt = %d, %v; want %d, %v", got, err, tt.want, tt.wantErr)
 			}
@@ -343,7 +343,7 @@ func TestMysqlIncrementAttempt(t *testing.T) {
 	}
 }
 
-func TestMysqlIncrementAttemptJoinsTransaction(t *testing.T) {
+func TestMySQLIncrementAttemptJoinsTransaction(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT\s+status,\s+attempts`).WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}))
@@ -353,7 +353,7 @@ func TestMysqlIncrementAttemptJoinsTransaction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	err := sqltx.NewTransactor(db).Do(ctx, func(ctx context.Context) error {
-		_, err := NewMysql(db).IncrementAttempt(ctx, msgID, sub)
+		_, err := NewMySQL(db).IncrementAttempt(ctx, msgID, sub)
 		return err
 	})
 	if err != nil {

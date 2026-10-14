@@ -17,7 +17,7 @@ import (
 
 var (
 	_ forgo.LiveConfigStore = (*Postgres)(nil)
-	_ forgo.LiveConfigStore = (*Mysql)(nil)
+	_ forgo.LiveConfigStore = (*MySQL)(nil)
 	_ forgo.LiveConfigCache = (*RedisCache)(nil)
 )
 
@@ -94,7 +94,7 @@ var dialects = []dialect{
 	},
 	{
 		name:   "mysql",
-		store:  func(db *sql.DB) forgo.LiveConfigStore { return NewMysql(db) },
+		store:  func(db *sql.DB) forgo.LiveConfigStore { return NewMySQL(db) },
 		get:    `SELECT data, version FROM live_configs WHERE name = \?`,
 		insert: `INSERT INTO live_configs \(\s+name,\s+data,\s+version,\s+updated_at\s+\)\s+VALUES \(\?, \?, 1, UTC_TIMESTAMP\(6\)\)$`,
 		update: `UPDATE live_configs\s+SET\s+data = \?,\s+version = version \+ 1,\s+updated_at = UTC_TIMESTAMP\(6\)\s+WHERE name = \?\s+AND version = \?`,
