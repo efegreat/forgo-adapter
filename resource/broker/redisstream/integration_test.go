@@ -3,87 +3,36 @@ package redisstream
 import (
 	"context"
 	"errors"
-	"os"
 	"reflect"
-	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/efegreat/forgo-adapter/internal/redistest"
 	"github.com/efegreat/forgo-adapter/resource/redisdb"
 	"github.com/efegreat/forgo/server/worker"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// integrationEnv names the addresses of disposable Redis servers, separated by commas, such as
-// 127.0.0.1:6379,127.0.0.1:6380. The integration tests run against each of them and empty its
-// database. Without it, they skip.
-const integrationEnv = "ADAPTER_TEST_REDIS_ADDRS"
-
 // TestIntegrationBroker runs the broker against real Redis servers, for what the unit tests cannot
 // check on miniredis: approximate trimming, delivery counts, consumer idle times, and claims,
 // delayed retries, the heartbeat and the sweep on the real clock.
 func TestIntegrationBroker(t *testing.T) {
-	addrs := os.Getenv(integrationEnv)
-	if addrs == "" {
-		t.Skip("set " + integrationEnv + " to run against disposable Redis servers")
-	}
-	for addr := range strings.SplitSeq(addrs, ",") {
-		t.Run(addr, func(t *testing.T) {
-			integration(t, strings.TrimSpace(addr))
-		})
-	}
+	redistest.Run(t, redistest.DBRedisStream, integration)
 }
 
-// live connects to the Redis server at addr and empties its database, before the test and after it.
-func live(t *testing.T, addr string) (*redis.Client, Config) {
+// live opens the database of srv, emptied, and a config that connects the broker to it.
+func live(t *testing.T, srv redistest.Server) (*redis.Client, Config) {
 	t.Helper()
-	cl := redis.NewClient(&redis.Options{Addr: addr})
-	ctx := context.Background()
-	if err := cl.FlushDB(ctx).Err(); err != nil {
-		_ = cl.Close()
-		t.Fatalf("flush %s: %v", addr, err)
-	}
-	t.Cleanup(func() {
-		if err := cl.FlushDB(ctx).Err(); err != nil {
-			t.Errorf("flush %s: %v", addr, err)
-		}
-		_ = cl.Close()
-	})
-	return cl, Config{Name: "events", Redis: redisdb.Config{Addrs: []string{addr}}}
+	return redistest.Open(t, srv), Config{Name: "events", Redis: redisdb.Config{Addrs: []string{srv.Addr}, DB: srv.DB}}
 }
 
-// atLeast reports whether the server of cl runs Redis major.minor or newer.
-func atLeast(t *testing.T, cl *redis.Client, major, minor int) bool {
-	t.Helper()
-	info, err := cl.Info(context.Background(), "server").Result()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for line := range strings.Lines(info) {
-		v, ok := strings.CutPrefix(strings.TrimSpace(line), "redis_version:")
-		if !ok {
-			continue
-		}
-		var got [2]int
-		for i, part := range strings.SplitN(v, ".", 3)[:2] {
-			if got[i], err = strconv.Atoi(part); err != nil {
-				t.Fatalf("redis_version %q: %v", v, err)
-			}
-		}
-		return got[0] > major || got[0] == major && got[1] >= minor
-	}
-	t.Fatal("INFO server has no redis_version")
-	return false
-}
-
-func integration(t *testing.T, addr string) {
+func integration(t *testing.T, srv redistest.Server) {
 	ctx := context.Background()
 
 	t.Run("declare", func(t *testing.T) {
-		cl, cfg := live(t, addr)
+		cl, cfg := live(t, srv)
 		for range 2 {
 			if err := cl.XAdd(ctx, &redis.XAddArgs{Stream: "orders", Values: []string{PayloadField, "{}"}}).Err(); err != nil {
 				t.Fatal(err)
@@ -117,7 +66,7 @@ func integration(t *testing.T, addr string) {
 	})
 
 	t.Run("trims about MaxLen", func(t *testing.T) {
-		cl, cfg := live(t, addr)
+		cl, cfg := live(t, srv)
 		cfg.Streams = []StreamConfig{{Name: "orders", MaxLen: 10}}
 		b := open(t, cfg)
 		const added = 300
@@ -131,7 +80,7 @@ func integration(t *testing.T, addr string) {
 	})
 
 	t.Run("consume and complete", func(t *testing.T) {
-		cl, cfg := live(t, addr)
+		cl, cfg := live(t, srv)
 		b := open(t, topology(cfg, SubscriberConfig{}))
 		msg := worker.NewMessage("order.placed", "order-1", "orders", []byte(`{"id":1}`))
 		msg.Headers.Set("tenant", "acme")
@@ -156,7 +105,7 @@ func integration(t *testing.T, addr string) {
 	})
 
 	t.Run("retry after the delay", func(t *testing.T) {
-		cl, cfg := live(t, addr)
+		cl, cfg := live(t, srv)
 		const delay = 300 * time.Millisecond
 		b := open(t, topology(cfg, SubscriberConfig{ClaimIdle: time.Second, Retry: RetryConfig{Initial: delay}}))
 		msg := worker.NewMessage("order.placed", "", "orders", nil)
@@ -184,7 +133,7 @@ func integration(t *testing.T, addr string) {
 	})
 
 	t.Run("claim and heartbeat", func(t *testing.T) {
-		cl, cfg := live(t, addr)
+		cl, cfg := live(t, srv)
 		b := open(t, topology(cfg, SubscriberConfig{ClaimIdle: time.Second}))
 		msg := worker.NewMessage("order.placed", "", "orders", nil)
 		publish(t, b, msg)
@@ -226,7 +175,7 @@ func integration(t *testing.T, addr string) {
 	})
 
 	t.Run("dead letter", func(t *testing.T) {
-		cl, cfg := live(t, addr)
+		cl, cfg := live(t, srv)
 		b := open(t, topology(cfg, SubscriberConfig{DeadLetter: DeadLetterConfig{Enabled: true}}))
 		msg := worker.NewMessage("order.placed", "", "orders", []byte("{}"))
 		publish(t, b, msg)
@@ -249,7 +198,7 @@ func integration(t *testing.T, addr string) {
 	})
 
 	t.Run("sweep", func(t *testing.T) {
-		cl, cfg := live(t, addr)
+		cl, cfg := live(t, srv)
 		b := open(t, topology(cfg, SubscriberConfig{}))
 		publish(t, b, worker.NewMessage("order.placed", "", "orders", nil))
 		// Consumers of instances that crashed, one of them while it held an entry. Redis records
@@ -278,7 +227,7 @@ func integration(t *testing.T, addr string) {
 		// Since Redis 7.2, the reads and claims of the live consumers keep them active, so no
 		// sweep finds them idle. Before, only the entries they get do, and on a quiet group each
 		// subscriber sweeps the consumer of the other.
-		if atLeast(t, cl, 7, 2) {
+		if redistest.AtLeast(t, cl, 7, 2) {
 			want[subs[0].consumer], want[subs[1].consumer] = 0, 0
 		}
 		if got := consumers(t, cl); !reflect.DeepEqual(got, want) {
