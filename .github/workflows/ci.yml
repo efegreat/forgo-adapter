@@ -55,10 +55,28 @@ jobs:
           --health-interval 5s
           --health-timeout 10s
           --health-retries 30
+      # The newest Redis, and the oldest the Redis Streams broker supports.
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      redis-min:
+        image: redis:6.2
+        ports: ["6380:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     env:
       ADAPTER_TEST_POSTGRES_DSN: postgres://postgres:forgo@127.0.0.1:5432/postgres?sslmode=disable
       ADAPTER_TEST_MYSQL_DSN: root:forgo@tcp(127.0.0.1:3306)/forgo
       ADAPTER_TEST_RABBITMQ_URL: amqp://forgo:forgo@127.0.0.1:5672/
+      ADAPTER_TEST_REDIS_ADDRS: 127.0.0.1:6379,127.0.0.1:6380
     defaults:
       run:
         working-directory: forgo-adapter
