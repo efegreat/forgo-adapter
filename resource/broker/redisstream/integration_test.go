@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +53,30 @@ func live(t *testing.T, addr string) (*redis.Client, Config) {
 		_ = cl.Close()
 	})
 	return cl, Config{Name: "events", Redis: redisdb.Config{Addrs: []string{addr}}}
+}
+
+// atLeast reports whether the server of cl runs Redis major.minor or newer.
+func atLeast(t *testing.T, cl *redis.Client, major, minor int) bool {
+	t.Helper()
+	info, err := cl.Info(context.Background(), "server").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.Lines(info) {
+		v, ok := strings.CutPrefix(strings.TrimSpace(line), "redis_version:")
+		if !ok {
+			continue
+		}
+		var got [2]int
+		for i, part := range strings.SplitN(v, ".", 3)[:2] {
+			if got[i], err = strconv.Atoi(part); err != nil {
+				t.Fatalf("redis_version %q: %v", v, err)
+			}
+		}
+		return got[0] > major || got[0] == major && got[1] >= minor
+	}
+	t.Fatal("INFO server has no redis_version")
+	return false
 }
 
 func integration(t *testing.T, addr string) {
@@ -247,12 +272,23 @@ func integration(t *testing.T, addr string) {
 			_, found := consumers(t, cl)["crashed"]
 			return !found
 		})
-		// The live consumers read and claim all along, so no sweep finds them idle. ClaimIdle is a
-		// minute, so the entry of holding stays where it is, and holding with it.
+		// ClaimIdle is a minute, so the entry of holding stays where it is, and holding with it.
 		time.Sleep(time.Second)
-		want := map[string]int64{subs[0].consumer: 0, subs[1].consumer: 0, "holding": 1}
+		want := map[string]int64{"holding": 1}
+		// Since Redis 7.2, the reads and claims of the live consumers keep them active, so no
+		// sweep finds them idle. Before, only the entries they get do, and on a quiet group each
+		// subscriber sweeps the consumer of the other.
+		if atLeast(t, cl, 7, 2) {
+			want[subs[0].consumer], want[subs[1].consumer] = 0, 0
+		}
 		if got := consumers(t, cl); !reflect.DeepEqual(got, want) {
 			t.Fatalf("consumers = %v, want %v", got, want)
 		}
+		// A live consumer gets its next entry, deleted or not.
+		publish(t, b, worker.NewMessage("order.placed", "", "orders", nil))
+		eventually(t, "the next entry", func() bool {
+			got := consumers(t, cl)
+			return got[subs[0].consumer]+got[subs[1].consumer] == 1
+		})
 	})
 }

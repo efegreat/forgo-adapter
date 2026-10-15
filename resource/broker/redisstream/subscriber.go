@@ -25,8 +25,10 @@ const (
 	// sweepInterval is the pause between two sweeps of the stale consumers of a group.
 	sweepInterval = 5 * time.Minute
 	// staleIdle is how many times ClaimIdle a consumer without pending entries stays idle before a
-	// sweep deletes it. A live consumer claims about once a second, or holds the entries it
-	// handles, so it is never stale.
+	// sweep deletes it. Since Redis 7.2, a live consumer is never that idle: it claims about once a
+	// second, or holds the entries it handles. Before, only the entries it gets reset its idle
+	// time, so the live consumers of a quiet group are deleted too, and come back with their next
+	// entry.
 	staleIdle = 10
 
 	// retryConsumer owns the entries that wait for a retry.
@@ -172,8 +174,9 @@ func (s *subscriber) Close() error {
 // sweep deletes the consumers of the group that have no pending entries and were idle for
 // staleAfter, such as those of instances that crashed before Close could delete them. It keeps its
 // own consumer and the retry consumer. Deleting a consumer that is still alive is harmless: Redis
-// creates it again on its next read or claim. Every deletion goes through delConsumerScript, so a
-// consumer that took entries since XINFO is kept. A failed sweep is left to the next one.
+// creates it again with the next entry it reads or claims. Every deletion goes through
+// delConsumerScript, so a consumer that took entries since XINFO is kept. A failed sweep is left
+// to the next one.
 func (s *subscriber) sweep(ctx context.Context) {
 	info, err := s.client.XInfoConsumers(ctx, s.conf.Stream, s.conf.Group).Result()
 	if err != nil {
