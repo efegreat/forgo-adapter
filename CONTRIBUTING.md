@@ -6,7 +6,7 @@
 
 ## Making a change
 
-[AGENTS.md](AGENTS.md) is the contributor guide: the repository map, the invariants of resources, brokers and storages, the coding conventions and the checklists for new resources, providers and brokers. Tests must not need running infrastructure: use miniredis, sqlmock, fakes of the client interfaces and `pstest`. The integration tests, which run against PostgreSQL, MySQL and RabbitMQ when their URLs are set, skip without them, and CI runs them.
+[AGENTS.md](AGENTS.md) is the contributor guide: the repository map, the invariants of resources, brokers and storages, the coding conventions and the checklists for new resources, providers and brokers. Tests must not need running infrastructure: use miniredis, sqlmock, fakes of the client interfaces and `pstest`. The integration tests, which run against PostgreSQL, MySQL, RabbitMQ and Redis when their URLs or addresses are set, skip without them, and CI runs them.
 
 Before you open a pull request, run:
 
