@@ -43,7 +43,7 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `inbox` | `github.com/efegreat/forgo-adapter/provider/inbox` | provider | `*Postgres`, `*MySQL` → `worker.InboxStorage` | `*sql.DB` |
 | `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*MySQL` → `worker.OutboxStorage` | `*sql.DB` |
 | `locker` | `github.com/efegreat/forgo-adapter/provider/locker` | provider | `*Redis` → `operation.ILocker` | `redis.UniversalClient` |
-| `ratelimit` | `github.com/efegreat/forgo-adapter/provider/ratelimit` | provider | `*Redis` → `http.IRateLimiter` | `redis.UniversalClient` |
+| `ratelimit` | `github.com/efegreat/forgo-adapter/provider/ratelimit` | provider | `*Redis` → `ratelimit.ILimiter` | `redis.UniversalClient` |
 | `liveconfig` | `github.com/efegreat/forgo-adapter/provider/liveconfig` | provider | `*Postgres`, `*MySQL` → `forgo.LiveConfigStore`; `*RedisCache` → `forgo.LiveConfigCache` | `*sql.DB`; `redis.UniversalClient` |
 
 `redis` in this document is `github.com/redis/go-redis/v9`, `amqp` is `github.com/rabbitmq/amqp091-go`, and `option` is `google.golang.org/api/option`.
@@ -911,7 +911,7 @@ Keys are used as given. forgo builds them from your `Lock.Key`, for example `<Ke
 
 ### ratelimit
 
-`ratelimit.Redis` is an `http.IRateLimiter`. Use it with `http.RateLimitWith` to enforce a rate limit across every instance of your API (see [Rate limiting](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#rate-limiting)).
+`ratelimit.Redis` is a forgo `ratelimit.ILimiter`. Use it with the `RateLimitWith` middleware of the HTTP or the gRPC server to enforce a rate limit across every instance of your application (see [Rate limiting](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#rate-limiting)).
 
 ```go
 import "github.com/efegreat/forgo-adapter/provider/ratelimit"
@@ -921,16 +921,18 @@ forgo.WithProviders(ratelimit.NewRedis),
 
 // on a route or the server
 forgo.MiddlewareAs(http.RateLimitWith(http.RateLimitConfig{Limit: 5, Period: time.Minute, Prefix: "login:"}))
+// on a gRPC service or method
+forgo.MiddlewareAs(fgrpc.RateLimitWith(fgrpc.RateLimitConfig{Limit: 100, Period: time.Minute, Prefix: "grpc:"}))
 ```
 
-It implements the generic cell rate algorithm (GCRA), the algorithm of `http.MemoryRateLimiter`, so a `Rate` means the same with either limiter: `Limit` requests per `Period`, up to `Burst` at once, refilled continuously.
+It implements the generic cell rate algorithm (GCRA), the algorithm of forgo's `ratelimit.Memory`, so a `Rate` means the same with either limiter: `Limit` requests per `Period`, up to `Burst` at once, refilled continuously.
 
 - **Atomic.** Each `Allow` is one Lua script that reads and writes a single key, so concurrent requests from any number of instances are counted exactly. It works on Redis Cluster.
 - **One clock.** Time comes from the Redis server's `TIME`, so clock skew between app instances does not change the limit.
 - **Small.** A key stores one timestamp and expires when its burst has fully recovered.
 - **Keys.** Stored as `ratelimit:<Prefix><key>` (`ratelimit.KeyPrefix`). Give every `RateLimitWith` middleware its own `Prefix`.
 - **Resolution.** Microseconds. Rates above one request per microsecond per key are counted as one per microsecond.
-- **Failures.** A Redis error is returned to the middleware. By default the request fails with `rate_limit_unavailable` (503). With `RateLimitConfig.FailOpen` it is admitted and the failure is logged.
+- **Failures.** A Redis error is returned to the middleware. By default the request fails with `rate_limit_unavailable` (503 over HTTP, `Unavailable` over gRPC). With `RateLimitConfig.FailOpen` it is admitted and the failure is logged.
 
 ### liveconfig
 

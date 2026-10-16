@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/efegreat/forgo/server/http"
+	"github.com/efegreat/forgo/ratelimit"
 
 	"github.com/efegreat/forgo-adapter/internal/redistest"
 )
@@ -20,7 +20,7 @@ func TestIntegrationRedis(t *testing.T) {
 		cl := redistest.Open(t, srv)
 		l := NewRedis(cl)
 		ctx := context.Background()
-		allow := func(t *testing.T, key string, rate http.Rate) http.RateLimitResult {
+		allow := func(t *testing.T, key string, rate ratelimit.Rate) ratelimit.Result {
 			t.Helper()
 			res, err := l.Allow(ctx, key, rate)
 			if err != nil {
@@ -31,7 +31,7 @@ func TestIntegrationRedis(t *testing.T) {
 
 		t.Run("burst, reject, refill", func(t *testing.T) {
 			const emission = 200 * time.Millisecond
-			rate := http.Rate{Limit: 2, Period: 2 * emission}
+			rate := ratelimit.Rate{Limit: 2, Period: 2 * emission}
 			if res := allow(t, "client", rate); !res.Allowed || res.Remaining != 1 || res.ResetAfter != emission {
 				t.Fatalf("first request = %+v, want allowed with 1 remaining, reset after %s", res, emission)
 			}
@@ -52,7 +52,7 @@ func TestIntegrationRedis(t *testing.T) {
 		})
 
 		t.Run("key expires once recovered", func(t *testing.T) {
-			allow(t, "recovering", http.Rate{Limit: 1, Period: 100 * time.Millisecond})
+			allow(t, "recovering", ratelimit.Rate{Limit: 1, Period: 100 * time.Millisecond})
 			time.Sleep(150 * time.Millisecond)
 			if n := cl.Exists(ctx, KeyPrefix+"recovering").Val(); n != 0 {
 				t.Fatal("the key outlived its burst")
@@ -60,7 +60,7 @@ func TestIntegrationRedis(t *testing.T) {
 		})
 
 		t.Run("concurrent requests", func(t *testing.T) {
-			rate := http.Rate{Limit: 10, Period: time.Minute}
+			rate := ratelimit.Rate{Limit: 10, Period: time.Minute}
 			var wg sync.WaitGroup
 			var allowed atomic.Int32
 			for range 50 {
