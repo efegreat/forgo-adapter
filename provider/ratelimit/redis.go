@@ -1,5 +1,5 @@
-// Package ratelimit implements http.IRateLimiter on Redis, so that the limits of http.RateLimitWith hold
-// across every instance of an application.
+// Package ratelimit implements forgo's ratelimit.ILimiter on Redis, so that the limits of the servers'
+// RateLimitWith middlewares hold across every instance of an application.
 package ratelimit
 
 import (
@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/efegreat/forgo/server/http"
+	"github.com/efegreat/forgo/ratelimit"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -20,7 +20,7 @@ var errInvalidRate = errors.New("ratelimit: limit and period must be positive")
 
 // allowScript runs the generic cell rate algorithm (GCRA) atomically on the stored theoretical
 // arrival time (TAT) of the next request, in microseconds. It is the algorithm of
-// http.MemoryRateLimiter, so a limit means the same with either limiter.
+// forgo's ratelimit.Memory, so a limit means the same with either limiter.
 //
 // The clock is the Redis server's TIME, so every application instance sees the same time
 // regardless of clock skew between them. The key expires once its burst has fully recovered,
@@ -54,8 +54,9 @@ redis.call('SET', KEYS[1], string.format('%.0f', next_tat), 'PX', math.ceil(rese
 return {1, math.floor(diff / emission), 0, reset}
 `)
 
-// Redis is an http.IRateLimiter that counts in Redis, so a limit holds across every instance of
-// the application. Each key stores a single timestamp. Use it with http.RateLimitWith.
+// Redis is a forgo ratelimit.ILimiter that counts in Redis, so a limit holds across every instance of
+// the application. Each key stores a single timestamp. Use it with the RateLimitWith middleware of the
+// HTTP or the gRPC server.
 type Redis struct {
 	cl redis.UniversalClient
 }
@@ -66,10 +67,10 @@ func NewRedis(cl redis.UniversalClient) *Redis {
 }
 
 // Allow counts a request under key at rate, in one script on Redis. When Redis fails, Allow returns the
-// error, and http.RateLimitConfig.FailOpen decides whether the request is admitted.
-func (r *Redis) Allow(ctx context.Context, key string, rate http.Rate) (http.RateLimitResult, error) {
+// error, and the FailOpen of the middleware's config decides whether the request is admitted.
+func (r *Redis) Allow(ctx context.Context, key string, rate ratelimit.Rate) (ratelimit.Result, error) {
 	if rate.Limit <= 0 || rate.Period <= 0 {
-		return http.RateLimitResult{}, errInvalidRate
+		return ratelimit.Result{}, errInvalidRate
 	}
 	burst := rate.Burst
 	if burst <= 0 {
@@ -82,13 +83,13 @@ func (r *Redis) Allow(ctx context.Context, key string, rate http.Rate) (http.Rat
 
 	res, err := allowScript.Run(ctx, r.cl, []string{KeyPrefix + key}, emission, burstOffset).Int64Slice()
 	if err != nil {
-		return http.RateLimitResult{}, fmt.Errorf("ratelimit: allow: %w", err)
+		return ratelimit.Result{}, fmt.Errorf("ratelimit: allow: %w", err)
 	}
 	if len(res) != 4 {
-		return http.RateLimitResult{}, fmt.Errorf("ratelimit: allow: unexpected reply %v", res)
+		return ratelimit.Result{}, fmt.Errorf("ratelimit: allow: unexpected reply %v", res)
 	}
 
-	return http.RateLimitResult{
+	return ratelimit.Result{
 		Allowed:    res[0] == 1,
 		Remaining:  int(res[1]),
 		RetryAfter: time.Duration(res[2]) * time.Microsecond,

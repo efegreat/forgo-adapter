@@ -7,7 +7,7 @@
 [![Go 1.27+](https://img.shields.io/badge/go-1.27%2B-00ADD8)](https://go.dev/dl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-[Forgo](https://github.com/efegreat/forgo) defines contracts such as `worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `http.IRateLimiter`, `forgo.LiveConfigStore` and `forgo.LiveConfigCache`, and never depends on a concrete database, broker or cache. This library implements those contracts for common infrastructure. Resources are config values, and providers are constructors you hand to the bootstrap.
+[Forgo](https://github.com/efegreat/forgo) defines contracts such as `worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `ratelimit.ILimiter`, `forgo.LiveConfigStore` and `forgo.LiveConfigCache`, and never depends on a concrete database, broker or cache. This library implements those contracts for common infrastructure. Resources are config values, and providers are constructors you hand to the bootstrap.
 
 ```go
 app := forgo.NewApp(
@@ -33,7 +33,7 @@ app := forgo.NewApp(
 		inbox.NewPostgres,   // worker.InboxStorage
 		outbox.NewPostgres,  // worker.OutboxStorage
 		locker.NewRedis,     // operation.ILocker
-		ratelimit.NewRedis,  // http.IRateLimiter
+		ratelimit.NewRedis,  // forgo ratelimit.ILimiter
 	),
 	forgo.WithServers(config.Consumer, config.Producer),
 )
@@ -55,7 +55,7 @@ if err := app.Run(); err != nil { // logged; main picks the exit code
 | `provider/inbox` | provider | `worker.InboxStorage` | PostgreSQL, MySQL 8 |
 | `provider/outbox` | provider | `worker.OutboxStorage` | PostgreSQL, MySQL 8 |
 | `provider/locker` | provider | `operation.ILocker` | Redis |
-| `provider/ratelimit` | provider | `http.IRateLimiter` | Redis, GCRA |
+| `provider/ratelimit` | provider | `ratelimit.ILimiter` | Redis, GCRA |
 | `provider/liveconfig` | provider | `forgo.LiveConfigStore`, `forgo.LiveConfigCache` | PostgreSQL, MySQL 8; Redis |
 
 - **Configure, don't wire.** Every resource is a plain config value whose zero fields mean "use the default". Every provider is a constructor that the bootstrap calls with the resources it needs.
