@@ -18,6 +18,9 @@ The complete guide to the forgo adapter library. New here? Start with the [READM
   - [locker](#locker)
   - [ratelimit](#ratelimit)
   - [liveconfig](#liveconfig)
+- [Metrics (OpenTelemetry)](#metrics-opentelemetry)
+  - [meter](#meter)
+  - [observer](#observer)
 - [A complete worker app](#a-complete-worker-app)
 - [Errors](#errors)
 
@@ -45,6 +48,8 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `locker` | `github.com/efegreat/forgo-adapter/provider/locker` | provider | `*Redis` → `operation.ILocker` | `redis.UniversalClient` |
 | `ratelimit` | `github.com/efegreat/forgo-adapter/provider/ratelimit` | provider | `*Redis` → `ratelimit.ILimiter` | `redis.UniversalClient` |
 | `liveconfig` | `github.com/efegreat/forgo-adapter/provider/liveconfig` | provider | `*Postgres`, `*MySQL` → `forgo.LiveConfigStore`; `*RedisCache` → `forgo.LiveConfigCache` | `*sql.DB`; `redis.UniversalClient` |
+| `meter` | `github.com/efegreat/forgo-adapter/otel/meter` (module `…/otel`) | resource | `*meter.Provider` → `metric.MeterProvider` | |
+| `observer` | `github.com/efegreat/forgo-adapter/otel/observer` (module `…/otel`) | provider | `operation.IObserver` | `metric.MeterProvider` |
 
 `redis` in this document is `github.com/redis/go-redis/v9`, `amqp` is `github.com/rabbitmq/amqp091-go`, and `option` is `google.golang.org/api/option`.
 
@@ -57,6 +62,8 @@ Go 1.27 or newer.
 ```sh
 go get github.com/efegreat/forgo-adapter
 ```
+
+The OpenTelemetry metrics are a module of their own, `github.com/efegreat/forgo-adapter/otel`. See [Metrics](#metrics-opentelemetry).
 
 ---
 
@@ -965,6 +972,114 @@ forgo.WithProviders(
 
 ---
 
+## Metrics (OpenTelemetry)
+
+The metrics of forgo applications live in a module of their own, `github.com/efegreat/forgo-adapter/otel`, so that the other adapters never pull in OpenTelemetry's SDK, its exporters or the Prometheus client:
+
+```sh
+go get github.com/efegreat/forgo-adapter/otel
+```
+
+It has two packages: `meter`, a resource that builds OpenTelemetry's `MeterProvider`, and `observer`, the [`operation.IObserver`](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#metrics) that records forgo's metrics with it. List both, and every server records metrics:
+
+```go
+import (
+	"github.com/efegreat/forgo-adapter/otel/meter"
+	"github.com/efegreat/forgo-adapter/otel/observer"
+)
+
+app := forgo.NewApp(
+	forgo.WithResources(meter.Config{ServiceName: "orders"}),
+	forgo.WithProviders(observer.New(observer.Config{})),
+	forgo.WithServers(config.HTTP, config.GRPC, config.Consumer),
+)
+```
+
+### meter
+
+`meter.Config` is a resource whose `Value` is a `*meter.Provider`, the SDK's `MeterProvider`. Providers request it as `metric.MeterProvider` (`go.opentelemetry.io/otel/metric`), as `observer.New` does. The zero value pushes to the OpenTelemetry collector that the standard `OTEL_EXPORTER_OTLP_*` environment variables name, every minute.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `Name` | `"meter"` | The resource's name in the bootstrap. |
+| `ServiceName` | `OTEL_SERVICE_NAME`, else the SDK's `unknown_service:<executable>` | The `service.name` of the metrics. The other resource attributes come from `OTEL_RESOURCE_ATTRIBUTES`. |
+| `Exporter` | `meter.ExporterOTLP` | How metrics leave the process: `ExporterOTLP` pushes, `ExporterPrometheus` serves them to Prometheus through `meter.PrometheusRoute`, and `ExporterNone` exports only through `Readers`. |
+| `OTLP.Protocol` | `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` or `OTEL_EXPORTER_OTLP_PROTOCOL`, else `meter.OTLPHTTP` | `OTLPHTTP` (`http/protobuf`, port 4318) or `OTLPGRPC` (`grpc`, port 4317). |
+| `OTLP.Endpoint` | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`, else localhost | The collector's `host:port`. |
+| `OTLP.Insecure` | `false` | Sends without TLS. |
+| `OTLP.Headers` | | Headers of every export, such as an API key. |
+| `OTLP.Interval` | `OTEL_METRIC_EXPORT_INTERVAL`, else 1 minute | The time between two exports. |
+| `Readers` | | Readers besides the exporter's, such as an `sdkmetric.ManualReader` in tests, or an exporter of your own with `ExporterNone`. |
+| `DisableRuntime` | `false` | Leaves out the Go runtime metrics (`go.memory.used`, `go.goroutine.count`, …) of OpenTelemetry's runtime instrumentation. |
+| `Global` | `false` | Makes the provider OpenTelemetry's global `MeterProvider`, for libraries that take it from there, such as otelgrpc's stats handler in the `StatsHandlers` of the gRPC server's config. |
+| `ShutdownTimeout` | 5 seconds | Bounds the last export of `Close`. |
+
+- **The collector may be down.** The OTLP exporter connects lazily, so an unreachable collector does not stop the application. Failed exports go to OpenTelemetry's error handler, which logs them to stderr unless you call `otel.SetErrorHandler`.
+- **The last metrics are exported.** `Close` shuts the provider down, which exports what was recorded since the last export. The app closes resources once every server stopped, so the last operations are in it. A `Close` whose export fails returns the error, and the app logs it.
+
+#### Prometheus
+
+With `Exporter: meter.ExporterPrometheus`, Prometheus pulls the metrics from the route `meter.PrometheusRoute()` returns: `GET /metrics`, named `metrics`, in Prometheus's text format. Its scrapes are not logged (`ArgKeyRecorderDisabled`) and it is left out of API documents (`DisableAPIDoc`). Without the Prometheus exporter, the server that routes it fails at startup.
+
+```go
+var Admin = http.Config{
+	Addr:   ":9100", // a port of its own, which the cluster does not expose
+	Routes: []http.RouteConfig{meter.PrometheusRoute(), {Name: "health", Method: "GET", Path: "/health", Handler: http.HealthHandler()}},
+}
+
+forgo.WithResources(meter.Config{Exporter: meter.ExporterPrometheus}),
+forgo.WithServers(config.API, Admin),
+```
+
+Metric names follow Prometheus's conventions: `forgo.operation.duration` is served as `forgo_operation_duration_seconds`, and attributes as labels with underscores.
+
+#### Business metrics
+
+Services record their own metrics with the same provider, which the bootstrap gives their constructors:
+
+```go
+func NewOrderService(mp metric.MeterProvider, repo OrderRepository) (*OrderService, error) {
+	placed, err := mp.Meter("orders").Int64Counter("orders.placed", metric.WithUnit("{order}"))
+	if err != nil {
+		return nil, err
+	}
+	return &OrderService{repo: repo, placed: placed}, nil
+}
+```
+
+### observer
+
+`observer.New(cfg)` returns the provider of the observer, a `func(metric.MeterProvider) (operation.IObserver, error)`. Every forgo server picks it up. It also implements the interfaces of the [signals outside operations](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#signals-outside-operations): `worker.IDeliveryObserver`, `worker.IRelayObserver`, `operation.ILockObserver` and `transport.IConnObserverFactory`. A config it rejects fails the bootstrap.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `Buckets` | 5 ms to 10 s, the HTTP semantic conventions' | Boundaries, in seconds, of `forgo.operation.duration`, `http.server.request.duration` and `forgo.outbox.batch.duration`. They must increase strictly. |
+| `LagBuckets` | 5 ms to 1 h | Boundaries, in seconds, of `forgo.message.lag`. |
+| `DisableHTTPSemconv` | `false` | Leaves out `http.server.request.duration`. |
+| `ConnIO` | `false` | Also counts the read and write errors of connections. It wraps every connection, which hides the zero-copy paths of `*net.TCPConn`. |
+
+| Instrument | Kind | Attributes |
+| --- | --- | --- |
+| `forgo.operation.duration` | histogram (s) | `forgo.operation.type`, `forgo.operation.name`, `forgo.operation.status` (`ok`, or the `operation.Status` of the error, such as `not_found`) and, for failures, `forgo.error.code`. The same on every transport. Its count is the number of operations. |
+| `forgo.operation.active` | up-down counter | `forgo.operation.type`, `forgo.operation.name` |
+| `http.server.request.duration` | histogram (s) | The stable HTTP semantic conventions: `http.request.method` (`_OTHER` for unknown methods), `url.scheme`, `http.response.status_code`, `http.route` (the route's path template, none for `not_found`), `network.protocol.version`, and `error.type` for a 5xx. A hijacked connection is left out. |
+| `forgo.message.settled` | counter | `forgo.subscriber`, `forgo.operation.name`, `forgo.settlement.kind` (`completed`, `retried`, `rejected`), `forgo.settlement.duplicate`, `forgo.settlement.failed` (the broker did not take it) |
+| `forgo.message.lag` | histogram (s) | `forgo.subscriber`, `forgo.operation.name`. The time from a message's creation to the start of its handling, for messages whose producer sent it. |
+| `forgo.outbox.published`, `forgo.outbox.failed` | counters | none. Failed messages go back to the outbox. |
+| `forgo.outbox.batch.duration` | histogram (s) | `forgo.outbox.batch.failed`. Every batch is recorded, the empty ones included, so its count is the relay's heartbeat. |
+| `forgo.lock.held`, `forgo.lock.failed` | counters | `forgo.operation.type`, `forgo.operation.name`. Never the lock key, which can hold a message ID. |
+| `forgo.conn.accept_errors` | counter | `forgo.server.name`, `forgo.server.address` |
+| `forgo.conn.opened` | counter | `forgo.server.name`, `forgo.server.address`. Its rate is the connection churn. |
+| `forgo.conn.open` | up-down counter | `forgo.server.name`, `forgo.server.address`, `forgo.conn.state`: `new`, `active`, `idle` or `hijacked` on HTTP, `open` on gRPC |
+| `forgo.conn.io_errors` | counter | `forgo.server.name`, `forgo.server.address`, `forgo.conn.direction` (`read`, `write`). With `ConnIO` only. |
+
+- **No request counter.** A histogram's count is the number of operations, with the same labels.
+- **gRPC's semantic conventions** come from otelgrpc's stats handler in the gRPC server's `StatsHandlers`, with `meter.Config.Global` so that it records with this provider. The observer does not record them again.
+- **Bounded labels.** Every attribute comes from configuration (route, job, handler, command and subscriber names, addresses) or from bounded sets (statuses, error codes, settlement kinds, HTTP methods and status codes). Nothing is labelled by an ID, a path or a message name a producer chose.
+- **No allocation.** The observer builds the attribute set of a label combination once and reuses it, so recording an operation allocates nothing once its labels were seen.
+
+---
+
 ## A complete worker app
 
 ```go
@@ -1045,3 +1160,5 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | `locker:` | A TTL that is not positive, and Redis errors. `locker.ErrNotHeld` from `Unlock`. |
 | `ratelimit:` | An invalid `Rate` and Redis errors. |
 | `liveconfig:` | Live config queries and Redis errors. Conflicting saves return forgo's `forgo.ErrLiveConfigConflict`. |
+| `meter:` | Validation (an unknown exporter or OTLP protocol, `ExporterNone` without `Readers`, negative durations), building the exporter or the runtime metrics, `PrometheusRoute` without `ExporterPrometheus`, and the last export of `Close`. |
+| `observer:` | Boundaries that do not increase, a nil `MeterProvider`, and creating the instruments. |

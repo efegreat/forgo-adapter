@@ -3,7 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # v* releases the root module, otel/v* the nested OpenTelemetry module.
+    tags: ["v*", "otel/v*"]
   pull_request:
   # Weekly, so that a vulnerability found since the last push fails the build.
   schedule:
@@ -139,6 +140,68 @@ jobs:
       - name: Test with race detector
         run: go test -race ./...
 
+  # The nested OpenTelemetry module, which has a go.mod of its own and needs none of the services.
+  otel:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: forgo-adapter/otel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: forgo-adapter
+          persist-credentials: false
+
+      # Until forgo is released, go.mod replaces it with a checkout next to forgo-adapter.
+      - name: Check for a local forgo
+        id: forgo
+        run: |
+          if grep -q '=> ../../forgo$' go.mod; then
+            echo "local=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out forgo
+        if: steps.forgo.outputs.local == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: efegreat/forgo
+          path: forgo
+          token: ${{ secrets.FORGO_TOKEN || github.token }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: forgo-adapter/otel/go.mod
+          cache-dependency-path: forgo-adapter/otel/go.sum
+          check-latest: true
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: go mod tidy -diff
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: Govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
   # Pushing a v* tag releases it once every check passes on the tagged commit.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -175,3 +238,37 @@ jobs:
       - name: Publish the version to the Go module proxy
         if: ${{ !github.event.repository.private }}
         run: curl -fsS "https://proxy.golang.org/github.com/efegreat/forgo-adapter/@v/$TAG.info"
+
+  # Pushing an otel/v* tag releases the nested OpenTelemetry module, as version v* of
+  # github.com/efegreat/forgo-adapter/otel.
+  release-otel:
+    if: startsWith(github.ref, 'refs/tags/otel/v')
+    needs: [otel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check that go.mod requires a released forgo
+        run: |
+          if grep -q '=> ../../forgo$' otel/go.mod; then
+            echo "otel/go.mod replaces forgo with ../../forgo. Require a released forgo version before tagging."
+            exit 1
+          fi
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=
+          case "$TAG" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $prerelease
+
+      - name: Publish the version to the Go module proxy
+        if: ${{ !github.event.repository.private }}
+        run: curl -fsS "https://proxy.golang.org/github.com/efegreat/forgo-adapter/otel/@v/${TAG#otel/}.info"
