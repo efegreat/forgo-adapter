@@ -4,9 +4,9 @@ Guide for coding agents and contributors working **on forgo-adapter itself**. Fo
 
 ## What forgo-adapter is
 
-The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ, Google Cloud Pub/Sub, Redis Streams) and providers (a SQL transactor, inbox/outbox storages, live config stores and a live config cache, a Redis locker, a Redis rate limiter) that implement forgo's interfaces. Module path: `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)). Go 1.27. Both repositories are private and untagged before the first release, so `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with `../forgo`: a sibling forgo checkout is required to build. At release, require a tagged forgo version and remove the `replace` directive.
+The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ, Google Cloud Pub/Sub, Redis Streams) and providers (a SQL transactor, inbox/outbox storages, live config stores and a live config cache, a Redis locker, a Redis rate limiter) that implement forgo's interfaces, and, in the nested module `github.com/efegreat/forgo-adapter/otel`, the OpenTelemetry metrics of forgo applications. Module path: `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)). Go 1.27. Both repositories are private and untagged before the first release, so `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with `../forgo`: a sibling forgo checkout is required to build. At release, require a tagged forgo version and remove the `replace` directive.
 
-The dependency points one way. **Adapters import forgo; forgo never imports adapters.** Anything a server needs from an adapter is an interface declared in forgo. When a forgo contract changes (`worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `ratelimit.ILimiter`, `forgo.LiveConfigStore`, `forgo.LiveConfigCache`, …), update the adapters here in the same change set.
+The dependency points one way. **Adapters import forgo; forgo never imports adapters.** Anything a server needs from an adapter is an interface declared in forgo. When a forgo contract changes (`worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `ratelimit.ILimiter`, `forgo.LiveConfigStore`, `forgo.LiveConfigCache`, `operation.IObserver` and its extension interfaces, …), update the adapters here in the same change set.
 
 forgo's [AGENTS.md](https://github.com/efegreat/forgo/blob/main/AGENTS.md) applies here too: its design principles, coding conventions and logging rules. This file only adds what is specific to adapters.
 
@@ -34,6 +34,9 @@ forgo's four goals carry over:
 | `provider/locker/` | `operation.ILocker` on Redis. Token-guarded unlock script, `ErrNotHeld`. |
 | `provider/ratelimit/` | forgo's `ratelimit.ILimiter` on Redis, for the HTTP and gRPC servers' `RateLimitWith`. GCRA Lua script on the server clock, `KeyPrefix`. |
 | `provider/liveconfig/` | `forgo.LiveConfigStore` for PostgreSQL (`postgres.go`) and MySQL 8 (`mysql.go`) on the `live_configs` table, with versioned conditional saves. `liveconfig.go`: the shared `get` and `applied`. `redis.go`: `forgo.LiveConfigCache` on Redis, version-guarded Lua `Set`, `KeyPrefix`. |
+| `otel/` | The nested module `github.com/efegreat/forgo-adapter/otel`, with a `go.mod` of its own that replaces forgo with `../../forgo`, so that OpenTelemetry's SDK, its exporters and the Prometheus client stay out of the other adapters' module graph. |
+| `otel/meter/` | `Config` → `*meter.Provider`, which embeds the SDK's `*sdkmetric.MeterProvider`: the OTLP (HTTP or gRPC) or Prometheus exporter's reader, `Readers`, the Go runtime metrics, `Global`, and a `Close` that exports what is left. `prometheus.go`: `PrometheusRoute`, an `http.RouteConfig` whose handler writes the registry through `State.Writer`. |
+| `otel/observer/` | `New(Config)` → the provider of the `operation.IObserver`. `observer.go`: the instruments, `Start` and `End` (`forgo.operation.*`, `forgo.message.lag`, `http.server.request.duration`). `signals.go`: `Settled`, `Relayed`, `LockHeld`/`LockFailed` and `ConnObserver`, whose `conns` keep the last state of every open connection. `cache.go`: the copy-on-write map from label tuples to the options of their attribute set. |
 | `internal/sqltest/` | The databases of the integration tests: `Dialect.Open` opens PostgreSQL or MySQL from the environment as a `sqldb` resource with its query log on (lines discarded) or skips, `Reset` creates a table with the schema of forgo's REFERENCE.md, `Ago` is a time on the database clock. Imported by tests only. |
 | `internal/redistest/` | The Redis servers of the integration tests: `Run` runs a test once per server in `ADAPTER_TEST_REDIS_ADDRS` or skips, on the database of the package (`DBRedisStream`, `DBLocker`, …), `Open` connects and empties that database before and after the test, `AtLeast` compares the server's version. Imported by tests only. |
 | `internal/sqllog/` | `Quiet` marks the context of the storages' statements, which the query log writes at debug. |
@@ -121,6 +124,14 @@ Do not break these without an explicit decision from the maintainer.
 - MySQL storages stamp every row with `UTC_TIMESTAMP(6)`, never `CURRENT_TIMESTAMP` or a time from the app: `CURRENT_TIMESTAMP` in a `DATETIME` column follows the session time zone and its daylight saving changes, and an app time goes through the driver's `loc`.
 - Each dialect lives in its own file. Placeholders differ (`$n` and `?`): keep the helpers local to the file that uses them.
 
+### OpenTelemetry module
+
+- `otel` is a module of its own. The root module never imports it, and it imports nothing of the root module. Its `go.mod` replaces forgo with `../../forgo` until forgo is released, and it is tagged `otel/vX.Y.Z` (see [Releasing](#releasing)).
+- Recording an operation allocates nothing once its labels were seen: every instrument's options are built once per label tuple in a `cache`, whose reads take no lock, and passed with `...`. `TestAllocations` fails otherwise. Keep it so when adding an instrument.
+- Labels stay bounded: configuration names, statuses, error codes, settlement kinds, HTTP methods (`_OTHER` beyond the known ones) and status codes. Never a lock key, a message ID, a path or a name a client or producer chose.
+- `observer` imports forgo's `server/http` and `server/worker` for their `State`, but not `server/grpc`, so that applications without a gRPC server do not link grpc-go's server: it compares the server name with `"grpc"` instead.
+- Only `meter.Config.Global` writes OpenTelemetry's globals. Nothing else does, and `Close` does not restore them.
+
 ### Redis
 
 - Read-modify-write logic runs as one Lua script (`redis.NewScript`) that touches a single key, so it is atomic and works on Redis Cluster.
@@ -147,7 +158,7 @@ gofmt -l .        # must print nothing
 go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 ```
 
-CI (`.github/workflows/ci.yml`) runs these on every push and pull request, with the integration tests against PostgreSQL, MySQL, RabbitMQ and Redis service containers, plus `go mod tidy -diff`, govulncheck and `go test` without the race detector. While `go.mod` replaces forgo with `../forgo`, CI checks out forgo's `main` next to this repository, so a change that needs an unmerged forgo change passes once that change is merged.
+Run them in `otel/` too, which is a module of its own. CI (`.github/workflows/ci.yml`) runs these on every push and pull request, for both modules, with the integration tests against PostgreSQL, MySQL, RabbitMQ and Redis service containers, plus `go mod tidy -diff`, govulncheck and `go test` without the race detector. While `go.mod` replaces forgo with `../forgo`, CI checks out forgo's `main` next to this repository, so a change that needs an unmerged forgo change passes once that change is merged.
 
 When you change behavior:
 
@@ -163,6 +174,7 @@ Versions follow semantic versioning. `go get` picks the latest tag, and pkg.go.d
 1. Require a released forgo (`go get github.com/efegreat/forgo@v1.2.3`) and remove the `replace` directive: modules that depend on this one ignore it, so a release that replaces forgo does not build for them. The release job of CI refuses such a tag.
 2. Check that CI passes on `main`.
 3. Tag the commit and push the tag: `git tag v1.2.3 && git push origin v1.2.3`. CI runs on the tag, then creates the GitHub release with generated notes and asks the module proxy for the version, so that pkg.go.dev lists it.
+4. The `otel` module is released on its own, with the same steps in `otel/go.mod` and a tag prefixed with its directory: `git tag otel/v0.1.0 && git push origin otel/v0.1.0`. The `release-otel` job checks `otel/go.mod` and asks the proxy for `github.com/efegreat/forgo-adapter/otel@v0.1.0`.
 
 ### Checklists
 

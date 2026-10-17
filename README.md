@@ -57,6 +57,8 @@ if err := app.Run(); err != nil { // logged; main picks the exit code
 | `provider/locker` | provider | `operation.ILocker` | Redis |
 | `provider/ratelimit` | provider | `ratelimit.ILimiter` | Redis, GCRA |
 | `provider/liveconfig` | provider | `forgo.LiveConfigStore`, `forgo.LiveConfigCache` | PostgreSQL, MySQL 8; Redis |
+| `otel/meter` | resource | `metric.MeterProvider` | OpenTelemetry's SDK, exporting over OTLP or to Prometheus, with Go runtime metrics. In the module `github.com/efegreat/forgo-adapter/otel`. |
+| `otel/observer` | provider | `operation.IObserver` | OpenTelemetry: the duration of every operation, labelled alike on every server, HTTP semantic conventions, message settlements, outbox batches, locks and connections |
 
 - **Configure, don't wire.** Every resource is a plain config value whose zero fields mean "use the default". Every provider is a constructor that the bootstrap calls with the resources it needs.
 - **Fail at startup.** Resources connect and verify the connection in `New`. RabbitMQ declares its whole topology there too, Pub/Sub creates and checks the topics and subscriptions you list, and Redis Streams creates its consumer groups, so a bad DSN, a conflicting queue or a changed subscription stops the app before it serves anything.
@@ -73,6 +75,12 @@ go get github.com/efegreat/forgo-adapter
 ```
 
 Import the SQL driver you use in `main`, for example `_ "github.com/lib/pq"`.
+
+The metrics are in a module of their own, so that the other adapters never pull in OpenTelemetry:
+
+```sh
+go get github.com/efegreat/forgo-adapter/otel
+```
 
 ## Documentation
 

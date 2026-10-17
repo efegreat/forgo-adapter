@@ -8,6 +8,15 @@ updates:
       go-modules:
         update-types: [minor, patch]
 
+  # The nested OpenTelemetry module has a go.mod of its own.
+  - package-ecosystem: gomod
+    directory: /otel
+    schedule:
+      interval: weekly
+    groups:
+      otel-modules:
+        update-types: [minor, patch]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
