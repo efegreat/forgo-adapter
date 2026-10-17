@@ -920,9 +920,9 @@ forgo.WithResources(config.Redis),
 forgo.WithProviders(ratelimit.NewRedis),
 
 // on a route or the server
-forgo.MiddlewareAs(http.RateLimitWith(http.RateLimitConfig{Limit: 5, Period: time.Minute, Prefix: "login:"}))
+http.RateLimitWith(http.RateLimitConfig{Limit: 5, Period: time.Minute, Prefix: "login:"})
 // on a gRPC service or method
-forgo.MiddlewareAs(fgrpc.RateLimitWith(fgrpc.RateLimitConfig{Limit: 100, Period: time.Minute, Prefix: "grpc:"}))
+fgrpc.RateLimitWith(fgrpc.RateLimitConfig{Limit: 100, Period: time.Minute, Prefix: "grpc:"})
 ```
 
 It implements the generic cell rate algorithm (GCRA), the algorithm of forgo's `ratelimit.Memory`, so a `Rate` means the same with either limiter: `Limit` requests per `Period`, up to `Burst` at once, refilled continuously.

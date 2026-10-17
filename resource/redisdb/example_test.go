@@ -24,7 +24,7 @@ func ExampleConfig() {
 		ServerConfig: forgo.ServerConfig{
 			Middlewares: []forgo.MiddlewareFactory{
 				// 100 requests per minute and client IP, counted in Redis across every instance.
-				forgo.MiddlewareAs(http.RateLimitWith(http.RateLimitConfig{Limit: 100, Period: time.Minute})),
+				http.RateLimitWith(http.RateLimitConfig{Limit: 100, Period: time.Minute}),
 			},
 		},
 	}
