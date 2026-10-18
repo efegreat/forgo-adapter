@@ -1,7 +1,7 @@
 // Package observer is the operation.IObserver that records the metrics of every forgo server with
 // OpenTelemetry: the duration of every operation, labelled alike on every transport, the HTTP semantic
 // conventions' request duration, and the signals outside operations, such as message settlements, outbox
-// relay batches, lock contention and connections.
+// relay batches and backlog, lock contention and connections.
 package observer
 
 import (
@@ -96,8 +96,8 @@ func (c Config) validate() error {
 //
 // The provider takes the metric.MeterProvider of the bootstrap and returns the observer as an
 // operation.IObserver, which every server picks up. It also implements worker.IDeliveryObserver,
-// worker.IRelayObserver, operation.ILockObserver and transport.IConnObserverFactory. A config it rejects
-// fails the bootstrap.
+// worker.IRelayObserver, worker.IBacklogObserver, operation.ILockObserver and
+// transport.IConnObserverFactory. A config it rejects fails the bootstrap.
 func New(cfg Config) func(metric.MeterProvider) (operation.IObserver, error) {
 	return func(mp metric.MeterProvider) (operation.IObserver, error) {
 		if mp == nil {
@@ -121,6 +121,8 @@ type observer struct {
 	published    metric.Int64Counter
 	unpublished  metric.Int64Counter
 	batch        metric.Float64Histogram
+	backlog      metric.Int64Gauge
+	backlogAge   metric.Float64Gauge
 	lockHeld     metric.Int64Counter
 	lockFailed   metric.Int64Counter
 	acceptErrors metric.Int64Counter
@@ -156,6 +158,11 @@ func newObserver(m metric.Meter, cfg Config) (*observer, error) {
 		errs = append(errs, err)
 		return c
 	}
+	gauge := func(name, unit, description string) metric.Int64Gauge {
+		g, err := m.Int64Gauge(name, metric.WithUnit(unit), metric.WithDescription(description))
+		errs = append(errs, err)
+		return g
+	}
 	upDown := func(name, unit, description string) metric.Int64UpDownCounter {
 		c, err := m.Int64UpDownCounter(name, metric.WithUnit(unit), metric.WithDescription(description))
 		errs = append(errs, err)
@@ -176,6 +183,11 @@ func newObserver(m metric.Meter, cfg Config) (*observer, error) {
 		"Number of claimed outbox messages that failed to publish, which go back to the outbox.")
 	o.batch = histogram("forgo.outbox.batch.duration", "s", "Duration of outbox relay batches, the empty ones included.",
 		cfg.Buckets)
+	o.backlog = gauge("forgo.outbox.backlog", "{message}", "Number of outbox messages not published yet.")
+	backlogAge, err := m.Float64Gauge("forgo.outbox.backlog.age", metric.WithUnit("s"),
+		metric.WithDescription("Age of the oldest outbox message not published yet, 0 when there is none."))
+	errs = append(errs, err)
+	o.backlogAge = backlogAge
 	o.lockHeld = counter("forgo.lock.held", "{operation}", "Number of operations skipped or retried for a lock another holder had.")
 	o.lockFailed = counter("forgo.lock.failed", "{operation}", "Number of operations whose lock could not be acquired.")
 	o.acceptErrors = counter("forgo.conn.accept_errors", "{error}", "Number of failed accepts of a server's listener.")

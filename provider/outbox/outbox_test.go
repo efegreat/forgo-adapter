@@ -17,8 +17,8 @@ import (
 )
 
 var (
-	_ worker.OutboxStorage = (*Postgres)(nil)
-	_ worker.OutboxStorage = (*MySQL)(nil)
+	_ worker.OutboxBacklogStorage = (*Postgres)(nil)
+	_ worker.OutboxBacklogStorage = (*MySQL)(nil)
 )
 
 var (
@@ -339,5 +339,47 @@ func TestDeleteProcessedBefore(t *testing.T) {
 				t.Fatalf("DeleteProcessedBefore err = %v", err)
 			}
 		})
+	}
+}
+
+// backlogSQL matches backlogQuery: both subqueries read the pending rows, the second the first one by ID.
+const backlogSQL = `SELECT\s+\(SELECT COUNT\(\*\) FROM outbox_events WHERE processed_at IS NULL\),\s+` +
+	`\(SELECT created_at FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT 1\)`
+
+func TestBacklog(t *testing.T) {
+	down := errors.New("connection refused")
+	for _, tc := range []struct {
+		name   string
+		values []driver.Value // the row, none for a failure
+		err    error
+		want   worker.OutboxBacklog
+	}{
+		{"pending", []driver.Value{int64(42), created}, nil, worker.OutboxBacklog{Pending: 42, Oldest: created}},
+		{"empty", []driver.Value{int64(0), nil}, nil, worker.OutboxBacklog{}},
+		{"failure", nil, down, worker.OutboxBacklog{}},
+	} {
+		for _, dialect := range []string{"postgres", "mysql"} {
+			t.Run(tc.name+" "+dialect, func(t *testing.T) {
+				db, mock := newMock(t)
+				q := mock.ExpectQuery(backlogSQL)
+				if tc.err != nil {
+					q.WillReturnError(tc.err)
+				} else {
+					q.WillReturnRows(sqlmock.NewRows([]string{"count", "created_at"}).AddRow(tc.values...))
+				}
+				var s worker.OutboxBacklogStorage = NewPostgres(db)
+				if dialect == "mysql" {
+					s = NewMySQL(db)
+				}
+
+				got, err := s.Backlog(context.Background())
+				if !errors.Is(err, tc.err) || (err != nil && !strings.HasPrefix(err.Error(), "outbox: backlog")) {
+					t.Fatalf("Backlog error = %v, want %v", err, tc.err)
+				}
+				if got.Pending != tc.want.Pending || !got.Oldest.Equal(tc.want.Oldest) {
+					t.Fatalf("Backlog = %+v, want %+v", got, tc.want)
+				}
+			})
+		}
 	}
 }

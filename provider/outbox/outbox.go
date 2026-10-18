@@ -2,12 +2,16 @@
 package outbox
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
 
 	"github.com/efegreat/forgo/server/worker"
 	"github.com/efegreat/forgo/types"
+
+	"github.com/efegreat/forgo-adapter/internal/sqllog"
+	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
 // claimAge returns the age at which a claim expires. ExpiredBefore is a time on the producer's
@@ -17,6 +21,29 @@ import (
 // expires.
 func claimAge(claim worker.Claim) time.Duration {
 	return time.Since(claim.ExpiredBefore)
+}
+
+// backlogQuery selects the number of pending rows, through the index of the pending rows (a partial index on
+// PostgreSQL, (processed_at, id) on MySQL), and the created_at of the first one by ID, through the same index,
+// NULL when there is none. It has no parameters, so it works with either dialect.
+const backlogQuery = `
+	SELECT
+		(SELECT COUNT(*) FROM outbox_events WHERE processed_at IS NULL),
+		(SELECT created_at FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT 1)
+	`
+
+// backlog runs backlogQuery on db, or on the transaction of ctx.
+func backlog(ctx context.Context, db *sql.DB) (worker.OutboxBacklog, error) {
+	ctx = sqllog.Quiet(ctx)
+	var b worker.OutboxBacklog
+	var oldest sql.NullTime
+	if err := sqltx.From(ctx, db).QueryRowContext(ctx, backlogQuery).Scan(&b.Pending, &oldest); err != nil {
+		return worker.OutboxBacklog{}, fmt.Errorf("outbox: backlog: %w", err)
+	}
+	if oldest.Valid {
+		b.Oldest = oldest.Time
+	}
+	return b, nil
 }
 
 // scanMessages reads claimed rows of id, name, payload, headers, created_at, message_key and

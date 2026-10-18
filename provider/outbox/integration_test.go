@@ -248,3 +248,47 @@ func checkMessage(t *testing.T, got, want worker.Message) {
 		t.Fatalf("headers = %v", got.Headers)
 	}
 }
+
+// TestIntegrationBacklog checks the backlog against a real database: nothing pending, then the pending rows
+// and the first of them by ID, which processing removes.
+func TestIntegrationBacklog(t *testing.T) {
+	for _, d := range sqltest.Dialects {
+		t.Run(d.Name, func(t *testing.T) {
+			db := d.Open(t)
+			d.Reset(t, db, "outbox_events")
+			s := storage(d, db).(worker.OutboxBacklogStorage)
+			ctx := context.Background()
+
+			if b, err := s.Backlog(ctx); err != nil || b.Pending != 0 || !b.Oldest.IsZero() {
+				t.Fatalf("Backlog of an empty outbox = %+v, %v", b, err)
+			}
+
+			base := time.Now().Add(-time.Hour).Truncate(time.Microsecond).UTC()
+			for i := 1; i <= 3; i++ {
+				write(t, d, db, worker.Message{
+					ID: fmt.Sprintf("m%d", i), Name: "order.placed", Payload: []byte(`{}`),
+					Headers: types.NewJSONMap[string](), CreatedAt: base.Add(time.Duration(i) * time.Minute),
+				})
+			}
+			b, err := s.Backlog(ctx)
+			if err != nil || b.Pending != 3 || !b.Oldest.Equal(base.Add(time.Minute)) {
+				t.Fatalf("Backlog = %+v, %v; want 3 pending, the oldest created at %v", b, err, base.Add(time.Minute))
+			}
+
+			// Claimed rows are still pending; processed ones are not.
+			if got := claimIDs(t, s, "c1", time.Now().Add(-time.Minute), 1); !reflect.DeepEqual(got, []string{"m1"}) {
+				t.Fatalf("claimed %v", got)
+			}
+			if b, err := s.Backlog(ctx); err != nil || b.Pending != 3 {
+				t.Fatalf("Backlog with a claim = %+v, %v; want the claimed row counted", b, err)
+			}
+			if err := s.Complete(ctx, "c1", []string{"m1"}); err != nil {
+				t.Fatal(err)
+			}
+			b, err = s.Backlog(ctx)
+			if err != nil || b.Pending != 2 || !b.Oldest.Equal(base.Add(2*time.Minute)) {
+				t.Fatalf("Backlog after processing m1 = %+v, %v", b, err)
+			}
+		})
+	}
+}

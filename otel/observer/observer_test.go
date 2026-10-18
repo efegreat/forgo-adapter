@@ -434,3 +434,46 @@ func TestAllocations(t *testing.T) {
 		t.Errorf("Settled: %v allocations, want 0", allocs)
 	}
 }
+
+// gaugeValue returns the value of the one data point of a gauge, as a float64.
+func gaugeValue(t testing.TB, m metricdata.Metrics) float64 {
+	t.Helper()
+	switch data := m.Data.(type) {
+	case metricdata.Gauge[int64]:
+		if len(data.DataPoints) == 1 {
+			return float64(data.DataPoints[0].Value)
+		}
+	case metricdata.Gauge[float64]:
+		if len(data.DataPoints) == 1 {
+			return data.DataPoints[0].Value
+		}
+	default:
+		t.Fatalf("%s is a %T", m.Name, m.Data)
+	}
+	t.Fatalf("%s has no single data point", m.Name)
+	return 0
+}
+
+func TestBacklog(t *testing.T) {
+	o, reader := newTestObserver(t, Config{})
+	ctx := context.Background()
+	o.BacklogSampled(ctx, worker.OutboxBacklog{Pending: 12, Oldest: time.Now().Add(-2 * time.Minute)})
+
+	metrics := collect(t, reader)
+	if n := gaugeValue(t, metrics["forgo.outbox.backlog"]); n != 12 {
+		t.Fatalf("backlog %v, want 12", n)
+	}
+	if age := gaugeValue(t, metrics["forgo.outbox.backlog.age"]); age < 120 || age > 180 {
+		t.Fatalf("backlog age %vs, want about 120s", age)
+	}
+	if unit := metrics["forgo.outbox.backlog.age"].Unit; unit != "s" {
+		t.Fatalf("unit %q", unit)
+	}
+
+	// An empty outbox has no age, and the gauges show the last sample.
+	o.BacklogSampled(ctx, worker.OutboxBacklog{})
+	metrics = collect(t, reader)
+	if n, age := gaugeValue(t, metrics["forgo.outbox.backlog"]), gaugeValue(t, metrics["forgo.outbox.backlog.age"]); n != 0 || age != 0 {
+		t.Fatalf("backlog %v and age %v of an empty outbox, want 0 and 0", n, age)
+	}
+}

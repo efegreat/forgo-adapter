@@ -889,6 +889,8 @@ Both outboxes time claims on the database clock alone: a claim expires once its 
 
 Concurrent deliveries of a new message each count an attempt: the first inserts its row, and the others wait for that row and count theirs on it. A message only leaves *waiting*. Moving it out of another terminal state fails with `inbox.ErrNotWaiting`. Repeating `MarkFailed` or `MarkRejected` on a message already in that state succeeds. `MarkCompleted` is strict: it succeeds only when it moves the message out of *waiting* itself. When two deliveries of one message run at once, for example after a channel was lost while a handler ran, the one that completes second fails with `inbox.ErrNotWaiting`. Its transaction then rolls back its handler's writes instead of committing them a second time, and its redelivery is skipped as completed. Several producer instances can run against one outbox, because a claim skips the rows another claim has locked.
 
+Both outboxes are `worker.OutboxBacklogStorage`s too: `Backlog` returns the number of rows not processed yet, the claimed ones included, and the `created_at` of the first one by `id`, which is the oldest with `NewMessage`'s UUIDv7 IDs. The producer samples it every `BacklogInterval` for an observer that implements `worker.IBacklogObserver`, such as [observer](#observer)'s. One query does both through the index of the pending rows (`outbox_events_pending` on PostgreSQL, `outbox_events_processed` on MySQL), so the count reads the pending rows only, and the oldest one is the first entry of the index.
+
 Every statement runs through `sqltx.From`, so a storage called inside `sqltx.Transactor.Do` joins that transaction. The operations that need several statements (MySQL `IncrementAttempt`, both `Claim`s and `Complete`s) run in `sqltx.Run` or `sqltx.RunWith`, which starts a transaction of their own or joins the caller's.
 
 On MySQL, the transactions these operations start are `READ COMMITTED`, whatever the session's isolation. Under `REPEATABLE READ`, InnoDB also locks the gaps between the index records a locking statement reads, and a claim or release can then block the application's outbox inserts until it commits. `READ COMMITTED` writes need `binlog_format` `ROW`, the default, or `MIXED`: under `STATEMENT`, InnoDB refuses them (error 1665). Joined to a transaction of yours, the storages run at its isolation.
@@ -1049,7 +1051,7 @@ func NewOrderService(mp metric.MeterProvider, repo OrderRepository) (*OrderServi
 
 ### observer
 
-`observer.New(cfg)` returns the provider of the observer, a `func(metric.MeterProvider) (operation.IObserver, error)`. Every forgo server picks it up. It also implements the interfaces of the [signals outside operations](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#signals-outside-operations): `worker.IDeliveryObserver`, `worker.IRelayObserver`, `operation.ILockObserver` and `transport.IConnObserverFactory`. A config it rejects fails the bootstrap.
+`observer.New(cfg)` returns the provider of the observer, a `func(metric.MeterProvider) (operation.IObserver, error)`. Every forgo server picks it up. It also implements the interfaces of the [signals outside operations](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#signals-outside-operations): `worker.IDeliveryObserver`, `worker.IRelayObserver`, `worker.IBacklogObserver`, `operation.ILockObserver` and `transport.IConnObserverFactory`. A config it rejects fails the bootstrap.
 
 | Field | Default | Description |
 | --- | --- | --- |
@@ -1067,6 +1069,8 @@ func NewOrderService(mp metric.MeterProvider, repo OrderRepository) (*OrderServi
 | `forgo.message.lag` | histogram (s) | `forgo.subscriber`, `forgo.operation.name`. The time from a message's creation to the start of its handling, for messages whose producer sent it. |
 | `forgo.outbox.published`, `forgo.outbox.failed` | counters | none. Failed messages go back to the outbox. |
 | `forgo.outbox.batch.duration` | histogram (s) | `forgo.outbox.batch.failed`. Every batch is recorded, the empty ones included, so its count is the relay's heartbeat. |
+| `forgo.outbox.backlog` | gauge | none. The outbox messages not published yet, sampled every `BacklogInterval` by each producer instance from an outbox that reports its backlog, such as [outbox](#inbox-and-outbox)'s: aggregate instances with `max`. |
+| `forgo.outbox.backlog.age` | gauge (s) | none. The age of the oldest of them, 0 when there is none. It grows when the broker is down or the relay falls behind. |
 | `forgo.lock.held`, `forgo.lock.failed` | counters | `forgo.operation.type`, `forgo.operation.name`. Never the lock key, which can hold a message ID. |
 | `forgo.conn.accept_errors` | counter | `forgo.server.name`, `forgo.server.address` |
 | `forgo.conn.opened` | counter | `forgo.server.name`, `forgo.server.address`. Its rate is the connection churn. |
