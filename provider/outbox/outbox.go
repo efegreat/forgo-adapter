@@ -23,21 +23,34 @@ func claimAge(claim worker.Claim) time.Duration {
 	return time.Since(claim.ExpiredBefore)
 }
 
-// backlogQuery selects the number of pending rows, through the index of the pending rows (a partial index on
-// PostgreSQL, (processed_at, id) on MySQL), and the created_at of the first one by ID, through the same index,
-// NULL when there is none. It has no parameters, so it works with either dialect.
-const backlogQuery = `
+// The backlog queries select the number of pending rows, counting no more than the limit they take, and the
+// created_at of the first one by ID, NULL when there is none. Both subqueries read the index of the pending
+// rows (a partial index on PostgreSQL, (processed_at, id) on MySQL) in ID order, so the count reads at most
+// limit entries however far the relay is behind, and its ORDER BY keeps it on that index: a scan of the table
+// would have to sort every pending row. They differ only in their placeholder.
+const (
+	postgresBacklogQuery = `
 	SELECT
-		(SELECT COUNT(*) FROM outbox_events WHERE processed_at IS NULL),
+		(SELECT COUNT(*) FROM (
+			SELECT 1 FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT $1
+		) pending),
 		(SELECT created_at FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT 1)
 	`
+	mysqlBacklogQuery = `
+	SELECT
+		(SELECT COUNT(*) FROM (
+			SELECT 1 FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT ?
+		) pending),
+		(SELECT created_at FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT 1)
+	`
+)
 
-// backlog runs backlogQuery on db, or on the transaction of ctx.
-func backlog(ctx context.Context, db *sql.DB) (worker.OutboxBacklog, error) {
+// backlog runs query, one of the backlog queries, with limit on db, or on the transaction of ctx.
+func backlog(ctx context.Context, db *sql.DB, query string, limit int) (worker.OutboxBacklog, error) {
 	ctx = sqllog.Quiet(ctx)
 	var b worker.OutboxBacklog
 	var oldest sql.NullTime
-	if err := sqltx.From(ctx, db).QueryRowContext(ctx, backlogQuery).Scan(&b.Pending, &oldest); err != nil {
+	if err := sqltx.From(ctx, db).QueryRowContext(ctx, query, limit).Scan(&b.Pending, &oldest); err != nil {
 		return worker.OutboxBacklog{}, fmt.Errorf("outbox: backlog: %w", err)
 	}
 	if oldest.Valid {

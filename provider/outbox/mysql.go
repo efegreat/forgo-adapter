@@ -185,11 +185,12 @@ func (m *MySQL) Complete(
 	})
 }
 
-// Backlog returns the number of messages not processed yet and the created_at of the first one by ID, for
-// the producer's worker.IBacklogObserver. Both come from the outbox_events_processed index, (processed_at,
-// id), whose rows with a NULL processed_at are the pending ones.
-func (m *MySQL) Backlog(ctx context.Context) (worker.OutboxBacklog, error) {
-	return backlog(ctx, m.db)
+// Backlog returns the number of messages not processed yet, up to limit, and the created_at of the first one
+// by ID, for the producer's worker.IBacklogObserver. Both come from the outbox_events_processed index,
+// (processed_at, id), whose entries with a NULL processed_at are the pending ones, and the count reads no
+// more than limit of them.
+func (m *MySQL) Backlog(ctx context.Context, limit int) (worker.OutboxBacklog, error) {
+	return backlog(ctx, m.db, mysqlBacklogQuery, limit)
 }
 
 // DeleteProcessedBefore deletes up to limit messages processed before before, and returns how many
