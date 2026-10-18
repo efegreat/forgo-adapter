@@ -155,11 +155,11 @@ func (p *Postgres) Complete(
 	})
 }
 
-// Backlog returns the number of messages not processed yet and the created_at of the first one by ID, for
-// the producer's worker.IBacklogObserver. Both come from the outbox_events_pending partial index, so the
-// count reads the pending rows only.
-func (p *Postgres) Backlog(ctx context.Context) (worker.OutboxBacklog, error) {
-	return backlog(ctx, p.db)
+// Backlog returns the number of messages not processed yet, up to limit, and the created_at of the first one
+// by ID, for the producer's worker.IBacklogObserver. Both come from the outbox_events_pending partial index,
+// so the count reads pending rows only, and no more than limit of them.
+func (p *Postgres) Backlog(ctx context.Context, limit int) (worker.OutboxBacklog, error) {
+	return backlog(ctx, p.db, postgresBacklogQuery, limit)
 }
 
 // DeleteProcessedBefore deletes up to limit messages processed before before, and returns how many

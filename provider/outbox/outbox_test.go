@@ -342,8 +342,10 @@ func TestDeleteProcessedBefore(t *testing.T) {
 	}
 }
 
-// backlogSQL matches backlogQuery: both subqueries read the pending rows, the second the first one by ID.
-const backlogSQL = `SELECT\s+\(SELECT COUNT\(\*\) FROM outbox_events WHERE processed_at IS NULL\),\s+` +
+// backlogSQL matches the backlog queries: both subqueries read the pending rows in ID order, the first up to
+// the limit, whose placeholder is the dialect's, and the second the first one.
+const backlogSQL = `SELECT\s+\(SELECT COUNT\(\*\) FROM \(\s+` +
+	`SELECT 1 FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT (\$1|\?)\s+\) pending\),\s+` +
 	`\(SELECT created_at FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT 1\)`
 
 func TestBacklog(t *testing.T) {
@@ -361,7 +363,7 @@ func TestBacklog(t *testing.T) {
 		for _, dialect := range []string{"postgres", "mysql"} {
 			t.Run(tc.name+" "+dialect, func(t *testing.T) {
 				db, mock := newMock(t)
-				q := mock.ExpectQuery(backlogSQL)
+				q := mock.ExpectQuery(backlogSQL).WithArgs(10000)
 				if tc.err != nil {
 					q.WillReturnError(tc.err)
 				} else {
@@ -372,7 +374,7 @@ func TestBacklog(t *testing.T) {
 					s = NewMySQL(db)
 				}
 
-				got, err := s.Backlog(context.Background())
+				got, err := s.Backlog(context.Background(), 10000)
 				if !errors.Is(err, tc.err) || (err != nil && !strings.HasPrefix(err.Error(), "outbox: backlog")) {
 					t.Fatalf("Backlog error = %v, want %v", err, tc.err)
 				}

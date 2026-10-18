@@ -183,7 +183,7 @@ func newObserver(m metric.Meter, cfg Config) (*observer, error) {
 		"Number of claimed outbox messages that failed to publish, which go back to the outbox.")
 	o.batch = histogram("forgo.outbox.batch.duration", "s", "Duration of outbox relay batches, the empty ones included.",
 		cfg.Buckets)
-	o.backlog = gauge("forgo.outbox.backlog", "{message}", "Number of outbox messages not published yet.")
+	o.backlog = gauge("forgo.outbox.backlog", "{message}", "Number of outbox messages not published yet, up to the producer's BacklogLimit.")
 	backlogAge, err := m.Float64Gauge("forgo.outbox.backlog.age", metric.WithUnit("s"),
 		metric.WithDescription("Age of the oldest outbox message not published yet, 0 when there is none."))
 	errs = append(errs, err)
