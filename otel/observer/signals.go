@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/efegreat/forgo/operation"
 	"github.com/efegreat/forgo/server/worker"
@@ -65,6 +66,17 @@ func (o *observer) Relayed(ctx context.Context, b worker.RelayBatch) {
 	if failed := b.Claimed - b.Published; failed > 0 {
 		o.unpublished.Add(ctx, int64(failed))
 	}
+}
+
+// BacklogSampled records the number of outbox messages not published yet, and the age of the oldest one, 0
+// when there is none.
+func (o *observer) BacklogSampled(ctx context.Context, b worker.OutboxBacklog) {
+	o.backlog.Record(ctx, b.Pending)
+	var age float64
+	if !b.Oldest.IsZero() {
+		age = max(time.Since(b.Oldest).Seconds(), 0)
+	}
+	o.backlogAge.Record(ctx, age)
 }
 
 // LockHeld counts an operation skipped or retried for a lock another holder had, labelled by the operation,
@@ -173,6 +185,7 @@ var (
 	_ operation.IObserver            = (*observer)(nil)
 	_ worker.IDeliveryObserver       = (*observer)(nil)
 	_ worker.IRelayObserver          = (*observer)(nil)
+	_ worker.IBacklogObserver        = (*observer)(nil)
 	_ operation.ILockObserver        = (*observer)(nil)
 	_ transport.IConnObserverFactory = (*observer)(nil)
 	_ transport.IConnStateObserver   = (*conns)(nil)
