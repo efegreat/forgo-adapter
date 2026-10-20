@@ -22,8 +22,8 @@ app := forgo.NewApp(
 			Queues: []rabbitmq.QueueConfig{{
 				Name:       "billing",
 				Durable:    true,
-				Bindings:   []rabbitmq.BindingConfig{{Exchange: "orders", RoutingKey: "order.*"}},
-				DeadLetter: rabbitmq.DeadLetterConfig{Enabled: true}, // billing.dlx → billing.dlq
+				Bindings:   []rabbitmq.BindingConfig{{Exchange: "orders", RoutingKey: "order.*"}}, // Message.Key, such as order.placed
+				DeadLetter: rabbitmq.DeadLetterConfig{Enabled: true},                              // billing.dlx → billing.dlq
 			}},
 			Subscribers: []rabbitmq.SubscriberConfig{{Name: "billing", Queue: "billing"}},
 		},
