@@ -13,7 +13,9 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"sync"
 	"testing"
@@ -59,6 +61,60 @@ var discardLogs sync.Once
 // than UTC.
 func (d Dialect) Open(t *testing.T) *sql.DB {
 	t.Helper()
+	return d.open(t, d.dsn(t))
+}
+
+// databaseName is what OpenDatabase accepts as a database name, which it writes into statements.
+var databaseName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// OpenDatabase opens the database name on the server of d's DSN, as Open does, and creates it first when it
+// is missing. go test runs packages in parallel, and the tests of a package reset the tables they test on the
+// database of the DSN, so a test that uses the tables of other packages, such as the outbox's and the inbox's
+// together, runs on a database of its own. name is lower case letters, digits and underscores.
+func (d Dialect) OpenDatabase(t *testing.T, name string) *sql.DB {
+	t.Helper()
+	if !databaseName.MatchString(name) {
+		t.Fatalf("database name %q", name)
+	}
+	dsn := d.dsn(t)
+	server := d.open(t, dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if d == Postgres {
+		// PostgreSQL has no CREATE DATABASE IF NOT EXISTS.
+		var exists bool
+		if err := server.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`, name).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if !exists {
+			if _, err := server.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		u, err := url.Parse(dsn)
+		if err != nil || u.Scheme == "" {
+			t.Fatalf("%s must be a postgres:// URL to open another database on its server", d.env)
+		}
+		u.Path = "/" + name
+		dsn = u.String()
+	} else {
+		if _, err := server.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+name); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			t.Fatalf("parse %s: %v", d.env, err)
+		}
+		cfg.DBName = name
+		dsn = cfg.FormatDSN()
+	}
+	return d.open(t, dsn)
+}
+
+// dsn returns the DSN of d from the environment, with the connection settings of Open, or skips t when it is
+// not set.
+func (d Dialect) dsn(t *testing.T) string {
+	t.Helper()
 	dsn := os.Getenv(d.env)
 	if dsn == "" {
 		t.Skip("set " + d.env + " to run against a disposable " + d.Name + " database")
@@ -76,7 +132,12 @@ func (d Dialect) Open(t *testing.T) *sql.DB {
 		cfg.Params["time_zone"] = sessionTimeZone
 		dsn = cfg.FormatDSN()
 	}
+	return dsn
+}
 
+// open opens dsn as a sqldb resource, with the query log of Open, and closes it when t ends.
+func (d Dialect) open(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
 	discardLogs.Do(func() { logger.SetDefault(zerolog.New(io.Discard)) })
 	res, err := sqldb.Config{
 		Name:           d.Name,

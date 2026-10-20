@@ -132,6 +132,44 @@ func TestIntegrationRelay(t *testing.T) {
 	}
 }
 
+// TestIntegrationClaimWithoutExpiry checks a claim with a zero ExpiredBefore, as forgo's forgotest makes them
+// to read the outbox in tests: it takes the rows no claim holds, and never a claimed one, however old its
+// claim is, since no claim was made before the zero time.
+func TestIntegrationClaimWithoutExpiry(t *testing.T) {
+	for _, d := range sqltest.Dialects {
+		t.Run(d.Name, func(t *testing.T) {
+			db := d.Open(t)
+			d.Reset(t, db, "outbox_events")
+			s := storage(d, db)
+			for _, id := range []string{"m1", "m2", "m3"} {
+				write(t, d, db, worker.Message{ID: id, Name: "n", Payload: []byte(`{}`), Headers: types.NewJSONMap[string](), CreatedAt: time.Now()})
+			}
+
+			if got := claimIDs(t, s, "c1", time.Time{}, 2); !reflect.DeepEqual(got, []string{"m1", "m2"}) {
+				t.Fatalf("first claim = %v, want m1 and m2", got)
+			}
+			if got := claimIDs(t, s, "c2", time.Time{}, 10); !reflect.DeepEqual(got, []string{"m3"}) {
+				t.Fatalf("second claim = %v, want the row the first one left", got)
+			}
+			if got := claimIDs(t, s, "c3", time.Time{}, 10); len(got) != 0 {
+				t.Fatalf("claim of claimed rows = %v", got)
+			}
+
+			// Claims two centuries old, which any claim with an ExpiredBefore takes back.
+			age := `UPDATE outbox_events SET processing_at = ` + d.Ago(200*365*24*time.Hour)
+			if _, err := db.ExecContext(context.Background(), age); err != nil {
+				t.Fatal(err)
+			}
+			if got := claimIDs(t, s, "c4", time.Time{}, 10); len(got) != 0 {
+				t.Fatalf("claim without expiry of old claims = %v", got)
+			}
+			if got := claimIDs(t, s, "c5", time.Now().Add(-time.Minute), 10); !reflect.DeepEqual(got, []string{"m1", "m2", "m3"}) {
+				t.Fatalf("claim of expired claims = %v, want every row", got)
+			}
+		})
+	}
+}
+
 // TestIntegrationCompleteReleasesFailures checks that Complete without successful IDs releases
 // every row of the claim at once, without waiting for the claim to expire.
 func TestIntegrationCompleteReleasesFailures(t *testing.T) {
