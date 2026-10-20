@@ -80,11 +80,14 @@ import (
 	"github.com/efegreat/forgo-adapter/resource/sqldb"
 )
 
-var DB = sqldb.Config{
-	Name:         "main",
-	DriverName:   "postgres",
-	DSN:          forgo.Env("DATABASE_URL", "postgresql://user:password@localhost/app?sslmode=disable"),
-	MaxOpenConns: 20,
+// DB is a function, not a var, so that tests can set DATABASE_URL before it is read.
+func DB() sqldb.Config {
+	return sqldb.Config{
+		Name:         "main",
+		DriverName:   "postgres",
+		DSN:          forgo.Env("DATABASE_URL", "postgresql://user:password@localhost/app?sslmode=disable"),
+		MaxOpenConns: 20,
+	}
 }
 ```
 
@@ -123,16 +126,18 @@ forgo.WithProviders(
 `Logger` logs every statement on a line of its own, through `logger.FromCtx` of the context the statement ran with, so the line carries `op_id` and the other fields of the operation that ran it. It is off by default, and the pool then runs on the driver alone.
 
 ```go
-var DB = sqldb.Config{
-	Name:       "main",
-	DriverName: "postgres",
-	DSN:        forgo.Env("DATABASE_URL", ""),
-	Logger: sqldb.LoggerConfig{
-		Enabled:         true,
-		SlowThreshold:   500 * time.Millisecond,
-		Args:            true,
-		SensitiveFields: []string{"password_hash", "token"},
-	},
+func DB() sqldb.Config {
+	return sqldb.Config{
+		Name:       "main",
+		DriverName: "postgres",
+		DSN:        forgo.Env("DATABASE_URL", ""),
+		Logger: sqldb.LoggerConfig{
+			Enabled:         true,
+			SlowThreshold:   500 * time.Millisecond,
+			Args:            true,
+			SensitiveFields: []string{"password_hash", "token"},
+		},
+	}
 }
 ```
 
@@ -222,10 +227,12 @@ A go-redis universal client, for one Redis server, a Redis Cluster or a Sentinel
 ```go
 import "github.com/efegreat/forgo-adapter/resource/redisdb"
 
-var Redis = redisdb.Config{
-	Name:     "cache",
-	Addrs:    strings.Split(forgo.Env("REDIS_ADDRS", "localhost:6379"), ","),
-	Password: forgo.Env("REDIS_PASSWORD", ""),
+func Redis() redisdb.Config {
+	return redisdb.Config{
+		Name:     "cache",
+		Addrs:    strings.Split(forgo.Env("REDIS_ADDRS", "localhost:6379"), ","),
+		Password: forgo.Env("REDIS_PASSWORD", ""),
+	}
 }
 ```
 
@@ -278,29 +285,31 @@ A RabbitMQ broker for forgo's [worker](https://github.com/efegreat/forgo/blob/ma
 ```go
 import "github.com/efegreat/forgo-adapter/resource/broker/rabbitmq"
 
-var Broker = rabbitmq.Config{
-	Name:     "events",
-	Addr:     forgo.Env("RABBITMQ_HOST", "localhost"),
-	Username: forgo.Env("RABBITMQ_USER", "guest"),
-	Password: forgo.Env("RABBITMQ_PASSWORD", "guest"),
-	Exchanges: []rabbitmq.ExchangeConfig{
-		{Name: "orders", Kind: amqp.ExchangeTopic, Durable: true},
-	},
-	Queues: []rabbitmq.QueueConfig{
-		{
-			Name:       "billing",
-			Durable:    true,
-			Bindings:   []rabbitmq.BindingConfig{{Exchange: "orders", RoutingKey: "order.*"}},
-			DeadLetter: rabbitmq.DeadLetterConfig{Enabled: true},
-			Retry:      rabbitmq.RetryConfig{Initial: time.Second}, // delayed retries: 1s, 2s, 4s… up to 10m
+func Broker() rabbitmq.Config {
+	return rabbitmq.Config{
+		Name:     "events",
+		Addr:     forgo.Env("RABBITMQ_HOST", "localhost"),
+		Username: forgo.Env("RABBITMQ_USER", "guest"),
+		Password: forgo.Env("RABBITMQ_PASSWORD", "guest"),
+		Exchanges: []rabbitmq.ExchangeConfig{
+			{Name: "orders", Kind: amqp.ExchangeTopic, Durable: true},
 		},
-	},
-	Publishers: []rabbitmq.PublisherConfig{
-		{Name: "order.placed"}, // persistent by default
-	},
-	Subscribers: []rabbitmq.SubscriberConfig{
-		{Name: "billing", Queue: "billing"}, // prefetch defaults to the worker's Concurrency
-	},
+		Queues: []rabbitmq.QueueConfig{
+			{
+				Name:       "billing",
+				Durable:    true,
+				Bindings:   []rabbitmq.BindingConfig{{Exchange: "orders", RoutingKey: "order.*"}},
+				DeadLetter: rabbitmq.DeadLetterConfig{Enabled: true},
+				Retry:      rabbitmq.RetryConfig{Initial: time.Second}, // delayed retries: 1s, 2s, 4s… up to 10m
+			},
+		},
+		Publishers: []rabbitmq.PublisherConfig{
+			{Name: "order.placed"}, // persistent by default
+		},
+		Subscribers: []rabbitmq.SubscriberConfig{
+			{Name: "billing", Queue: "billing"}, // prefetch defaults to the worker's Concurrency
+		},
+	}
 }
 ```
 
@@ -488,21 +497,23 @@ A Google Cloud Pub/Sub broker for forgo's [worker](https://github.com/efegreat/f
 ```go
 import "github.com/efegreat/forgo-adapter/resource/broker/pubsub"
 
-var Broker = pubsub.Config{
-	Name:      "events",
-	ProjectID: forgo.Env("GOOGLE_CLOUD_PROJECT", ""),
-	Topics:    []pubsub.TopicConfig{{Name: "orders"}},
-	Subscriptions: []pubsub.SubscriptionConfig{
-		{
-			Name:       "billing",
-			Topic:      "orders",
-			Retry:      pubsub.RetryConfig{Initial: time.Second}, // redeliveries back off from 1s up to 10m
-			DeadLetter: pubsub.DeadLetterConfig{Enabled: true},   // billing.dlq topic and subscription
+func Broker() pubsub.Config {
+	return pubsub.Config{
+		Name:      "events",
+		ProjectID: forgo.Env("GOOGLE_CLOUD_PROJECT", ""),
+		Topics:    []pubsub.TopicConfig{{Name: "orders"}},
+		Subscriptions: []pubsub.SubscriptionConfig{
+			{
+				Name:       "billing",
+				Topic:      "orders",
+				Retry:      pubsub.RetryConfig{Initial: time.Second}, // redeliveries back off from 1s up to 10m
+				DeadLetter: pubsub.DeadLetterConfig{Enabled: true},   // billing.dlq topic and subscription
+			},
 		},
-	},
-	Subscribers: []pubsub.SubscriberConfig{
-		{Name: "billing", Subscription: "billing"}, // MaxOutstandingMessages defaults to the worker's Concurrency
-	},
+		Subscribers: []pubsub.SubscriberConfig{
+			{Name: "billing", Subscription: "billing"}, // MaxOutstandingMessages defaults to the worker's Concurrency
+		},
+	}
 }
 ```
 
@@ -659,24 +670,26 @@ A Redis Streams broker for forgo's [worker](https://github.com/efegreat/forgo/bl
 ```go
 import "github.com/efegreat/forgo-adapter/resource/broker/redisstream"
 
-var Broker = redisstream.Config{
-	Name:  "events",
-	Redis: Redis, // a redisdb.Config: one server, a cluster or a Sentinel master
-	Streams: []redisstream.StreamConfig{
-		{
-			Name:   "orders",
-			MaxLen: 1_000_000, // trimmed on every publish
-			Groups: []redisstream.GroupConfig{{Name: "billing"}, {Name: "shipping"}},
+func Broker() redisstream.Config {
+	return redisstream.Config{
+		Name:  "events",
+		Redis: Redis, // a redisdb.Config: one server, a cluster or a Sentinel master
+		Streams: []redisstream.StreamConfig{
+			{
+				Name:   "orders",
+				MaxLen: 1_000_000, // trimmed on every publish
+				Groups: []redisstream.GroupConfig{{Name: "billing"}, {Name: "shipping"}},
+			},
 		},
-	},
-	Subscribers: []redisstream.SubscriberConfig{
-		{
-			Name:       "billing", // reads the group billing
-			Stream:     "orders",
-			Retry:      redisstream.RetryConfig{Initial: time.Second}, // delayed retries: 1s, 2s, 4s… up to ClaimIdle
-			DeadLetter: redisstream.DeadLetterConfig{Enabled: true},   // orders:billing:dlq
+		Subscribers: []redisstream.SubscriberConfig{
+			{
+				Name:       "billing", // reads the group billing
+				Stream:     "orders",
+				Retry:      redisstream.RetryConfig{Initial: time.Second}, // delayed retries: 1s, 2s, 4s… up to ClaimIdle
+				DeadLetter: redisstream.DeadLetterConfig{Enabled: true},   // orders:billing:dlq
+			},
 		},
-	},
+	}
 }
 ```
 
@@ -908,7 +921,7 @@ On MySQL, the transactions these operations start are `READ COMMITTED`, whatever
 ```go
 import "github.com/efegreat/forgo-adapter/provider/locker"
 
-forgo.WithResources(config.Redis),
+forgo.WithResources(config.Redis()),
 forgo.WithProviders(locker.NewRedis),
 ```
 
@@ -931,7 +944,7 @@ Keys are used as given. forgo builds them from your `Lock.Key`, for example `<Ke
 ```go
 import "github.com/efegreat/forgo-adapter/provider/ratelimit"
 
-forgo.WithResources(config.Redis),
+forgo.WithResources(config.Redis()),
 forgo.WithProviders(ratelimit.NewRedis),
 
 // on a route or the server
@@ -956,7 +969,7 @@ Stores and a cache for forgo's [live configs](https://github.com/efegreat/forgo/
 ```go
 import "github.com/efegreat/forgo-adapter/provider/liveconfig"
 
-forgo.WithResources(config.Database, config.Redis),
+forgo.WithResources(config.Database(), config.Redis()),
 forgo.WithProviders(
 	liveconfig.NewPostgres,   // or liveconfig.NewMySQL
 	liveconfig.NewRedisCache,
@@ -1094,10 +1107,18 @@ func NewOrderService(mp metric.MeterProvider, repo OrderRepository) (*OrderServi
 
 ```go
 // config/config.go
-var (
-	DB     = sqldb.Config{Name: "main", DriverName: "postgres", DSN: forgo.Env("DATABASE_URL", "")}
-	Redis  = redisdb.Config{Name: "cache", Addrs: []string{forgo.Env("REDIS_ADDR", "localhost:6379")}}
-	Broker = rabbitmq.Config{
+
+// The resources are functions, so that tests can set DATABASE_URL and REDIS_ADDR before they are read.
+func DB() sqldb.Config {
+	return sqldb.Config{Name: "main", DriverName: "postgres", DSN: forgo.Env("DATABASE_URL", "")}
+}
+
+func Redis() redisdb.Config {
+	return redisdb.Config{Name: "cache", Addrs: []string{forgo.Env("REDIS_ADDR", "localhost:6379")}}
+}
+
+func Broker() rabbitmq.Config {
+	return rabbitmq.Config{
 		Name:      "events",
 		Exchanges: []rabbitmq.ExchangeConfig{{Name: "orders", Kind: amqp.ExchangeTopic, Durable: true}},
 		Queues: []rabbitmq.QueueConfig{{
@@ -1109,7 +1130,9 @@ var (
 		Publishers:  []rabbitmq.PublisherConfig{{Name: "order.placed"}},
 		Subscribers: []rabbitmq.SubscriberConfig{{Name: "billing", Queue: "billing"}},
 	}
+}
 
+var (
 	Adapters = []any{
 		sqltx.NewTransactor,
 		inbox.NewPostgres,
@@ -1140,7 +1163,7 @@ func main() {
 	app := forgo.NewApp(
 		forgo.WithName("shop-worker"),
 		forgo.WithLogger(config.Logger),
-		forgo.WithResources(config.DB, config.Redis, config.Broker),
+		forgo.WithResources(config.DB(), config.Redis(), config.Broker()),
 		forgo.WithProviders(config.Adapters...),
 		forgo.WithProviders(config.Services...),
 		forgo.WithServers(config.Consumer, config.Producer),
