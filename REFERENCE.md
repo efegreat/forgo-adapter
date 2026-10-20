@@ -298,7 +298,7 @@ func Broker() rabbitmq.Config {
 			{
 				Name:       "billing",
 				Durable:    true,
-				Bindings:   []rabbitmq.BindingConfig{{Exchange: "orders", RoutingKey: "order.*"}},
+				Bindings:   []rabbitmq.BindingConfig{{Exchange: "orders", RoutingKey: "order.*"}}, // Message.Key, such as order.placed
 				DeadLetter: rabbitmq.DeadLetterConfig{Enabled: true},
 				Retry:      rabbitmq.RetryConfig{Initial: time.Second}, // delayed retries: 1s, 2s, 4s… up to 10m
 			},
@@ -1124,7 +1124,7 @@ func Broker() rabbitmq.Config {
 		Queues: []rabbitmq.QueueConfig{{
 			Name:       "billing",
 			Durable:    true,
-			Bindings:   []rabbitmq.BindingConfig{{Exchange: "orders", RoutingKey: "order.*"}},
+			Bindings:   []rabbitmq.BindingConfig{{Exchange: "orders", RoutingKey: "order.*"}}, // Message.Key, such as order.placed
 			DeadLetter: rabbitmq.DeadLetterConfig{Enabled: true, Args: map[string]any{"x-message-ttl": 7 * 24 * 3600 * 1000}},
 		}},
 		Publishers:  []rabbitmq.PublisherConfig{{Name: "order.placed"}},
