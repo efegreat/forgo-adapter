@@ -324,6 +324,8 @@ Without `TLSConfig`, the credentials and every message travel in clear text. Man
 
 `New` connects, then declares every exchange, then every queue with its bindings. A queue's dead-letter exchange and queue are declared just before the queue itself, and its retry queues just after it. Any failure closes the connection and fails the bootstrap. The channel the topology was declared on stays open, because the client only redeclares the topology recorded on open channels after a reconnect. Declarations are idempotent, but redeclaring an existing exchange or queue with different properties or arguments is refused by RabbitMQ with `PRECONDITION_FAILED`.
 
+**The topology is the application's.** Which subscribers receive a message is decided here: by the exchange of its `Destination`, the bindings of the queues, and the routing key, `Message.Key` (see [Messages on the wire](#messages-on-the-wire)). Application tests on forgo's `forgotest` run no broker, so they do not cover it (see [Brokers in tests](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#brokers-in-tests)). They put a stand-in in place of this resource, with `forgotest.ReplaceResource[rabbitmq.Config](forgotest.Broker("events"))`. A binding whose routing key does not match drops the message, unless the publisher is `Mandatory`, while every test passes. Check the topology where it is declared, against a real broker, in staging or a smoke check.
+
 #### Publishers and subscribers
 
 The names match forgo's worker configs:
@@ -524,6 +526,8 @@ Creating needs `roles/pubsub.editor` on what you list. An app that only publishe
 
 To develop against the [emulator](https://cloud.google.com/pubsub/docs/emulator), set `PUBSUB_EMULATOR_HOST`, such as `localhost:8085`, and a `ProjectID`. The client then connects without credentials, and `New` creates the topology in the empty emulator.
 
+**The topology is the application's.** Which subscribers receive a message is decided here, or wherever the topics and subscriptions are created: by the topic of its `Destination`, and the subscriptions of that topic with their `Filter`. Application tests on forgo's `forgotest` run no broker, so they do not cover it (see [Brokers in tests](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#brokers-in-tests)). They put a stand-in in place of this resource, with `forgotest.ReplaceResource[pubsub.Config](forgotest.Broker("events"))`. A message published to a topic without the subscription a subscriber reads reaches no handler, while every test passes. Check the topology where it is declared, against Pub/Sub or the emulator, in staging or a smoke check.
+
 #### Subscriptions
 
 | `SubscriptionConfig` field | Default | Description |
@@ -694,6 +698,8 @@ var Broker = redisstream.Config{
 `New` connects with `Redis` like the `redisdb` resource, with its validation and startup ping. It then creates every group of `Streams` that does not exist, and its stream with it (`XGROUP CREATE … MKSTREAM`). A group that exists is kept as it is, with its position, so `StartID` only applies when a group is created. Any failure closes the client and fails the bootstrap, for example `redisstream: create group billing of stream orders: WRONGTYPE …` when the key holds another type.
 
 List the groups in the config the producer uses too. With `$`, a group created after a message was published never receives it, so the group must exist before the first publish. When both servers share the broker config, whichever starts first creates the groups.
+
+**The topology is the application's.** Which subscribers receive a message is decided here: by the stream of its `Destination`, and the groups of that stream. Application tests on forgo's `forgotest` run no broker, so they do not cover it (see [Brokers in tests](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#brokers-in-tests)). They put a stand-in in place of this resource, with `forgotest.ReplaceResource[redisstream.Config](forgotest.Broker("events"))`. A message added to a stream without the group a subscriber reads, or before a `$` group was created, reaches no handler, while every test passes. Check the topology against a real Redis, in staging or a smoke check.
 
 Every command touches a single key, so the broker works on Redis Cluster. A dead-letter stream is another key, which the broker writes with commands of its own, so it may hash to another slot.
 
