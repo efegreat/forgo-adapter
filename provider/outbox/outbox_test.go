@@ -12,13 +12,21 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/efegreat/forgo/server/worker"
+	"github.com/efegreat/forgo/types"
 
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
+// saver is what an application requests to save its messages.
+type saver interface {
+	Save(ctx context.Context, msg worker.Message) error
+}
+
 var (
 	_ worker.OutboxBacklogStorage = (*Postgres)(nil)
 	_ worker.OutboxBacklogStorage = (*MySQL)(nil)
+	_ saver                       = (*Postgres)(nil)
+	_ saver                       = (*MySQL)(nil)
 )
 
 var (
@@ -383,5 +391,88 @@ func TestBacklog(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// at matches a time.Time equal to want.
+func at(want time.Time) argFunc {
+	return func(v driver.Value) bool {
+		t, ok := v.(time.Time)
+		return ok && t.Equal(want)
+	}
+}
+
+// null matches SQL NULL.
+var null = argFunc(func(v driver.Value) bool { return v == nil })
+
+func TestSave(t *testing.T) {
+	down := errors.New("connection refused")
+	full := worker.Message{
+		ID:          "m1",
+		Name:        "order.placed",
+		Key:         "order.placed",
+		Destination: "orders",
+		Payload:     []byte(`{"id":1}`),
+		Headers:     types.NewJSONMapWithData(map[string]string{"tenant": "acme"}),
+		CreatedAt:   created.Add(1500 * time.Nanosecond),
+	}
+	bare := worker.Message{ID: "m2", Name: "order.placed", Payload: []byte(`{}`)}
+
+	for _, dialect := range []struct {
+		name  string
+		new   func(*sql.DB) saver
+		query string
+	}{
+		{"postgres", func(db *sql.DB) saver { return NewPostgres(db) },
+			`INSERT INTO outbox_events \(id, name, payload, headers, created_at, message_key, destination\)\s+` +
+				`VALUES \(\$1, \$2, \$3, \$4, COALESCE\(\$5, CURRENT_TIMESTAMP\), \$6, \$7\)`},
+		{"mysql", func(db *sql.DB) saver { return NewMySQL(db) },
+			`INSERT INTO outbox_events \(id, name, payload, headers, created_at, message_key, destination\)\s+` +
+				`VALUES \(\?, \?, \?, \?, COALESCE\(\?, UTC_TIMESTAMP\(6\)\), \?, \?\)`},
+	} {
+		t.Run(dialect.name, func(t *testing.T) {
+			// The payload and the headers as text, CreatedAt to the microsecond, in the transaction of ctx:
+			// with one connection, a statement outside it would wait for the transaction forever.
+			t.Run("in a transaction", func(t *testing.T) {
+				db, mock := newMock(t)
+				mock.ExpectBegin()
+				mock.ExpectExec(dialect.query).
+					WithArgs("m1", "order.placed", `{"id":1}`, `{"tenant":"acme"}`, at(created.Add(time.Microsecond)), "order.placed", "orders").
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectCommit()
+				err := sqltx.Run(context.Background(), db, func(ctx context.Context) error {
+					return dialect.new(db).Save(ctx, full)
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			})
+			// Without CreatedAt or headers, both are NULL: the database stamps the row.
+			t.Run("defaults", func(t *testing.T) {
+				db, mock := newMock(t)
+				mock.ExpectExec(dialect.query).
+					WithArgs("m2", "order.placed", `{}`, null, null, "", "").
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				if err := dialect.new(db).Save(context.Background(), bare); err != nil {
+					t.Fatal(err)
+				}
+			})
+			t.Run("no ID", func(t *testing.T) {
+				db, _ := newMock(t)
+				noID := bare
+				noID.ID = ""
+				if err := dialect.new(db).Save(context.Background(), noID); !errors.Is(err, ErrNoID) {
+					t.Fatalf("Save = %v, want ErrNoID", err)
+				}
+			})
+			t.Run("failure", func(t *testing.T) {
+				db, mock := newMock(t)
+				mock.ExpectExec(dialect.query).WillReturnError(down)
+				err := dialect.new(db).Save(context.Background(), bare)
+				if !errors.Is(err, down) || !strings.HasPrefix(err.Error(), "outbox: save message m2: ") {
+					t.Fatalf("Save = %v, want the failure, prefixed", err)
+				}
+			})
+		})
 	}
 }

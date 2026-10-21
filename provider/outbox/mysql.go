@@ -13,8 +13,8 @@ import (
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
-// MySQL is a worker.OutboxStorage on the outbox_events table of a MySQL 8 database.
-// Statements join the transaction a sqltx.Transactor put in the context. It stamps rows with
+// MySQL is a worker.OutboxStorage on the outbox_events table of a MySQL 8 database, which applications write
+// their messages to with Save. Statements join the transaction a sqltx.Transactor put in the context. It stamps rows with
 // UTC_TIMESTAMP(6) and ages them on the database clock, so that neither the session time zone nor
 // the driver's loc moves a claim or the cleanup.
 type MySQL struct {
@@ -32,6 +32,15 @@ func NewMySQL(db *sql.DB) *MySQL {
 // it, or a release of the claim with the smallest processing_id, would block those inserts until it
 // commits. A storage that joins the caller's transaction keeps the caller's isolation.
 var readCommitted = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+
+// Save writes msg to the outbox in the transaction of ctx. Called in the Do of the sqltx.Transactor that writes
+// the change msg announces, it is published if and only if that change commits. Outside a transaction, the
+// row is committed at once. CreatedAt is kept to the microsecond, and written by the driver in its loc, UTC
+// by default, in which the storage reads it back. A zero CreatedAt takes the database's time, in UTC. A
+// message without an ID fails with ErrNoID.
+func (m *MySQL) Save(ctx context.Context, msg worker.Message) error {
+	return save(ctx, m.db, mysqlSaveQuery, msg)
+}
 
 // Claim selects the messages and stamps them in one transaction. Claims are stamped and expired on
 // the database clock (see claimAge), in UTC so that neither the session time zone nor its daylight
