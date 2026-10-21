@@ -1,9 +1,11 @@
-// Package outbox implements worker.OutboxStorage on SQL databases.
+// Package outbox implements worker.OutboxStorage on SQL databases, and the Save that applications write their
+// messages with, in the transactions of their changes.
 package outbox
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +15,44 @@ import (
 	"github.com/efegreat/forgo-adapter/internal/sqllog"
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
+
+// ErrNoID is the error of Save for a message without an ID. The inboxes of the consumers recognize a message
+// by its ID, so they would drop a second message without one as a duplicate of the first.
+var ErrNoID = errors.New("outbox: message without an ID")
+
+// The save statements insert a message, stamped with the database's time when it has no CreatedAt. They
+// differ in their placeholders and in that time, which is UTC on MySQL, like every timestamp of its storage.
+const (
+	postgresSaveQuery = `
+	INSERT INTO outbox_events (id, name, payload, headers, created_at, message_key, destination)
+	VALUES ($1, $2, $3, $4, COALESCE($5, CURRENT_TIMESTAMP), $6, $7)
+	`
+	mysqlSaveQuery = `
+	INSERT INTO outbox_events (id, name, payload, headers, created_at, message_key, destination)
+	VALUES (?, ?, ?, ?, COALESCE(?, UTC_TIMESTAMP(6)), ?, ?)
+	`
+)
+
+// save runs query, one of the save statements, with msg on db, or on the transaction of ctx.
+func save(ctx context.Context, db *sql.DB, query string, msg worker.Message) error {
+	if msg.ID == "" {
+		return ErrNoID
+	}
+	ctx = sqllog.Quiet(ctx)
+	// The databases keep microseconds and round the rest, which could store a time after CreatedAt.
+	var created any
+	if !msg.CreatedAt.IsZero() {
+		created = msg.CreatedAt.Truncate(time.Microsecond)
+	}
+	// The payload is a string, which every driver sends as text. lib/pq sends a []byte as bytea, which a
+	// JSONB column rejects, and MySQL drivers that interpolate parameters send it as a binary string, which
+	// a JSON column rejects. The headers are a JSONMap, whose Value is a string too.
+	if _, err := sqltx.From(ctx, db).ExecContext(ctx, query,
+		msg.ID, msg.Name, string(msg.Payload), msg.Headers, created, msg.Key, msg.Destination); err != nil {
+		return fmt.Errorf("outbox: save message %s: %w", msg.ID, err)
+	}
+	return nil
+}
 
 // claimAge returns the age at which a claim expires. ExpiredBefore is a time on the producer's
 // clock, so comparing it with processing_at would let skew between that clock and the one that

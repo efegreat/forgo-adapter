@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -15,27 +16,27 @@ import (
 	"github.com/efegreat/forgo/types"
 
 	"github.com/efegreat/forgo-adapter/internal/sqltest"
+	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
+// store is what the outboxes implement: the producer's storage, and Save for applications.
+type store interface {
+	worker.OutboxBacklogStorage
+	Save(ctx context.Context, msg worker.Message) error
+}
+
 // storage returns the outbox of the dialect d on db.
-func storage(d sqltest.Dialect, db *sql.DB) worker.OutboxStorage {
+func storage(d sqltest.Dialect, db *sql.DB) store {
 	if d == sqltest.Postgres {
 		return NewPostgres(db)
 	}
 	return NewMySQL(db)
 }
 
-// write stores msg in the outbox, as an application does in the transaction of its change.
+// write saves msg to the outbox with Save, outside a transaction.
 func write(t *testing.T, d sqltest.Dialect, db *sql.DB, msg worker.Message) {
 	t.Helper()
-	placeholders := make([]string, 7)
-	for i := range placeholders {
-		placeholders[i] = d.Placeholder(i + 1)
-	}
-	query := `INSERT INTO outbox_events (id, name, payload, headers, created_at, message_key, destination) VALUES (` +
-		strings.Join(placeholders, ", ") + `)`
-	if _, err := db.ExecContext(context.Background(), query,
-		msg.ID, msg.Name, string(msg.Payload), msg.Headers, msg.CreatedAt, msg.Key, msg.Destination); err != nil {
+	if err := storage(d, db).Save(context.Background(), msg); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -127,6 +128,73 @@ func TestIntegrationRelay(t *testing.T) {
 			}
 			if deleted, err := s.DeleteProcessedBefore(ctx, time.Now().Add(time.Minute), 1); err != nil || deleted != 1 {
 				t.Fatalf("DeleteProcessedBefore with limit 1 = %d, %v", deleted, err)
+			}
+		})
+	}
+}
+
+// TestIntegrationSave saves messages as applications do, and claims them as the relay does: a claim returns
+// what was saved, a transaction that rolls back saves nothing, a zero CreatedAt takes the database's time,
+// and a message is saved once.
+func TestIntegrationSave(t *testing.T) {
+	for _, d := range sqltest.Dialects {
+		t.Run(d.Name, func(t *testing.T) {
+			db := d.Open(t)
+			d.Reset(t, db, "outbox_events")
+			s := storage(d, db)
+			tx := sqltx.NewTransactor(db)
+			ctx := context.Background()
+
+			placed := worker.NewMessage("order.placed", "order.placed", "orders", []byte(`{"id": 1}`))
+			placed.Headers.Set("tenant", "acme")
+			if err := tx.Do(ctx, func(ctx context.Context) error { return s.Save(ctx, placed) }); err != nil {
+				t.Fatalf("Save in a transaction: %v", err)
+			}
+
+			errRollback := errors.New("rollback")
+			err := tx.Do(ctx, func(ctx context.Context) error {
+				if err := s.Save(ctx, worker.NewMessage("order.cancelled", "", "orders", []byte(`{}`))); err != nil {
+					return err
+				}
+				return errRollback
+			})
+			if !errors.Is(err, errRollback) {
+				t.Fatalf("Do = %v", err)
+			}
+
+			// No CreatedAt and no headers, outside a transaction. The ID sorts after placed's UUIDv7.
+			before := time.Now()
+			stamped := worker.Message{ID: "z-stamped", Name: "order.stamped", Payload: []byte(`{}`)}
+			if err := s.Save(ctx, stamped); err != nil {
+				t.Fatalf("Save without CreatedAt: %v", err)
+			}
+			after := time.Now()
+
+			if err := s.Save(ctx, placed); err == nil {
+				t.Fatal("saved a message twice")
+			}
+			if err := s.Save(ctx, worker.Message{Name: "n", Payload: []byte(`{}`)}); !errors.Is(err, ErrNoID) {
+				t.Fatalf("Save without an ID = %v, want ErrNoID", err)
+			}
+
+			claimed, err := s.Claim(ctx, worker.Claim{ID: "c1", ExpiredBefore: time.Now(), Limit: 10})
+			if err != nil || len(claimed) != 2 {
+				t.Fatalf("Claim = %+v, %v; want the two committed messages", claimed, err)
+			}
+			slices.SortFunc(claimed, func(a, b worker.Message) int { return strings.Compare(a.ID, b.ID) })
+			want := placed
+			want.CreatedAt = placed.CreatedAt.Truncate(time.Microsecond)
+			checkMessage(t, claimed[0], want)
+
+			// The database's time, in UTC on MySQL, whose session time zone in these tests is not. A second
+			// either way allows for the clocks of the test and of the database.
+			got := claimed[1]
+			if got.ID != stamped.ID || got.Name != stamped.Name ||
+				got.CreatedAt.Before(before.Add(-time.Second)) || got.CreatedAt.After(after.Add(time.Second)) {
+				t.Fatalf("claimed %+v, want %s created between %v and %v", got, stamped.ID, before, after)
+			}
+			if got.Headers == nil || got.Headers.Len() != 0 {
+				t.Fatalf("headers = %v, want usable empty headers", got.Headers)
 			}
 		})
 	}
@@ -294,7 +362,7 @@ func TestIntegrationBacklog(t *testing.T) {
 		t.Run(d.Name, func(t *testing.T) {
 			db := d.Open(t)
 			d.Reset(t, db, "outbox_events")
-			s := storage(d, db).(worker.OutboxBacklogStorage)
+			s := storage(d, db)
 			ctx := context.Background()
 
 			if b, err := s.Backlog(ctx, 10); err != nil || b.Pending != 0 || !b.Oldest.IsZero() {

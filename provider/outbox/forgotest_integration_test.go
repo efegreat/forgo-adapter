@@ -37,11 +37,17 @@ type order struct {
 	OrderID string `json:"order_id" validate:"required"`
 }
 
+// saver saves messages to the outbox, in the transaction of ctx.
+type saver interface {
+	Save(ctx context.Context, msg worker.Message) error
+}
+
 // shop saves an order_created message to the outbox in the transaction of each order it places, and ships
 // each order whose message it handles.
 type shop struct {
-	d  sqltest.Dialect
-	db *sql.DB
+	d      sqltest.Dialect
+	db     *sql.DB
+	outbox saver
 
 	mu    sync.Mutex
 	saved []worker.Message
@@ -69,15 +75,7 @@ func (s *shop) Place(ctx context.Context, req order) (order, error) {
 func (s *shop) save(ctx context.Context, orderID string) (worker.Message, error) {
 	msg := worker.NewMessage("order_created", orderID, "orders", fmt.Appendf(nil, `{"order_id":%q}`, orderID))
 	msg.Headers.Set("tenant", "acme")
-	placeholders := make([]string, 7)
-	for i := range placeholders {
-		placeholders[i] = s.d.Placeholder(i + 1)
-	}
-	_, err := sqltx.From(ctx, s.db).ExecContext(ctx,
-		`INSERT INTO outbox_events (id, name, payload, headers, created_at, message_key, destination) VALUES (`+
-			strings.Join(placeholders, ", ")+`)`,
-		msg.ID, msg.Name, string(msg.Payload), msg.Headers, msg.CreatedAt, msg.Key, msg.Destination)
-	return msg, err
+	return msg, s.outbox.Save(ctx, msg)
 }
 
 // Ship records the shipment of the order, then fails the order "down", which rolls the shipment back.
@@ -106,12 +104,15 @@ func TestIntegrationForgotest(t *testing.T) {
 			exec(t, db, `CREATE TABLE shipments (order_id VARCHAR(255) PRIMARY KEY)`)
 			ctx := context.Background()
 
-			s := &shop{d: d, db: db}
-			var box worker.OutboxStorage = outbox.NewMySQL(db)
+			var box interface {
+				worker.OutboxStorage
+				saver
+			} = outbox.NewMySQL(db)
 			var marks worker.InboxStorage = inbox.NewMySQL(db)
 			if d == sqltest.Postgres {
 				box, marks = outbox.NewPostgres(db), inbox.NewPostgres(db)
 			}
+			s := &shop{d: d, db: db, outbox: box}
 			// newApp builds the app with servers, as the function that main calls would.
 			newApp := func(servers ...forgo.ServerFactory) *forgo.App {
 				return forgo.NewApp(

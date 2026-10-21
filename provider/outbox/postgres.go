@@ -14,8 +14,8 @@ import (
 	"github.com/efegreat/forgo-adapter/provider/sqltx"
 )
 
-// Postgres is a worker.OutboxStorage on the outbox_events table of a PostgreSQL database.
-// Statements join the transaction a sqltx.Transactor put in the context.
+// Postgres is a worker.OutboxStorage on the outbox_events table of a PostgreSQL database, which applications
+// write their messages to with Save. Statements join the transaction a sqltx.Transactor put in the context.
 type Postgres struct {
 	db *sql.DB
 }
@@ -23,6 +23,14 @@ type Postgres struct {
 // NewPostgres returns an outbox storage using db, for forgo.WithProviders.
 func NewPostgres(db *sql.DB) *Postgres {
 	return &Postgres{db: db}
+}
+
+// Save writes msg to the outbox in the transaction of ctx. Called in the Do of the sqltx.Transactor that writes
+// the change msg announces, it is published if and only if that change commits. Outside a transaction, the
+// row is committed at once. CreatedAt is kept to the microsecond, and a zero CreatedAt takes the database's
+// time. A message without an ID fails with ErrNoID.
+func (p *Postgres) Save(ctx context.Context, msg worker.Message) error {
+	return save(ctx, p.db, postgresSaveQuery, msg)
 }
 
 // Claim claims the messages in one UPDATE … RETURNING. It runs in a transaction so a failure while

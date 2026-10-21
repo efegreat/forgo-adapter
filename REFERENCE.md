@@ -44,7 +44,7 @@ The bootstrap matches by assignability. A provider that asks for `redis.Universa
 | `redisstream` | `github.com/efegreat/forgo-adapter/resource/broker/redisstream` | resource | `worker.IBroker` | |
 | `sqltx` | `github.com/efegreat/forgo-adapter/provider/sqltx` | provider | `*Transactor` → `operation.Transactor` | `*sql.DB` |
 | `inbox` | `github.com/efegreat/forgo-adapter/provider/inbox` | provider | `*Postgres`, `*MySQL` → `worker.InboxStorage` | `*sql.DB` |
-| `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*MySQL` → `worker.OutboxStorage` | `*sql.DB` |
+| `outbox` | `github.com/efegreat/forgo-adapter/provider/outbox` | provider | `*Postgres`, `*MySQL` → `worker.OutboxStorage`, and `Save` for services | `*sql.DB` |
 | `locker` | `github.com/efegreat/forgo-adapter/provider/locker` | provider | `*Redis` → `operation.ILocker` | `redis.UniversalClient` |
 | `ratelimit` | `github.com/efegreat/forgo-adapter/provider/ratelimit` | provider | `*Redis` → `ratelimit.ILimiter` | `redis.UniversalClient` |
 | `liveconfig` | `github.com/efegreat/forgo-adapter/provider/liveconfig` | provider | `*Postgres`, `*MySQL` → `forgo.LiveConfigStore`; `*RedisCache` → `forgo.LiveConfigCache` | `*sql.DB`; `redis.UniversalClient` |
@@ -879,7 +879,7 @@ func (r *OrderRepository) Insert(ctx context.Context, o order.Order) error {
 
 **In the worker.** For each message, the consumer runs your handler and the inbox's `MarkCompleted` inside `Transactor.Do`. With `sqltx` and the SQL inbox, your writes and the completion commit together. A handler that fails rolls back both, and the message is retried. A crash after the commit leads to a redelivery that the inbox skips. A concurrent duplicate of the message rolls back, because `MarkCompleted` fails for the delivery that completes second.
 
-**In your services.** Write outbox rows with `sqltx.From` inside the same `Do` as the business change, as in forgo's [producer example](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#producer-outbox-relay). The row is then published only if the change commits.
+**In your services.** Save messages with the outbox's [`Save`](#inbox-and-outbox) inside the same `Do` as the business change, as in forgo's [producer example](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#producer-outbox-relay). The message is then published only if the change commits.
 
 ### inbox and outbox
 
@@ -904,9 +904,27 @@ forgo.WithProviders(
 | `outbox.NewPostgres(*sql.DB)` | PostgreSQL | Claims with `FOR UPDATE SKIP LOCKED`. Stamps and expires claims with `CURRENT_TIMESTAMP`. |
 | `outbox.NewMySQL(*sql.DB)` | MySQL 8 | Claims with `FOR UPDATE SKIP LOCKED`. Stamps claims and processed rows with `UTC_TIMESTAMP(6)`, and expires and deletes them by their age on the database clock. |
 
-Both outboxes time claims on the database clock alone: a claim expires once its `processing_at` is `ClaimTTL` older than the database's current time. Clock skew between producer instances, or between them and the database, does not change `ClaimTTL`. On MySQL, every timestamp the storages write is UTC, whatever the session time zone and the driver's `loc`, and the cleanups compare ages on the database clock too. Create the tables with the schema forgo's REFERENCE.md gives for your database, including its indexes: without them, claims and releases scan the outbox backlog, and cleanup batches scan whole tables, locking every row they read under MySQL's `REPEATABLE READ`.
+Both outboxes time claims on the database clock alone: a claim expires once its `processing_at` is `ClaimTTL` older than the database's current time. Clock skew between producer instances, or between them and the database, does not change `ClaimTTL`. On MySQL, every timestamp the storages stamp is UTC, whatever the session time zone and the driver's `loc`, and the cleanups compare ages on the database clock too. Create the tables with the schema forgo's REFERENCE.md gives for your database, including its indexes: without them, claims and releases scan the outbox backlog, and cleanup batches scan whole tables, locking every row they read under MySQL's `REPEATABLE READ`.
 
 Concurrent deliveries of a new message each count an attempt: the first inserts its row, and the others wait for that row and count theirs on it. A message only leaves *waiting*. Moving it out of another terminal state fails with `inbox.ErrNotWaiting`. Repeating `MarkFailed` or `MarkRejected` on a message already in that state succeeds. `MarkCompleted` is strict: it succeeds only when it moves the message out of *waiting* itself. When two deliveries of one message run at once, for example after a channel was lost while a handler ran, the one that completes second fails with `inbox.ErrNotWaiting`. Its transaction then rolls back its handler's writes instead of committing them a second time, and its redelivery is skipped as completed. Several producer instances can run against one outbox, because a claim skips the rows another claim has locked.
+
+**Saving messages.** Services save their messages with the outbox's `Save(ctx, msg)`, inside the `Do` of the change a message announces. The row joins that transaction, so the relay publishes the message if and only if the change commits. Outside a transaction, the row is committed at once. Request an interface of your own with that method, which bootstrap matches to the outbox by assignability, and provide no other type with that method, or the request is ambiguous:
+
+```go
+// Outbox saves messages in the transaction of ctx: outbox.NewPostgres.
+type Outbox interface {
+	Save(ctx context.Context, msg worker.Message) error
+}
+
+err = s.tx.Do(ctx, func(ctx context.Context) error {
+	if err := s.orders.Insert(ctx, order); err != nil {
+		return err
+	}
+	return s.outbox.Save(ctx, msg)
+})
+```
+
+`Save` keeps `CreatedAt` to the microsecond, truncated, and a zero `CreatedAt` takes the database's time, UTC on MySQL. On MySQL, the driver writes `CreatedAt` in its `loc`, UTC by default, in which the storage reads it back. A message without an `ID` fails with `outbox.ErrNoID`: the consumers' inboxes recognize a message by its ID, so they would drop a second message without one as a duplicate of the first. A message whose ID the outbox holds already fails with the database's duplicate key error.
 
 Both outboxes are `worker.OutboxBacklogStorage`s too: `Backlog` returns the number of rows not processed yet, the claimed ones included, counting no more than its limit, and the `created_at` of the first one by `id`, which is the oldest with `NewMessage`'s UUIDv7 IDs. The producer samples it every `BacklogInterval`, with `BacklogLimit` (10000 by default) as the limit, for an observer that implements `worker.IBacklogObserver`, such as [observer](#observer)'s. One query does both through the index of the pending rows (`outbox_events_pending` on PostgreSQL, `outbox_events_processed` on MySQL), in `id` order: the count reads no more than the limit of pending rows however far the relay is behind, and the oldest one is the first entry of the index.
 
