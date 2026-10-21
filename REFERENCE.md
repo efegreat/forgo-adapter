@@ -1062,13 +1062,16 @@ With `Exporter: meter.ExporterPrometheus`, Prometheus pulls the metrics from the
 
 ```go
 var Admin = http.Config{
-	Addr:   ":9100", // a port of its own, which the cluster does not expose
-	Routes: []http.RouteConfig{meter.PrometheusRoute(), {Name: "health", Method: "GET", Path: "/health", Handler: http.HealthHandler()}},
+	ServerConfig: forgo.ServerConfig{Name: "admin"}, // logged and observed apart from the API's server
+	Addr:         ":9100",                           // a port of its own, which the cluster does not expose
+	Routes:       []http.RouteConfig{meter.PrometheusRoute(), {Name: "health", Method: "GET", Path: "/health", Handler: http.HealthHandler()}},
 }
 
 forgo.WithResources(meter.Config{Exporter: meter.ExporterPrometheus}),
 forgo.WithServers(config.API, Admin),
 ```
+
+Both servers are HTTP servers, which forgo names `http` by default. `ServerConfig.Name` names the admin server apart, so that its logs, its connection metrics (`forgo.server.name`) and forgo's `forgotest` tell it from the API's.
 
 Metric names follow Prometheus's conventions: `forgo.operation.duration` is served as `forgo_operation_duration_seconds`, and attributes as labels with underscores.
 
