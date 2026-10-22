@@ -99,10 +99,6 @@ func (o *observer) lockOptions(ctx context.Context) []metric.AddOption {
 	return o.locks.get(opKey{op.Type, op.Name}, buildActive)
 }
 
-// grpcServerName is the server name of forgo's gRPC server, grpc.ServerNameGRPC, which this package does not
-// import, so that applications without a gRPC server do not link it.
-const grpcServerName = "grpc"
-
 // ConnObserver returns the connection observer of server, labelled with its name and address. It is an
 // transport.IConnStateObserver, and also an transport.IConnIOObserver with Config.ConnIO.
 func (o *observer) ConnObserver(server transport.Server) transport.IConnObserver {
@@ -113,8 +109,9 @@ func (o *observer) ConnObserver(server transport.Server) transport.IConnObserver
 	c := &conns{o: o, server: options(), states: make(map[net.Conn]transport.ConnState)}
 	for state := transport.ConnNew; state < transport.ConnClosed; state++ {
 		label := state.String()
-		// gRPC reports no state between new and closed: its connections are open.
-		if state == transport.ConnNew && server.Name == grpcServerName {
+		// A server that reports no activity, such as gRPC's, reports no state between new and closed: its
+		// connections are open.
+		if state == transport.ConnNew && !server.ReportsActivity {
 			label = "open"
 		}
 		c.byState[state] = options(attrConnState.String(label))

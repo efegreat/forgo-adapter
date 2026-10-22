@@ -1114,7 +1114,7 @@ func NewOrderService(mp metric.MeterProvider, repo OrderRepository) (*OrderServi
 | `forgo.lock.held`, `forgo.lock.failed` | counters | `forgo.operation.type`, `forgo.operation.name`. Never the lock key, which can hold a message ID. |
 | `forgo.conn.accept_errors` | counter | `forgo.server.name`, `forgo.server.address` |
 | `forgo.conn.opened` | counter | `forgo.server.name`, `forgo.server.address`. Its rate is the connection churn. |
-| `forgo.conn.open` | up-down counter | `forgo.server.name`, `forgo.server.address`, `forgo.conn.state`: `new`, `active`, `idle` or `hijacked` on HTTP, `open` on gRPC |
+| `forgo.conn.open` | up-down counter | `forgo.server.name`, `forgo.server.address`, `forgo.conn.state`: `new`, `active`, `idle` or `hijacked` on HTTP, `open` on gRPC, whatever the servers are named. The observer tells them apart by `transport.Server.ReportsActivity`. |
 | `forgo.conn.io_errors` | counter | `forgo.server.name`, `forgo.server.address`, `forgo.conn.direction` (`read`, `write`). With `ConnIO` only. |
 
 - **No request counter.** A histogram's count is the number of operations, with the same labels.
