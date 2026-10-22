@@ -2,6 +2,10 @@
 // OpenTelemetry: the duration of every operation, labelled alike on every transport, the HTTP semantic
 // conventions' request duration, and the signals outside operations, such as message settlements, outbox
 // relay batches and backlog, lock contention and connections.
+//
+// See the [observer] section of REFERENCE.md.
+//
+// [observer]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#observer
 package observer
 
 import (

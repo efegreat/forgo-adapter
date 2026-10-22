@@ -1,5 +1,9 @@
 // Package outbox implements worker.OutboxStorage on SQL databases, and the Save that applications write their
 // messages with, in the transactions of their changes.
+//
+// See the [inbox and outbox] section of REFERENCE.md.
+//
+// [inbox and outbox]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#inbox-and-outbox
 package outbox
 
 import (

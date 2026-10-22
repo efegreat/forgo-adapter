@@ -6,4 +6,8 @@
 // exist yet. The entries of a consumer that stops, such as an instance that crashed, are claimed by
 // another consumer of the group once they have been idle for the subscriber's ClaimIdle. Rejected
 // entries go to a dead-letter stream when the subscriber enables one. It needs Redis 6.2 or newer.
+//
+// See the [redisstream] section of REFERENCE.md.
+//
+// [redisstream]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#redisstream
 package redisstream

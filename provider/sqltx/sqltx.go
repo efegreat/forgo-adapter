@@ -1,5 +1,9 @@
 // Package sqltx carries database/sql transactions in the context, so every repository and storage
 // called inside Transactor.Do joins the transaction without passing a *sql.Tx around.
+//
+// See the [sqltx] section of REFERENCE.md.
+//
+// [sqltx]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#sqltx
 package sqltx
 
 import (

@@ -1,5 +1,9 @@
 // Package ratelimit implements forgo's ratelimit.ILimiter on Redis, so that the limits of the servers'
 // RateLimitWith middlewares hold across every instance of an application.
+//
+// See the [ratelimit] section of REFERENCE.md.
+//
+// [ratelimit]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#ratelimit
 package ratelimit
 
 import (

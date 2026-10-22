@@ -2,6 +2,10 @@
 // exporter, built when the application starts and shut down, with a last export, when it stops. Its Value
 // is a *Provider, which providers request as metric.MeterProvider, such as observer.New's and those of
 // services that record business metrics.
+//
+// See the [meter] section of REFERENCE.md.
+//
+// [meter]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#meter
 package meter
 
 import (

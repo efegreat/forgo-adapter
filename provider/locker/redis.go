@@ -1,5 +1,9 @@
 // Package locker implements operation.ILocker on Redis, for the locks of cron jobs, commands and
 // messages that must not run twice at once across the instances of an application.
+//
+// See the [locker] section of REFERENCE.md.
+//
+// [locker]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#locker
 package locker
 
 import (
