@@ -417,7 +417,7 @@ This declares a durable direct exchange `billing.dlx` and a durable queue `billi
 
 - a message that failed `MaxAttempt` times (the inbox marks it *failed*),
 - a message whose payload cannot be bound (`msg_bind`, inbox *rejected*),
-- a message no handler is registered for (`nf_mh`).
+- a message no handler is registered for (`msg_no_handler`).
 
 RabbitMQ also dead-letters messages that expire through `x-message-ttl` or overflow a queue with `x-overflow: reject-publish-dlx`. Retried messages are not dead-lettered: they are requeued, or wait in a retry queue.
 
@@ -589,7 +589,7 @@ A `worker.Message` is published to the topic `Message.Destination`:
 | `x-msg-timestamp` attribute (Unix nanoseconds) | `Message.CreatedAt`, when set |
 | attributes | `Message.Headers` |
 
-Consuming reverses the mapping with `worker.NewMessageFromDelivery`: `Key` is the ordering key, and `Destination` is empty, because Pub/Sub does not tell a subscriber which topic a message was published to. Messages from other producers without `x-msg-id` keep the message ID Pub/Sub assigned them, which stays the same across redeliveries, and those without `x-msg-timestamp` take the time Pub/Sub received them. Without `x-msg-name`, no handler receives them (`nf_mh`).
+Consuming reverses the mapping with `worker.NewMessageFromDelivery`: `Key` is the ordering key, and `Destination` is empty, because Pub/Sub does not tell a subscriber which topic a message was published to. Messages from other producers without `x-msg-id` keep the message ID Pub/Sub assigned them, which stays the same across redeliveries, and those without `x-msg-timestamp` take the time Pub/Sub received them. Without `x-msg-name`, no handler receives them (`msg_no_handler`).
 
 **Ordering keys.** Every client publisher enables message ordering, so a message with a `Key` never fails for want of it. The client then sends the messages of a key one batch at a time, and Pub/Sub accepts at most 1 MB/s per key. A failed publish pauses its key in the client, and `Publish` resumes it at once: the outbox publishes the message again on a later cycle, and does not keep the order of messages it retries anyway. Subscriptions deliver in key order only with `Ordering`. Pub/Sub keeps the order of messages published in one region, so publish them through a regional endpoint, such as `option.WithEndpoint("us-east1-pubsub.googleapis.com:443")`.
 
@@ -653,7 +653,7 @@ For a subscription created outside `New`, set `SubscriberConfig.DeadLetterTopic`
 
 - a message that failed `MaxAttempt` times (the inbox marks it *failed*),
 - a message whose payload cannot be bound (`msg_bind`, inbox *rejected*),
-- a message no handler is registered for (`nf_mh`),
+- a message no handler is registered for (`msg_no_handler`),
 
 and, with `MaxDeliveryAttempts`, the messages Pub/Sub forwards itself.
 
@@ -758,7 +758,7 @@ A `worker.Message` is added to the stream `Message.Destination` as one entry:
 | `x-msg-key` (`redisstream.KeyField`) | `Message.Key`, when set |
 | `payload` (`redisstream.PayloadField`) | `Message.Payload` |
 
-The identity fields are written from the message over any header of the same name, and headers named `payload` or `x-msg-key` are not sent. Consuming reverses the mapping with `worker.NewMessageFromDelivery`: `Key` comes from `x-msg-key`, `Destination` is the stream, and every other field is a header. Entries of other producers without `x-msg-id` take the entry ID, which stays the same across redeliveries, and those without `x-msg-timestamp` the time in the entry ID, when Redis added the entry. Without `x-msg-name`, no handler receives them (`nf_mh`). Another producer only needs `XADD orders * x-msg-name order.placed payload '{"id":1}'`.
+The identity fields are written from the message over any header of the same name, and headers named `payload` or `x-msg-key` are not sent. Consuming reverses the mapping with `worker.NewMessageFromDelivery`: `Key` comes from `x-msg-key`, `Destination` is the stream, and every other field is a header. Entries of other producers without `x-msg-id` take the entry ID, which stays the same across redeliveries, and those without `x-msg-timestamp` the time in the entry ID, when Redis added the entry. Without `x-msg-name`, no handler receives them (`msg_no_handler`). Another producer only needs `XADD orders * x-msg-name order.placed payload '{"id":1}'`.
 
 The worker settles each delivery:
 
@@ -831,7 +831,7 @@ To reject an entry, the subscriber adds a copy of it to `orders:billing:dlq`, th
 
 - a message that failed `MaxAttempt` times (the inbox marks it *failed*),
 - a message whose payload cannot be bound (`msg_bind`, inbox *rejected*),
-- a message no handler is registered for (`nf_mh`).
+- a message no handler is registered for (`msg_no_handler`).
 
 **A copy that cannot be added.** When the key holds another type or Redis does not answer within the worker's `SubscriberConfig.AckTimeout`, `Reject` fails with `redisstream: dead-letter <id> to <stream>, delivering it again` and the entry is claimed again at once, within about a second. The worker then rejects it again, until the copy is added.
 
