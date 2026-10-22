@@ -7,4 +7,8 @@
 // once the broker is responsible for it. A lost connection or channel is recovered, and the late
 // acknowledgements of messages delivered before the loss are dropped instead of reaching the recovered
 // channel.
+//
+// See the [rabbitmq] section of REFERENCE.md.
+//
+// [rabbitmq]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#rabbitmq
 package rabbitmq

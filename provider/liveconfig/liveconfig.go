@@ -3,6 +3,10 @@
 // The SQL stores read and write the database directly, never through the transaction a context carries:
 // forgo.LiveConfigs caches a document once its save succeeds, and the cache never expires, so a save must
 // be committed when Set returns.
+//
+// See the [liveconfig] section of REFERENCE.md.
+//
+// [liveconfig]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#liveconfig
 package liveconfig
 
 import (

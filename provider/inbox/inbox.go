@@ -5,6 +5,10 @@
 // once, the one that completes second fails and rolls back its handler's writes instead of
 // committing them a second time. MarkFailed and MarkRejected carry no business writes, so
 // repeating them is harmless and succeeds.
+//
+// See the [inbox and outbox] section of REFERENCE.md.
+//
+// [inbox and outbox]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#inbox-and-outbox
 package inbox
 
 import (

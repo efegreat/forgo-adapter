@@ -1,5 +1,9 @@
 // Package sqldb is a database/sql resource: a *sql.DB with pool limits, opened and verified when the
 // application starts and closed when it stops, and optionally logging every statement it runs.
+//
+// See the [sqldb] section of REFERENCE.md.
+//
+// [sqldb]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#sqldb
 package sqldb
 
 import (

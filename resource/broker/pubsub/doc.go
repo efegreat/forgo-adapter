@@ -6,4 +6,8 @@
 // until Pub/Sub has stored the message, so the outbox marks a message processed only then. Retried
 // messages follow the retry policy of their subscription, and rejected ones go to its dead-letter topic
 // when it has one.
+//
+// See the [pubsub] section of REFERENCE.md.
+//
+// [pubsub]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#pubsub
 package pubsub

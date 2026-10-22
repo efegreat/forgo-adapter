@@ -1,5 +1,9 @@
 // Package redisdb is a Redis resource: a go-redis universal client for one server, a Redis Cluster or a
 // Sentinel-managed master, connected and verified when the application starts and closed when it stops.
+//
+// See the [redisdb] section of REFERENCE.md.
+//
+// [redisdb]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#redisdb
 package redisdb
 
 import (
