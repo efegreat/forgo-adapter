@@ -303,8 +303,9 @@ func TestLocks(t *testing.T) {
 
 func TestConnections(t *testing.T) {
 	o, reader := newTestObserver(t, Config{})
-	api := o.ConnObserver(transport.Server{Name: "http", Addr: ":8080"})
-	rpc := o.ConnObserver(transport.Server{Name: "grpc", Addr: ":9090"})
+	api := o.ConnObserver(transport.Server{Name: "http", Addr: ":8080", ReportsActivity: true})
+	// A gRPC server with a ServerConfig.Name of its own: its connections are open whatever its name.
+	rpc := o.ConnObserver(transport.Server{Name: "internal", Addr: ":9090"})
 	if _, ok := api.(transport.IConnIOObserver); ok {
 		t.Fatal("observes reads and writes without ConnIO")
 	}
@@ -331,7 +332,7 @@ func TestConnections(t *testing.T) {
 			t.Fatalf("%d connections %s, want %d", n, state, want)
 		}
 	}
-	if n := mustFind(t, open, server("grpc", ":9090", attrConnState.String("open"))...); n != 1 {
+	if n := mustFind(t, open, server("internal", ":9090", attrConnState.String("open"))...); n != 1 {
 		t.Fatalf("%d gRPC connections open", n)
 	}
 	if n := mustFind(t, metrics["forgo.conn.opened"], server("http", ":8080")...); n != 2 {
@@ -351,7 +352,7 @@ func TestConnections(t *testing.T) {
 	}
 
 	o, reader = newTestObserver(t, Config{ConnIO: true})
-	io, ok := o.ConnObserver(transport.Server{Name: "http", Addr: ":8080"}).(transport.IConnIOObserver)
+	io, ok := o.ConnObserver(transport.Server{Name: "http", Addr: ":8080", ReportsActivity: true}).(transport.IConnIOObserver)
 	if !ok {
 		t.Fatal("observes no reads and writes with ConnIO")
 	}
