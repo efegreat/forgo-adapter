@@ -1,5 +1,7 @@
 # Contributing to forgo-adapter
 
+Everyone who takes part in forgo-adapter's issues, pull requests and discussions follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 - **Bugs:** open an issue with the smallest program or test that shows the problem, and the version of the database, broker or Redis it runs against. For a security issue, follow [SECURITY.md](SECURITY.md) instead.
 - **New adapters and changes of behavior:** open an issue to discuss them before you send a pull request. A new adapter wraps one client library and implements a forgo contract.
 - **Contracts** such as `worker.IBroker` or `operation.ILocker` belong to [forgo](https://github.com/efegreat/forgo). A change to one needs pull requests in both repositories.

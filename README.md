@@ -91,7 +91,7 @@ go get github.com/efegreat/forgo-adapter/otel
 
 ## Contributing
 
-Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md), and report vulnerabilities privately as [SECURITY.md](SECURITY.md) describes.
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md), follow the [Code of Conduct](CODE_OF_CONDUCT.md), and report vulnerabilities privately as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 
