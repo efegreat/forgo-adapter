@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +28,7 @@ const (
 	// sweepInterval is the pause between two sweeps of the stale consumers of a group.
 	sweepInterval = 5 * time.Minute
 	// staleIdle is how many times ClaimIdle a consumer without pending entries stays idle before a
-	// sweep deletes it. Since Redis 7.2, a live consumer is never that idle: it claims about once a
+	// sweep deletes it. Since Redis 7.2, a live consumer is never that idle: it reads about once a
 	// second, or holds the entries it handles. Before, only the entries it gets reset its idle
 	// time, so the live consumers of a quiet group are deleted too, and come back with their next
 	// entry.
@@ -33,9 +36,12 @@ const (
 
 	// retryConsumer owns the entries that wait for a retry.
 	retryConsumer = "forgo-retry"
-	// claimStart starts a scan of the pending entries, and ends one when XAUTOCLAIM returns it.
+	// claimStart starts a scan of the pending entries, and ends one when claim returns it.
 	claimStart = "0-0"
 )
+
+// errClaimReply is returned for an XCLAIM reply that does not hold stream entries.
+var errClaimReply = errors.New("unexpected XCLAIM reply")
 
 // delConsumerScript deletes a consumer from its group while it has no pending entries. XGROUP
 // DELCONSUMER drops the pending entries of the consumer from the group, so they would never be
@@ -197,19 +203,135 @@ func (s *subscriber) sweep(ctx context.Context) {
 // claim claims up to n entries of the group that were idle for ClaimIdle, scanning the pending
 // entries from cursor. It returns the cursor of the next scan, which is claimStart once the scan
 // reached the end.
+//
+// Redis finds the entries that are due (XPENDING … IDLE), in one round trip however many entries
+// wait for a retry, and claims them (XCLAIM), checking their idle time again, so an entry that
+// another consumer claimed in between is skipped. XAUTOCLAIM would take a round trip for every ten
+// pending entries per free slot, and no new entry is read until a scan ends.
 func (s *subscriber) claim(ctx context.Context, cursor string, n int) ([]redis.XMessage, string, error) {
-	entries, next, err := s.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-		Stream:   s.conf.Stream,
-		Group:    s.conf.Group,
-		MinIdle:  s.conf.ClaimIdle,
-		Start:    cursor,
-		Count:    int64(n),
-		Consumer: s.consumer,
+	due, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: s.conf.Stream,
+		Group:  s.conf.Group,
+		Idle:   s.conf.ClaimIdle,
+		Start:  cursor,
+		End:    "+",
+		Count:  int64(n),
 	}).Result()
 	if err != nil {
-		return nil, cursor, fmt.Errorf("redisstream: subscriber %s: claim entries of group %s of stream %s: %w", s.conf.Name, s.conf.Group, s.conf.Stream, err)
+		return nil, cursor, s.claimError(err)
+	}
+	next := claimStart
+	if len(due) == n {
+		next = after(due[n-1].ID)
+	}
+	if len(due) == 0 {
+		return nil, next, nil
+	}
+
+	args := make([]any, 0, 5+len(due))
+	args = append(args, "XCLAIM", s.conf.Stream, s.conf.Group, s.consumer, s.conf.ClaimIdle.Milliseconds())
+	for _, p := range due {
+		args = append(args, p.ID)
+	}
+	reply, err := s.client.Do(ctx, args...).Slice()
+	if err != nil {
+		return nil, cursor, s.claimError(err)
+	}
+	entries, trimmed, err := claimed(reply)
+	if err != nil {
+		return nil, cursor, s.claimError(err)
+	}
+	if trimmed {
+		s.dropTrimmed(ctx, due, entries)
 	}
 	return entries, next, nil
+}
+
+func (s *subscriber) claimError(err error) error {
+	return fmt.Errorf("redisstream: subscriber %s: claim entries of group %s of stream %s: %w", s.conf.Name, s.conf.Group, s.conf.Stream, err)
+}
+
+// claimed converts the reply of XCLAIM to entries. It reports whether the reply held a null, which
+// Redis before 7.0 replies for a pending entry that was trimmed from the stream, after claiming it.
+// The typed XClaim of go-redis fails the whole reply on a null.
+func claimed(reply []any) (entries []redis.XMessage, trimmed bool, err error) {
+	entries = make([]redis.XMessage, 0, len(reply))
+	for _, r := range reply {
+		if r == nil {
+			trimmed = true
+			continue
+		}
+		e, ok := r.([]any)
+		if !ok || len(e) < 2 {
+			return nil, false, errClaimReply
+		}
+		id, ok := e[0].(string)
+		fields, ok2 := e[1].([]any)
+		if !ok || !ok2 || len(fields)%2 != 0 {
+			return nil, false, errClaimReply
+		}
+		values := make(map[string]any, len(fields)/2)
+		for i := 0; i < len(fields); i += 2 {
+			k, ok := fields[i].(string)
+			if !ok {
+				return nil, false, errClaimReply
+			}
+			values[k] = fields[i+1]
+		}
+		entries = append(entries, redis.XMessage{ID: id, Values: values})
+	}
+	return entries, trimmed, nil
+}
+
+// dropTrimmed acknowledges the entries of due that the claim did not return and that are no longer
+// in the stream. Before 7.0, Redis keeps a pending entry that was trimmed from the stream in the
+// group, and every claim takes it again; since 7.0, the claim drops it. An entry that the claim
+// skipped because another consumer claimed it first is still in the stream, so it is left alone.
+// A failure is left to a later claim: the trimmed entries stay pending to this consumer until they
+// are idle for ClaimIdle again.
+func (s *subscriber) dropTrimmed(ctx context.Context, due []redis.XPendingExt, entries []redis.XMessage) {
+	returned := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		returned[e.ID] = true
+	}
+	pipe := s.client.Pipeline()
+	ranges := make(map[string]*redis.XMessageSliceCmd, len(due)-len(entries))
+	for _, p := range due {
+		if !returned[p.ID] {
+			ranges[p.ID] = pipe.XRange(ctx, s.conf.Stream, p.ID, p.ID)
+		}
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return
+	}
+	var gone []string
+	for id, r := range ranges {
+		if len(r.Val()) == 0 {
+			gone = append(gone, id)
+		}
+	}
+	if len(gone) > 0 {
+		_ = s.client.XAck(ctx, s.conf.Stream, s.conf.Group, gone...).Err()
+	}
+}
+
+// after returns the entry ID that follows id, where a scan that ended with id goes on, or
+// claimStart for an ID it cannot parse. XPENDING takes exclusive ranges only since Redis 6.2, and
+// miniredis not at all.
+func after(id string) string {
+	ms, seq, ok := strings.Cut(id, "-")
+	m, err := strconv.ParseUint(ms, 10, 64)
+	if !ok || err != nil {
+		return claimStart
+	}
+	n, err := strconv.ParseUint(seq, 10, 64)
+	if err != nil {
+		return claimStart
+	}
+	if n == math.MaxUint64 {
+		return strconv.FormatUint(m+1, 10) + "-0"
+	}
+	return ms + "-" + strconv.FormatUint(n+1, 10)
 }
 
 // read reads up to n new entries, waiting up to s.block for the first one.
@@ -336,9 +458,12 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// transient reports whether err may pass on its own: a lost connection, a timeout, or Redis
-// loading its data or failing over. Any other error reply, such as NOGROUP for a deleted group or
-// NOPERM, stops the subscriber, because trying again cannot fix it.
+// transient reports whether err may pass on its own: a lost connection, a timeout, Redis loading
+// its data or failing over, or Redis refusing commands for a while. A failover also unblocks the
+// reads of a master that turns into a replica (UNBLOCKED), and Redis refuses commands while a
+// script runs too long (BUSY), after a snapshot failed (MISCONF), or while a master lacks the
+// replicas it must write to (NOREPLICAS). Any other error reply, such as NOGROUP for a deleted
+// group or NOPERM, stops the subscriber, because trying again cannot fix it.
 func transient(err error) bool {
 	if errors.Is(err, redis.ErrClosed) {
 		return false
@@ -352,5 +477,9 @@ func transient(err error) bool {
 		redis.IsMasterDownError(err) ||
 		redis.IsClusterDownError(err) ||
 		redis.IsTryAgainError(err) ||
-		redis.IsMaxClientsError(err)
+		redis.IsMaxClientsError(err) ||
+		redis.IsNoReplicasError(err) ||
+		redis.HasErrorPrefix(err, "UNBLOCKED ") ||
+		redis.HasErrorPrefix(err, "BUSY ") || // not BUSYGROUP
+		redis.HasErrorPrefix(err, "MISCONF ")
 }

@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -224,9 +228,9 @@ func integration(t *testing.T, srv redistest.Server) {
 		// ClaimIdle is a minute, so the entry of holding stays where it is, and holding with it.
 		time.Sleep(time.Second)
 		want := map[string]int64{"holding": 1}
-		// Since Redis 7.2, the reads and claims of the live consumers keep them active, so no
-		// sweep finds them idle. Before, only the entries they get do, and on a quiet group each
-		// subscriber sweeps the consumer of the other.
+		// Since Redis 7.2, the reads of the live consumers keep them active, so no sweep finds
+		// them idle. Before, only the entries they get do, and on a quiet group each subscriber
+		// sweeps the consumer of the other.
 		if redistest.AtLeast(t, cl, 7, 2) {
 			want[subs[0].consumer], want[subs[1].consumer] = 0, 0
 		}
@@ -240,4 +244,171 @@ func integration(t *testing.T, srv redistest.Server) {
 			return got[subs[0].consumer]+got[subs[1].consumer] == 1
 		})
 	})
+
+	t.Run("read unblocked by a failover", func(t *testing.T) {
+		cl, cfg := live(t, srv)
+		b := open(t, topology(cfg, SubscriberConfig{}))
+		ch, handle := deliveries()
+		s := openSubscriber(t, b, "billing")
+		s.block = time.Second // so that the read is blocked when CLIENT UNBLOCK comes
+		_, done := consume(t, s, 1, handle)
+
+		// A master that turns into a replica, as in a Sentinel failover, unblocks the blocked
+		// reads with an UNBLOCKED error reply, like CLIENT UNBLOCK … ERROR for one client.
+		eventually(t, "the read to unblock", func() bool {
+			id, ok := blockedRead(t, cl, srv.DB)
+			return ok && cl.ClientUnblockWithError(ctx, id).Val() == 1
+		})
+		msg := worker.NewMessage("order.placed", "", "orders", nil)
+		publish(t, b, msg)
+		if d := next(t, ch); d.Message().ID != msg.ID {
+			t.Fatalf("delivered %s, want %s", d.Message().ID, msg.ID)
+		}
+		select {
+		case <-done:
+			t.Fatal("Consume returned after the read was unblocked")
+		default:
+		}
+	})
+
+	t.Run("trimmed pending entries", func(t *testing.T) {
+		cl, cfg := live(t, srv)
+		b := open(t, topology(cfg, SubscriberConfig{ClaimIdle: time.Second}))
+		trimmed, kept := worker.NewMessage("order.placed", "", "orders", nil), worker.NewMessage("order.placed", "", "orders", nil)
+		publish(t, b, trimmed)
+		publish(t, b, kept)
+		// A consumer that crashed after reading both entries, and the first one was trimmed from
+		// the stream since. Redis 7 drops it from the group when it is claimed, Redis 6.2 claims
+		// it and replies null for it.
+		res, err := cl.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "billing", Consumer: "crashed", Streams: []string{"orders", ">"}, Block: -1}).Result()
+		if err != nil || len(res[0].Messages) != 2 {
+			t.Fatalf("XREADGROUP = %v, %v", res, err)
+		}
+		gone, live := res[0].Messages[0].ID, res[0].Messages[1].ID
+		if err := cl.XDel(ctx, "orders", gone).Err(); err != nil {
+			t.Fatal(err)
+		}
+
+		ch, handle := deliveries()
+		s := openSubscriber(t, b, "billing")
+		_, done := consume(t, s, 2, handle)
+		if d := next(t, ch); d.Message().ID != kept.ID {
+			t.Fatalf("claimed %s, want %s", d.Message().ID, kept.ID)
+		}
+		eventually(t, "the trimmed entry to leave the group", func() bool {
+			p := pending(t, cl)
+			return len(p) == 1 && p[0].ID == live && p[0].Consumer == s.consumer
+		})
+		msg := worker.NewMessage("order.placed", "", "orders", nil)
+		publish(t, b, msg)
+		if d := next(t, ch); d.Message().ID != msg.ID {
+			t.Fatalf("delivered %s, want %s", d.Message().ID, msg.ID)
+		}
+		select {
+		case <-done:
+			t.Fatal("Consume returned after claiming a trimmed entry")
+		default:
+		}
+	})
+
+	t.Run("claims and reads past a retry backlog", func(t *testing.T) {
+		cl, cfg := live(t, srv)
+		b := open(t, topology(cfg, SubscriberConfig{})) // ClaimIdle 1m
+		// 20000 entries wait for their retry, none of them due yet, and behind them the entry of
+		// a consumer that crashed is due.
+		const parked = 20000
+		for i := 0; i < parked; i += 1000 {
+			if _, err := cl.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				for range 1000 {
+					pipe.XAdd(ctx, &redis.XAddArgs{Stream: "orders", Values: []string{PayloadField, "{}"}})
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := cl.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "billing", Consumer: retryConsumer, Streams: []string{"orders", ">"}, Count: parked, Block: -1}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		due := worker.NewMessage("order.placed", "", "orders", nil)
+		publish(t, b, due)
+		res, err := cl.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "billing", Consumer: "crashed", Streams: []string{"orders", ">"}, Block: -1}).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.Do(ctx, "XCLAIM", "orders", "billing", "crashed", 0, res[0].Messages[0].ID, "IDLE", 2*time.Minute.Milliseconds(), "JUSTID").Err(); err != nil {
+			t.Fatal(err)
+		}
+
+		var trips roundTrips
+		b.client.AddHook(&trips)
+		ch, handle := deliveries()
+		consume(t, openSubscriber(t, b, "billing"), 1, handle)
+		// One scan finds the due entry in Redis, where XAUTOCLAIM took a round trip for every ten
+		// pending entries.
+		if d := next(t, ch); d.Message().ID != due.ID {
+			t.Fatalf("claimed %s, want %s", d.Message().ID, due.ID)
+		}
+		if n := trips.n.Load(); n > 10 {
+			t.Fatalf("%d round trips to claim the due entry", n)
+		}
+		// Every scan takes one round trip, so new entries are read between them.
+		trips.n.Store(0)
+		msg := worker.NewMessage("order.placed", "", "orders", nil)
+		publish(t, b, msg)
+		if d := next(t, ch); d.Message().ID != msg.ID {
+			t.Fatalf("delivered %s, want %s", d.Message().ID, msg.ID)
+		}
+		if n := trips.n.Load(); n > 50 {
+			t.Fatalf("%d round trips to read a new entry", n)
+		}
+		if p, err := cl.XPending(ctx, "orders", "billing").Result(); err != nil || p.Count != parked+2 {
+			t.Fatalf("XPENDING = %+v, %v; want the %d parked entries and the 2 delivered", p, err, parked)
+		}
+	})
+}
+
+// blockedRead returns the ID of the client of database db that is blocked in XREADGROUP.
+func blockedRead(t *testing.T, cl *redis.Client, db int) (int64, bool) {
+	t.Helper()
+	list, err := cl.ClientList(context.Background()).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.Lines(list) {
+		fields := strings.Fields(line)
+		if slices.Contains(fields, "db="+strconv.Itoa(db)) && slices.Contains(fields, "cmd=xreadgroup") {
+			for _, f := range fields {
+				if v, ok := strings.CutPrefix(f, "id="); ok {
+					id, err := strconv.ParseInt(v, 10, 64)
+					return id, err == nil
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// roundTrips is a go-redis hook that counts the round trips of a client: commands, and pipelines
+// as one.
+type roundTrips struct {
+	n atomic.Int64
+}
+
+func (r *roundTrips) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (r *roundTrips) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		r.n.Add(1)
+		return next(ctx, cmd)
+	}
+}
+
+func (r *roundTrips) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		r.n.Add(1)
+		return next(ctx, cmds)
+	}
 }
