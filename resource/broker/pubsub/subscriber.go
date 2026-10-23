@@ -19,6 +19,10 @@ const (
 	// that may pass. It doubles with every failure in a row, up to receiveRetryMax.
 	receiveRetryInitial = time.Second
 	receiveRetryMax     = time.Minute
+
+	// ackFlushWait is how long Consume waits, once every handler finished, for the client to send
+	// their acknowledgements before it returns.
+	ackFlushWait = 5 * time.Second
 )
 
 // errReceiveStopped reports that receiving stopped on its own, without an error and before ctx
@@ -32,13 +36,15 @@ type subscriber struct {
 	// deadLetter publishes the messages Reject drops. Nil acknowledges them instead.
 	deadLetter *deadLetter
 
-	// retryInitial and retryMax time the pauses before receiving again. Tests shorten them.
-	retryInitial, retryMax time.Duration
+	// retryInitial, retryMax and flushWait time the pauses before receiving again and the wait for
+	// the last acknowledgements. Tests shorten them.
+	retryInitial, retryMax, flushWait time.Duration
 }
 
 // Consume receives from the subscription and hands every message to state.Handler, with at most
-// state.Concurrency in flight. It returns once ctx ends and every handler finished, or with the
-// error that stopped receiving, such as a missing subscription or missing permissions.
+// state.Concurrency in flight. It returns once ctx ends, every handler finished and the client sent
+// their acknowledgements, for up to five seconds, or with the error that stopped receiving, such as a
+// missing subscription or missing permissions.
 //
 // The client opens its stream again after most failures, but gives up on some that pass when a
 // stream ends with them: an exceeded quota (RESOURCE_EXHAUSTED), an error a proxy or load balancer
@@ -62,8 +68,7 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 	wait := s.retryInitial
 	for {
 		started := time.Now()
-		// Receive returns once every callback returned.
-		err := s.sub.Receive(ctx, handle)
+		err := s.receive(ctx, slots, concurrency, handle)
 		if err == nil {
 			if ctx.Err() == nil {
 				return errReceiveStopped
@@ -81,6 +86,35 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 			return nil
 		}
 		wait = min(2*wait, s.retryMax)
+	}
+}
+
+// receive runs Receive until it returns, or once ctx ended, until every handler finished and the
+// client had flushWait more to send their acknowledgements. Receive returns only after every
+// callback returned and every acknowledgement was sent, which it retries for about a minute while
+// Pub/Sub cannot be reached: then it goes on until the broker closes the client, and the messages
+// whose acknowledgement it did not send are delivered again.
+func (s *subscriber) receive(ctx context.Context, slots *process.ChannelSemaphore, concurrency int, handle func(context.Context, *gpubsub.Message)) error {
+	done := make(chan error, 1)
+	go func() { done <- s.sub.Receive(ctx, handle) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+	}
+
+	// Every handler finished once every slot is taken. The slots are never released, so the callbacks
+	// that come later, once ctx ended, nack their messages instead of starting a handler.
+	for range concurrency {
+		_ = slots.WaitAcquire(context.Background())
+	}
+	t := time.NewTimer(s.flushWait)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		return nil
 	}
 }
 

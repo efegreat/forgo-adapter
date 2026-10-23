@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/efegreat/forgo/server/worker"
 
 	gpubsub "cloud.google.com/go/pubsub/v2"
 )
+
+// publishStopWait is how long Close waits for the messages still being published.
+const publishStopWait = 5 * time.Second
 
 var (
 	// errNoTopic is returned for a message without a Destination, which names its topic.
@@ -72,6 +76,8 @@ func message(msg worker.Message) *gpubsub.Message {
 // use. A client publisher batches the messages published to it concurrently.
 type topics struct {
 	client *gpubsub.Client
+	// stopWait bounds how long stop waits for the messages still being published. Tests shorten it.
+	stopWait time.Duration
 
 	mu      sync.Mutex
 	stopped bool
@@ -79,7 +85,7 @@ type topics struct {
 }
 
 func newTopics(client *gpubsub.Client) *topics {
-	return &topics{client: client, byName: make(map[string]*gpubsub.Publisher)}
+	return &topics{client: client, stopWait: publishStopWait, byName: make(map[string]*gpubsub.Publisher)}
 }
 
 // publish sends m to the topic name and waits until Pub/Sub has stored it or ctx ends.
@@ -120,7 +126,11 @@ func (t *topics) get(name string) (*gpubsub.Publisher, error) {
 	return p, nil
 }
 
-// stop sends the messages still being published and stops every client publisher.
+// stop sends the messages still being published and stops every client publisher, for at most
+// stopWait. The broker stops its topics once the worker's publishers are done, so a message that is
+// still pending then is one whose publish gave up waiting for it, such as while Pub/Sub does not
+// answer: the outbox publishes it again. The client would retry it for a minute. Closing the client
+// ends those retries.
 func (t *topics) stop() {
 	t.mu.Lock()
 	t.stopped = true
@@ -128,9 +138,19 @@ func (t *topics) stop() {
 	t.byName = nil
 	t.mu.Unlock()
 
-	var wg sync.WaitGroup
-	for _, p := range publishers {
-		wg.Go(p.Stop)
+	stopped := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		for _, p := range publishers {
+			wg.Go(p.Stop)
+		}
+		wg.Wait()
+		close(stopped)
+	}()
+	timer := time.NewTimer(t.stopWait)
+	defer timer.Stop()
+	select {
+	case <-stopped:
+	case <-timer.C:
 	}
-	wg.Wait()
 }
