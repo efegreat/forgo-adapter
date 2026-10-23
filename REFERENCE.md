@@ -575,6 +575,8 @@ Publishers have no settings. `NewPublisher` accepts every `worker.PublisherConfi
 
 An unknown subscriber name fails the server at startup. A missing subscription does not, because `roles/pubsub.subscriber` cannot read subscriptions. Instead, receiving fails at once with `pubsub: subscriber billing: receive from projects/<project>/subscriptions/billing`, followed by Pub/Sub's `NotFound` or `PermissionDenied`, and the worker server stops the app.
 
+While Pub/Sub cannot be reached, the client opens its stream again by itself. It gives up when a stream ends with some errors that pass: an exceeded quota (`ResourceExhausted`), an error a proxy or load balancer sent (`Unknown`), or a server that shut down. The subscriber then receives again, after a pause that doubles from a second up to a minute with every failure in a row. Other errors, such as `NotFound` or `PermissionDenied`, stop the app as above.
+
 The worker's `SubscriberConfig.Concurrency` bounds how many messages are handled at once. The subscriber extends the ack deadline of every message it holds for up to 60 minutes. A handler that runs longer has its message delivered again meanwhile, so bound slow handlers with `HandlerConfig.Timeout`. On shutdown, the subscriber stops pulling and waits for every running handler, and the client sends their acknowledgements before `Consume` returns. Delivered messages whose handler had not started are nacked, so they are delivered again.
 
 #### Messages on the wire

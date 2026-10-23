@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -20,6 +21,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 )
@@ -674,6 +677,138 @@ func TestConsumeMissingSubscription(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Consume did not fail")
+	}
+}
+
+// endedStream is a StreamingPull stream that the server ended with err as soon as it opened.
+type endedStream struct {
+	ctx context.Context
+	err error
+}
+
+func (s *endedStream) Header() (metadata.MD, error) { return nil, nil }
+func (s *endedStream) Trailer() metadata.MD         { return nil }
+func (s *endedStream) CloseSend() error             { return nil }
+func (s *endedStream) Context() context.Context     { return s.ctx }
+func (s *endedStream) SendMsg(any) error            { return nil }
+func (s *endedStream) RecvMsg(any) error            { return s.err }
+
+// endingStreams is fake for a server that ends the first n StreamingPull streams with err once
+// they opened, as Pub/Sub ends a stream with a status. It returns the number of streams opened.
+// pstest cannot inject errors into StreamingPull, so the client's connection does.
+func endingStreams(t *testing.T, n int32, err error) (*pstest.Server, Config, *atomic.Int32) {
+	t.Helper()
+	srv := pstest.NewServer()
+	streams := new(atomic.Int32)
+	conn, cerr := grpc.NewClient(srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			if strings.HasSuffix(method, "/StreamingPull") && streams.Add(1) <= n {
+				return &endedStream{ctx: ctx, err: err}, nil
+			}
+			return streamer(ctx, desc, cc, method, opts...)
+		}))
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+		_ = srv.Close()
+	})
+	return srv, Config{Name: "events", ProjectID: project, Options: []option.ClientOption{option.WithGRPCConn(conn)}}, streams
+}
+
+// quickRetries returns the subscriber name of b, which pauses briefly before receiving again.
+func quickRetries(t *testing.T, b *broker, name string) *subscriber {
+	t.Helper()
+	s, err := b.NewSubscriber(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := s.(*subscriber)
+	sub.retryInitial, sub.retryMax = 10*time.Millisecond, 40*time.Millisecond
+	return sub
+}
+
+func TestConsumeReceivesAgain(t *testing.T) {
+	// Statuses the client gives up on when a stream ends with them, and that pass.
+	for _, err := range []error{
+		status.Error(codes.ResourceExhausted, "Quota exceeded for quota metric 'StreamingPull subscriber throughput' of service 'pubsub.googleapis.com'"),
+		status.Error(codes.Unknown, "unexpected HTTP status code received from server: 520"),
+		status.Error(codes.Unavailable, "Server shutdownNow invoked"),
+	} {
+		t.Run(status.Code(err).String(), func(t *testing.T) {
+			srv, cfg, streams := endingStreams(t, 3, err)
+			b := open(t, topology(cfg, SubscriptionConfig{}))
+			ch, handle := deliveries()
+			stop := consumeWith(t, quickRetries(t, b, "billing"), 1, handle)
+			eventually(t, "a stream that stays open", func() bool { return streams.Load() > 3 })
+
+			msg := worker.NewMessage("order.placed", "", "orders", nil)
+			publish(t, b, msg)
+			d := next(t, ch)
+			if d.Message().ID != msg.ID {
+				t.Fatalf("delivered %s, want %s", d.Message().ID, msg.ID)
+			}
+			if err := d.Complete(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, "the ack", func() bool { return acks(srv, msg.ID) == 1 })
+			if err := stop(); err != nil {
+				t.Fatalf("Consume() = %v", err)
+			}
+		})
+	}
+
+	t.Run("lasting", func(t *testing.T) {
+		_, cfg, streams := endingStreams(t, 100, status.Error(codes.PermissionDenied, "User not authorized to perform this action."))
+		b := open(t, topology(cfg, SubscriptionConfig{}))
+		_, handle := deliveries()
+		stop := consumeWith(t, quickRetries(t, b, "billing"), 1, handle)
+		eventually(t, "the stream", func() bool { return streams.Load() == 1 })
+		err := stop()
+		if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "pubsub: subscriber billing: receive from projects/proj/subscriptions/billing") {
+			t.Fatalf("Consume() = %v", err)
+		}
+		if n := streams.Load(); n != 1 {
+			t.Fatalf("%d streams, want 1", n)
+		}
+	})
+
+	t.Run("stopped while pausing", func(t *testing.T) {
+		_, cfg, streams := endingStreams(t, 100, status.Error(codes.ResourceExhausted, "Quota exceeded"))
+		b := open(t, topology(cfg, SubscriptionConfig{}))
+		s := quickRetries(t, b, "billing")
+		s.retryInitial, s.retryMax = time.Minute, time.Minute
+		_, handle := deliveries()
+		stop := consumeWith(t, s, 1, handle)
+		eventually(t, "the stream", func() bool { return streams.Load() == 1 })
+		if err := stop(); err != nil {
+			t.Fatalf("Consume() = %v", err)
+		}
+	})
+}
+
+func TestRetryable(t *testing.T) {
+	for code, want := range map[codes.Code]bool{
+		codes.ResourceExhausted:  true,
+		codes.Unknown:            true,
+		codes.Unavailable:        true,
+		codes.Internal:           true,
+		codes.DeadlineExceeded:   true,
+		codes.Aborted:            true,
+		codes.NotFound:           false,
+		codes.PermissionDenied:   false,
+		codes.InvalidArgument:    false,
+		codes.FailedPrecondition: false,
+		codes.Unauthenticated:    false,
+		codes.Canceled:           false,
+	} {
+		if got := retryable(fmt.Errorf("receive: %w", status.Error(code, "x"))); got != want {
+			t.Errorf("retryable(%s) = %v, want %v", code, got, want)
+		}
+	}
+	if retryable(errors.New("not a status")) {
+		t.Error("retryable(non-status error) = true")
 	}
 }
 
