@@ -221,7 +221,10 @@ func deleteTopology(t *testing.T, url string, cfg Config) {
 		return
 	}
 	for _, q := range cfg.Queues {
-		queues := []string{q.Name, q.DeadLetter.Queue}
+		queues := []string{q.Name}
+		if q.DeadLetter.Enabled {
+			queues = append(queues, q.DeadLetter.Queue)
+		}
 		for _, rq := range q.Retry.queues(q.Name) {
 			queues = append(queues, rq.name)
 		}
@@ -231,9 +234,11 @@ func deleteTopology(t *testing.T, url string, cfg Config) {
 				return
 			}
 		}
-		if err := ch.ExchangeDelete(q.DeadLetter.Exchange, false, false); err != nil {
-			t.Errorf("delete exchange %s: %v", q.DeadLetter.Exchange, err)
-			return
+		if q.DeadLetter.Enabled {
+			if err := ch.ExchangeDelete(q.DeadLetter.Exchange, false, false); err != nil {
+				t.Errorf("delete exchange %s: %v", q.DeadLetter.Exchange, err)
+				return
+			}
 		}
 	}
 	for _, e := range cfg.Exchanges {

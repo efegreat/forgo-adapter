@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/efegreat/forgo/process"
 	"github.com/efegreat/forgo/server/worker"
@@ -19,17 +20,14 @@ var errDeliveriesClosed = errors.New("rabbitmq: delivery channel closed by the b
 type consumeChannel interface {
 	Qos(prefetchCount, prefetchSize int, global bool) error
 	Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error)
+	Cancel(consumer string, noWait bool) error
+	IsClosed() bool
 	Close() error
 }
 
 // subscriber is the worker.ISubscriber of a SubscriberConfig. It consumes on a channel of its own.
 type subscriber struct {
-	conf SubscriberConfig
-	ch   consumeChannel
-	// tag is the consumer tag, under which the recovery reports a failed re-subscription to lost.
-	tag     string
-	guard   *ackGuard
-	lost    *consumerLoss
+	*subscription
 	retry   *retrier
 	release func()
 }
@@ -42,18 +40,11 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 	if err := s.ch.Qos(prefetch(s.conf.Prefetch, state.Concurrency), 0, false); err != nil {
 		return fmt.Errorf("rabbitmq: subscriber %s: set prefetch: %w", s.conf.Name, err)
 	}
-	msgs, err := s.ch.Consume(
-		s.conf.Queue,
-		s.tag,
-		false, // the worker settles every message
-		s.conf.Exclusive,
-		s.conf.NoLocal,
-		s.conf.NoWait,
-		s.conf.Args,
-	)
+	st, err := s.start()
 	if err != nil {
 		return fmt.Errorf("rabbitmq: subscriber %s: consume queue %s: %w", s.conf.Name, s.conf.Queue, err)
 	}
+	defer s.stop()
 
 	runner := process.NewConcurrentRunner(process.NewChannelSemaphore(state.Concurrency))
 	defer runner.Wait()
@@ -64,14 +55,22 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 			return nil
 		case <-s.lost.done:
 			return s.lost.err
-		case msg, ok := <-msgs:
+		case msg, ok := <-st.deliveries:
 			if !ok {
 				if ctx.Err() != nil {
 					return nil
 				}
-				return errDeliveriesClosed
+				if st, err = s.next(ctx, st); st == nil {
+					return err
+				}
+				continue
 			}
-			d := newDelivery(msg, s.guard, s.retry)
+			if st.gen != s.guard.generation() {
+				// The channel that delivered it was lost: the broker requeued the message, and an
+				// acknowledgement would settle a message of the reopened channel.
+				continue
+			}
+			d := newDelivery(msg, s.guard, st.gen, s.retry)
 			err := runner.Run(ctx, func() {
 				state.Handler(ctx, d)
 			})
@@ -110,4 +109,186 @@ func prefetch(configured, concurrency int) int {
 	default:
 		return min(max(concurrency, 1), maxPrefetch)
 	}
+}
+
+// subscription is the consumer of a subscriber's channel, and the streams it delivers on.
+//
+// The client's recovery would resume the consumer on the stream it had. Deliveries of the lost
+// channel that the client still buffers would then come first on it, and pass for deliveries of
+// the reopened channel, whose delivery tags start over: their acknowledgements would settle other
+// messages, or close the channel with an unknown delivery tag, again and again. So once the client
+// reopened the channel, the recovery cancels the client's consumer instead, which ends the stream
+// after the deliveries it buffers, and subscribes again on a new stream. Each stream carries the
+// ackGuard generation of the channel it delivers for, and Consume drops the deliveries of a stream
+// whose channel was lost.
+type subscription struct {
+	conf SubscriberConfig
+	ch   consumeChannel
+	// tag is the consumer tag, unique on the connection.
+	tag   string
+	guard *ackGuard
+	lost  *consumerLoss
+
+	mu sync.Mutex
+	// stream is the current stream, nil until Consume subscribes.
+	stream *stream
+	// consuming is set while Consume runs. The recovery subscribes again only then.
+	consuming bool
+	// replacing is set from the moment the recovery canceled the client's consumer until it
+	// subscribed again or gave up.
+	replacing bool
+	// changed is closed, and replaced, whenever stream or replacing changes.
+	changed chan struct{}
+}
+
+// stream is the deliveries of a consumer on one incarnation of its channel, the one whose ackGuard
+// generation is gen.
+type stream struct {
+	deliveries <-chan amqp.Delivery
+	gen        uint64
+}
+
+func newSubscription(conf SubscriberConfig, ch consumeChannel, tag string) *subscription {
+	return &subscription{
+		conf:    conf,
+		ch:      ch,
+		tag:     tag,
+		guard:   &ackGuard{},
+		lost:    newConsumerLoss(),
+		changed: make(chan struct{}),
+	}
+}
+
+// subscribe subscribes the consumer on a new stream. The caller holds s.mu.
+func (s *subscription) subscribe() error {
+	deliveries, err := s.ch.Consume(s.conf.Queue, s.tag, false, s.conf.Exclusive, s.conf.NoLocal, s.conf.NoWait, s.conf.Args)
+	if err != nil {
+		return err
+	}
+	s.stream = &stream{deliveries: deliveries, gen: s.guard.generation()}
+	s.notify()
+	return nil
+}
+
+// notify wakes the callers of next. The caller holds s.mu.
+func (s *subscription) notify() {
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
+// start subscribes for Consume, and returns the stream.
+func (s *subscription) start() (*stream, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.subscribe(); err != nil {
+		return nil, err
+	}
+	s.consuming = true
+	return s.stream, nil
+}
+
+// stop records that Consume returned.
+func (s *subscription) stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.consuming = false
+}
+
+// next returns the stream that replaces cur, which ended. Without one, it returns nil and what
+// Consume returns: errDeliveriesClosed when no recovery replaces cur, the consumer's loss, or nil
+// once ctx ends.
+func (s *subscription) next(ctx context.Context, cur *stream) (*stream, error) {
+	for {
+		s.mu.Lock()
+		st, replacing, changed := s.stream, s.replacing, s.changed
+		s.mu.Unlock()
+
+		if s.lost.reported() {
+			return nil, s.lost.err
+		}
+		if st != cur && st != nil {
+			return st, nil
+		}
+		if !replacing {
+			return nil, errDeliveriesClosed
+		}
+		select {
+		case <-changed:
+		case <-s.lost.done:
+			return nil, s.lost.err
+		case <-ctx.Done():
+			return nil, nil
+		}
+	}
+}
+
+// lose marks the deliveries of the channel stale, before the client reopens it. The hook of a
+// channel of a lost connection can run late, once the connection's recovery reopened the channel
+// and subscribed again, so unless always, for the connection's own hook, a channel that is open
+// again keeps its stream.
+func (s *subscription) lose(always bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if always || s.ch.IsClosed() {
+		s.guard.invalidate()
+	}
+}
+
+// detach cancels the client's consumer on the reopened channel, before the client's recovery would
+// resume it on the current stream. The client ends the stream once it handed out what it buffers.
+// detach reports whether the subscription waits for resubscribe.
+func (s *subscription) detach() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stream == nil || s.lost.reported() {
+		return false, nil
+	}
+	if s.replacing {
+		// An earlier attempt of the client's recovery canceled it.
+		return true, nil
+	}
+	// The broker has no consumer of that tag on the reopened channel, and acknowledges the
+	// cancellation anyway.
+	if err := s.ch.Cancel(s.tag, false); err != nil {
+		return false, fmt.Errorf("rabbitmq: subscriber %s: cancel the consumer of the lost channel: %w", s.conf.Name, err)
+	}
+	s.replacing = true
+	return true, nil
+}
+
+// resubscribe subscribes a detached subscription again on a new stream, after declare, or reports
+// it lost. A subscription that Consume no longer reads stays without a consumer.
+func (s *subscription) resubscribe(declare func() error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.replacing {
+		return
+	}
+	s.replacing = false
+	defer s.notify()
+	if !s.consuming {
+		s.stream = nil
+		return
+	}
+
+	err := declare()
+	if err == nil {
+		err = s.subscribe()
+	}
+	if err != nil {
+		s.lost.report(fmt.Errorf("consumer %s of queue %s: %w", s.tag, s.conf.Queue, err))
+	}
+}
+
+// giveUp reports a subscription that a recovery detached and could not subscribe again, unless
+// skip reports another recovery in progress.
+func (s *subscription) giveUp(skip func() bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.replacing || skip() {
+		return
+	}
+	s.lost.report(errRecoveryFailed)
+	s.replacing = false
+	s.notify()
 }

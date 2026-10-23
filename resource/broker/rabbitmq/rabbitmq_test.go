@@ -359,7 +359,7 @@ func TestPublishingRoundTrip(t *testing.T) {
 		Body:       p.Body,
 		RoutingKey: "order.placed",
 		Exchange:   "shop",
-	}, &ackGuard{}, nil).Message()
+	}, &ackGuard{}, 0, nil).Message()
 	if got.ID != msg.ID || got.Name != msg.Name || !got.CreatedAt.Equal(created) || got.Key != "order.placed" || got.Destination != "shop" {
 		t.Fatalf("consumed message = %+v, want the published identity", got)
 	}
@@ -383,7 +383,7 @@ func TestDeliveryFallsBackToProperties(t *testing.T) {
 		MessageId: "external-id",
 		Type:      "invoice.paid",
 		Headers:   amqp.Table{"retries": int32(2), "source": "erp"},
-	}, &ackGuard{}, nil).Message()
+	}, &ackGuard{}, 0, nil).Message()
 
 	if got.ID != "external-id" || got.Name != "invoice.paid" {
 		t.Fatalf("message = %+v, want ID and name from the AMQP properties", got)
@@ -411,7 +411,7 @@ func TestDeliveryConvertsHeaderValues(t *testing.T) {
 				"time":         time.Unix(1_700_000_000, 0),
 			}},
 		},
-	}, &ackGuard{}, nil).Message()
+	}, &ackGuard{}, 0, nil).Message()
 
 	if got.ID != "42" || !got.CreatedAt.Equal(created) {
 		t.Fatalf("message = %+v, want the identity from the converted headers", got)

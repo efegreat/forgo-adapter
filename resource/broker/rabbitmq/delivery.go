@@ -27,11 +27,11 @@ type delivery struct {
 }
 
 // newDelivery wraps raw, an AMQP delivery of a subscriber channel that guard protects against
-// recovery, and whose queue has the retry queues of retry, if any. Header values that are not
-// strings are converted by headerValue. Messages published without the identity headers, for
-// example by another producer, take their ID from the message_id property and their name from the
-// type property.
-func newDelivery(raw amqp.Delivery, guard *ackGuard, retry *retrier) *delivery {
+// recovery, delivered by the incarnation of the channel whose generation is gen, and whose queue
+// has the retry queues of retry, if any. Header values that are not strings are converted by
+// headerValue. Messages published without the identity headers, for example by another producer,
+// take their ID from the message_id property and their name from the type property.
+func newDelivery(raw amqp.Delivery, guard *ackGuard, gen uint64, retry *retrier) *delivery {
 	headers := types.NewJSONMap[string]()
 	for k, v := range raw.Headers {
 		headers.Set(k, headerValue(v))
@@ -47,7 +47,7 @@ func newDelivery(raw amqp.Delivery, guard *ackGuard, retry *retrier) *delivery {
 		delivery: raw,
 		msg:      worker.NewMessageFromDelivery(raw.RoutingKey, raw.Exchange, raw.Body, headers),
 		guard:    guard,
-		gen:      guard.generation(),
+		gen:      gen,
 		retry:    retry,
 	}
 }
