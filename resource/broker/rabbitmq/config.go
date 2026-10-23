@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"net"
 	"time"
 
 	"github.com/efegreat/forgo"
@@ -98,6 +99,16 @@ func (c Config) Sanitize() Config {
 
 // New connects and declares the topology. A failure closes the connection.
 func (c Config) New() (forgo.Resource, error) {
+	b, err := c.open(nil)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// open is New, dialing through dial unless it is nil. The tests of recovery dial through a network
+// they can cut.
+func (c Config) open(dial func(network, addr string) (net.Conn, error)) (*broker, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -107,13 +118,12 @@ func (c Config) New() (forgo.Resource, error) {
 		conf:        cfg,
 		subscribers: make(map[string]SubscriberConfig, len(cfg.Subscribers)),
 		publishers:  make(map[string]PublisherConfig, len(cfg.Publishers)),
-		owned:       make(map[*amqp.Channel]*ackGuard),
-		consumers:   make(map[string]*consumerLoss),
+		dial:        dial,
+		owned:       make(map[*amqp.Channel]ownedChannel),
 	}
 	if err := b.init(); err != nil {
 		return nil, err
 	}
-
 	return b, nil
 }
 
@@ -147,12 +157,14 @@ func (c Config) validate() error {
 }
 
 // RecoveryConfig configures the automatic recovery of the client (amqp091-go). After the connection
-// or a channel is lost, it reconnects, reopens every channel with its prefetch and confirm mode,
-// redeclares the exchanges, queues and bindings, and resubscribes the consumers.
+// or a channel is lost, it reconnects, reopens every channel with its prefetch and confirm mode, and
+// redeclares the exchanges, queues and bindings. The broker then subscribes every subscriber again,
+// and publishes wait while the client reopens their channel.
 //
 // Messages that were delivered but not yet acknowledged when the connection was lost are
 // redelivered by the broker. Their late acknowledgements are dropped with errStaleDelivery
-// instead of reaching the recovered channel, whose delivery tags start over.
+// instead of reaching the recovered channel, whose delivery tags start over, and the deliveries
+// that no handler took yet are dropped.
 type RecoveryConfig struct {
 	// Disabled turns recovery off: a lost connection stops every subscriber and fails every
 	// publish until the application restarts.

@@ -16,6 +16,9 @@ var (
 	// errNacked is returned when the broker refuses responsibility for a message, for example
 	// because a queue it routes to is full and rejects publishes.
 	errNacked = errors.New("rabbitmq: broker nacked the message")
+	// errChannelLost is returned when the publisher's channel was lost before the broker confirmed
+	// the message, which the client then settles as a nack. The broker may have stored it.
+	errChannelLost = errors.New("rabbitmq: publisher channel lost before the broker confirmed the message")
 	// errUnroutable is returned when a mandatory message matches no queue.
 	errUnroutable = errors.New("rabbitmq: mandatory message is unroutable")
 	// errNotConfirming is returned when the channel gives no confirmation to wait for, which it
@@ -26,6 +29,7 @@ var (
 // publishChannel is the part of *amqp.Channel a Publisher uses.
 type publishChannel interface {
 	PublishWithDeferredConfirmWithContext(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) (*amqp.DeferredConfirmation, error)
+	IsClosed() bool
 	Close() error
 }
 
@@ -42,6 +46,8 @@ type publisher struct {
 	ch   publishChannel
 	// returns receives unroutable mandatory messages. It is nil unless conf.Mandatory is set.
 	returns <-chan amqp.Return
+	// gate holds publishes back while the client reopens the channel.
+	gate    *gate
 	release func()
 
 	// mu keeps one publish in flight per channel, so a return can be matched to its publish.
@@ -60,23 +66,31 @@ func (p *publisher) publish(ctx context.Context, exchange, key string, msg amqp.
 	defer p.mu.Unlock()
 
 	p.dropReturns()
-	dc, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, p.conf.Mandatory, false, msg)
+	var dc *amqp.DeferredConfirmation
+	losses, err := p.gate.send(ctx, p.ch.IsClosed, func() (err error) {
+		dc, err = p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, p.conf.Mandatory, false, msg)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("rabbitmq: publish %s: %w", id, err)
 	}
 	if dc == nil {
 		return fmt.Errorf("%w: %s", errNotConfirming, id)
 	}
-	return p.await(ctx, dc, id)
+	return p.await(ctx, dc, id, losses)
 }
 
-// await waits for the confirm of the message with the given ID.
-func (p *publisher) await(ctx context.Context, c confirmation, id string) error {
+// await waits for the confirm of the message with the given ID, sent once the channel had been lost
+// losses times.
+func (p *publisher) await(ctx context.Context, c confirmation, id string, losses uint64) error {
 	acked, err := c.WaitContext(ctx)
 	if err != nil {
 		return fmt.Errorf("rabbitmq: wait for the confirm of %s: %w", id, err)
 	}
 	if !acked {
+		if lost := p.gate.lostSince(losses); lost != nil {
+			return fmt.Errorf("%w: %s: %w", errChannelLost, id, lost)
+		}
 		return fmt.Errorf("%w: %s", errNacked, id)
 	}
 

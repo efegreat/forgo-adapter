@@ -13,16 +13,38 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// recordingRecovery is the client recovery the hooks delegate to.
+// recordingRecovery is the client recovery the hooks delegate to. during, when set, runs in its
+// place, while the client would reopen the connection or channel.
 type recordingRecovery struct {
 	connections int
 	channels    []*amqp.Channel
+	during      func()
 }
 
-func (r *recordingRecovery) OnConnectionClose(*amqp.Connection, *amqp.Error) { r.connections++ }
+func (r *recordingRecovery) OnConnectionClose(*amqp.Connection, *amqp.Error) {
+	r.connections++
+	if r.during != nil {
+		r.during()
+	}
+}
 
 func (r *recordingRecovery) OnChannelClose(ch *amqp.Channel, _ *amqp.Error) {
 	r.channels = append(r.channels, ch)
+	if r.during != nil {
+		r.during()
+	}
+}
+
+// recordingTopology is the client's topology recovery, which records its calls in log and fails
+// with err.
+type recordingTopology struct {
+	log *callLog
+	err error
+}
+
+func (r *recordingTopology) RecoverTopology(_ *amqp.Connection, channels []*amqp.Channel) ([]amqp.TopologyRecoveryEntity, error) {
+	r.log.add(fmt.Sprintf("recover %d channels", len(channels)))
+	return nil, r.err
 }
 
 // fakeAcknowledger records the acknowledgements sent for a delivery.
@@ -120,7 +142,7 @@ func TestDeliveryAcknowledgements(t *testing.T) {
 			ack := &fakeAcknowledger{}
 			guard := &ackGuard{}
 
-			d := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, nil)
+			d := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, guard.generation(), nil)
 			if err := tt.settle(d); err != nil {
 				t.Fatal(err)
 			}
@@ -128,7 +150,7 @@ func TestDeliveryAcknowledgements(t *testing.T) {
 				t.Fatalf("acknowledgements = %q, want %q", ack.calls, tt.want)
 			}
 
-			stale := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, nil)
+			stale := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, guard.generation(), nil)
 			guard.invalidate()
 			if err := tt.settle(stale); !errors.Is(err, errStaleDelivery) {
 				t.Fatalf("settle after recovery = %v, want errStaleDelivery", err)
@@ -140,94 +162,284 @@ func TestDeliveryAcknowledgements(t *testing.T) {
 	}
 }
 
+// gateState reports whether g holds publishes back, without waiting.
+func gateState(g *gate) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.closed > 0 {
+		return "closed"
+	}
+	return "open"
+}
+
 func TestRecoveryHooks(t *testing.T) {
-	sub, pub, unowned := new(amqp.Channel), new(amqp.Channel), new(amqp.Channel)
-	guard := &ackGuard{}
+	subCh, pubCh, topologyCh, unowned := new(amqp.Channel), new(amqp.Channel), new(amqp.Channel), new(amqp.Channel)
+	fake := &fakeConsumeChannel{}
+	sub := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, fake, "forgo-s-1")
+	pubGate := &gate{}
 	next := &recordingRecovery{}
-	b := &broker{owned: map[*amqp.Channel]*ackGuard{sub: guard, pub: nil}}
+	b := &broker{owned: map[*amqp.Channel]ownedChannel{
+		subCh:      {sub: sub},
+		pubCh:      {gate: pubGate},
+		topologyCh: {},
+	}}
 	hooks := &recoveryHooks{broker: b, next: next}
 
 	hooks.OnChannelClose(unowned, &amqp.Error{Code: 404})
-	if len(next.channels) != 0 || guard.generation() != 0 {
+	if len(next.channels) != 0 {
 		t.Fatal("an unowned channel was recovered")
 	}
 
-	hooks.OnChannelClose(pub, &amqp.Error{Code: 406})
-	if len(next.channels) != 1 || next.channels[0] != pub || guard.generation() != 0 {
-		t.Fatalf("publisher channel close: recovered %v, guard %d", next.channels, guard.generation())
+	var during string
+	next.during = func() { during = gateState(pubGate) }
+	hooks.OnChannelClose(pubCh, &amqp.Error{Code: 404, Reason: "NOT_FOUND"})
+	if len(next.channels) != 1 || next.channels[0] != pubCh || during != "closed" || gateState(pubGate) != "open" {
+		t.Fatalf("publisher channel close: recovered %v, gate %s while reopened and %s after", next.channels, during, gateState(pubGate))
+	}
+	if lost := pubGate.lostSince(0); lost == nil || !strings.Contains(lost.Error(), "NOT_FOUND") {
+		t.Fatalf("the gate recorded the loss as %v", lost)
+	}
+	next.during = nil
+
+	fake.setClosed(true)
+	hooks.OnChannelClose(subCh, &amqp.Error{Code: 406})
+	if len(next.channels) != 2 || sub.guard.generation() != 1 {
+		t.Fatalf("subscriber channel close: recovered %d channels, guard %d", len(next.channels), sub.guard.generation())
 	}
 
-	hooks.OnChannelClose(sub, &amqp.Error{Code: 406})
-	if len(next.channels) != 2 || guard.generation() != 1 {
-		t.Fatalf("subscriber channel close: recovered %d channels, guard %d", len(next.channels), guard.generation())
+	// The hook of a channel that its connection's recovery already reopened leaves it alone.
+	fake.setClosed(false)
+	hooks.OnChannelClose(subCh, &amqp.Error{Code: 320})
+	if sub.guard.generation() != 1 {
+		t.Fatal("a late hook marked the reopened channel's deliveries stale")
 	}
 
+	hooks.OnChannelClose(topologyCh, &amqp.Error{Code: 406})
+	if len(next.channels) != 4 {
+		t.Fatal("the topology channel was not recovered")
+	}
+
+	next.during = func() { during = gateState(pubGate) }
 	hooks.OnConnectionClose(nil, &amqp.Error{Code: 320})
-	if next.connections != 1 || guard.generation() != 2 {
-		t.Fatalf("connection close: recoveries %d, guard %d", next.connections, guard.generation())
+	if next.connections != 1 || sub.guard.generation() != 2 || during != "closed" || gateState(pubGate) != "open" {
+		t.Fatalf("connection close: recoveries %d, guard %d, gate %s while reconnecting and %s after", next.connections, sub.guard.generation(), during, gateState(pubGate))
 	}
 
-	b.disown(sub)
-	hooks.OnChannelClose(sub, &amqp.Error{Code: 406})
-	if len(next.channels) != 2 {
+	b.disown(subCh)
+	hooks.OnChannelClose(subCh, &amqp.Error{Code: 406})
+	if len(next.channels) != 4 {
 		t.Fatal("a closed subscriber's channel was recovered")
 	}
 }
 
-// reported tells whether a loss was reported, without waiting.
-func reported(l *consumerLoss) bool {
-	select {
-	case <-l.done:
-		return true
-	default:
-		return false
+// consumingSubscription returns a subscription that Consume reads, on a fake channel recording its
+// calls in log.
+func consumingSubscription(t *testing.T, log *callLog) (*subscription, *fakeConsumeChannel) {
+	t.Helper()
+	ch := &fakeConsumeChannel{log: log}
+	s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, "forgo-s-1")
+	if _, err := s.start(); err != nil {
+		t.Fatal(err)
+	}
+	return s, ch
+}
+
+func TestRecoverTopology(t *testing.T) {
+	log := &callLog{}
+	subCh, pubCh := new(amqp.Channel), new(amqp.Channel)
+	sub, fake := consumingSubscription(t, log)
+	b := &broker{owned: map[*amqp.Channel]ownedChannel{subCh: {sub: sub}, pubCh: {gate: &gate{}}}}
+	topology := &recordingTopology{log: log}
+	hooks := &recoveryHooks{broker: b, topology: topology}
+
+	if _, err := hooks.RecoverTopology(nil, []*amqp.Channel{subCh, pubCh}); err != nil {
+		t.Fatal(err)
+	}
+	// The client recovers no consumer of its own: the subscriber is subscribed again once the rest of
+	// the topology is back, on a new stream.
+	want := "consume forgo-s-1, cancel forgo-s-1, recover 2 channels, consume forgo-s-1"
+	if got := log.String(); got != want {
+		t.Fatalf("calls %q, want %q", got, want)
+	}
+	if len(fake.streams) != 2 || sub.stream == nil || sub.replacing || sub.lost.reported() {
+		t.Fatalf("after the recovery: %d streams, replacing %v, lost %v", len(fake.streams), sub.replacing, sub.lost.reported())
 	}
 }
 
-func TestRecoveryReportsLostConsumer(t *testing.T) {
-	b := &broker{consumers: make(map[string]*consumerLoss)}
-	hooks := &recoveryHooks{broker: b}
-	tag, lost := b.addConsumer("billing")
-	otherTag, other := b.addConsumer("billing")
-	if tag == otherTag {
-		t.Fatalf("two subscribers share the consumer tag %q", tag)
-	}
+func TestRecoverTopologyFailures(t *testing.T) {
+	errDown := errors.New("connection lost")
 
-	refused := &amqp.Error{Code: amqp.AccessRefused, Reason: "queue 'billing' in exclusive use"}
-	skipped := []amqp.TopologyRecoveryEntity{
-		// Only consumers are matched by tag: a queue may have any name.
-		{EntityType: amqp.TopologyEntityQueue, EntityName: tag, Err: refused},
-		{EntityType: amqp.TopologyEntityConsumer, EntityName: "ctag-elsewhere-1", Err: refused},
-	}
-	for _, e := range skipped {
-		if !hooks.OnTopologyEntityError(nil, e) {
-			t.Fatalf("%v aborted the recovery", e)
+	t.Run("cancel failed", func(t *testing.T) {
+		subCh := new(amqp.Channel)
+		sub, fake := consumingSubscription(t, nil)
+		fake.cancelErr = errDown
+		topology := &recordingTopology{log: &callLog{}}
+		hooks := &recoveryHooks{broker: &broker{owned: map[*amqp.Channel]ownedChannel{subCh: {sub: sub}}}, topology: topology}
+
+		if _, err := hooks.RecoverTopology(nil, []*amqp.Channel{subCh}); !errors.Is(err, errDown) {
+			t.Fatalf("RecoverTopology = %v, want the cancellation's error", err)
+		}
+		if topology.log.String() != "" {
+			t.Fatal("the topology was recovered with the client's consumer still in place")
+		}
+	})
+
+	t.Run("topology failed, then recovered", func(t *testing.T) {
+		log := &callLog{}
+		subCh := new(amqp.Channel)
+		sub, _ := consumingSubscription(t, log)
+		topology := &recordingTopology{log: log, err: errDown}
+		hooks := &recoveryHooks{broker: &broker{owned: map[*amqp.Channel]ownedChannel{subCh: {sub: sub}}}, topology: topology}
+
+		if _, err := hooks.RecoverTopology(nil, []*amqp.Channel{subCh}); !errors.Is(err, errDown) {
+			t.Fatalf("RecoverTopology = %v", err)
+		}
+		if !sub.replacing {
+			t.Fatal("the subscription does not wait for the next attempt")
+		}
+		topology.err = nil
+		if _, err := hooks.RecoverTopology(nil, []*amqp.Channel{subCh}); err != nil {
+			t.Fatal(err)
+		}
+		want := "consume forgo-s-1, cancel forgo-s-1, recover 1 channels, recover 1 channels, consume forgo-s-1"
+		if got := log.String(); got != want {
+			t.Fatalf("calls %q, want %q", got, want)
+		}
+	})
+
+	t.Run("gave up", func(t *testing.T) {
+		subCh := new(amqp.Channel)
+		sub, _ := consumingSubscription(t, nil)
+		b := &broker{owned: map[*amqp.Channel]ownedChannel{subCh: {sub: sub}}}
+		hooks := &recoveryHooks{broker: b, next: &recordingRecovery{}, topology: &recordingTopology{err: errDown}}
+		if _, err := hooks.RecoverTopology(nil, []*amqp.Channel{subCh}); err == nil {
+			t.Fatal("RecoverTopology succeeded")
+		}
+
+		// While its connection is being recovered, the hook of the channel leaves the subscription
+		// waiting for the connection's recovery.
+		hooks.reconnecting.Add(1)
+		hooks.OnChannelClose(subCh, &amqp.Error{Code: 320})
+		if sub.lost.reported() {
+			t.Fatal("the channel's hook gave up during its connection's recovery")
+		}
+		hooks.reconnecting.Add(-1)
+
+		// The connection could not be recovered.
+		hooks.OnConnectionClose(nil, &amqp.Error{Code: 320})
+		if !sub.lost.reported() || !errors.Is(sub.lost.err, errRecoveryFailed) {
+			t.Fatalf("a subscription that the recovery could not subscribe again was not told: %v", sub.lost.err)
+		}
+	})
+}
+
+func TestRedeclareAutoDeleteQueue(t *testing.T) {
+	cfg := Config{Queues: []QueueConfig{
+		{Name: "durable", Durable: true},
+		{Name: "temporary", Durable: true, AutoDelete: true, Bindings: []BindingConfig{{Exchange: "shop", RoutingKey: "order.*"}}},
+	}}.Sanitize()
+	var r recorder
+	b := &broker{conf: cfg, topology: &r}
+
+	for _, queue := range []string{"durable", "declared elsewhere"} {
+		if err := b.redeclare(queue); err != nil || len(r.calls) != 0 {
+			t.Fatalf("redeclare(%s) = %v, declared %v", queue, err, r.calls)
 		}
 	}
-	if reported(lost) || reported(other) {
-		t.Fatal("a subscriber was told about another entity")
+	if err := b.redeclare("temporary"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"queue temporary durable=true args=map[]", "bind temporary shop order.*"}
+	if strings.Join(r.calls, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("redeclared %q, want %q", r.calls, want)
+	}
+}
+
+// reopening reports a channel that the client is reopening, not closed.
+func reopening() bool { return false }
+
+func TestGate(t *testing.T) {
+	var g gate
+	sent := 0
+	send := func() error { sent++; return nil }
+
+	if losses, err := g.send(context.Background(), reopening, send); err != nil || losses != 0 || sent != 1 {
+		t.Fatalf("send through an open gate = %d, %v, %d sends", losses, err, sent)
 	}
 
-	if !hooks.OnTopologyEntityError(nil, amqp.TopologyRecoveryEntity{EntityType: amqp.TopologyEntityConsumer, EntityName: tag, Err: refused}) {
-		t.Fatal("a lost consumer aborted the recovery of the rest of the topology")
+	// While the channel is closed, a publish fails at once, as the client's would.
+	g.close(amqp.ErrClosed)
+	if _, err := g.send(context.Background(), func() bool { return true }, send); !errors.Is(err, amqp.ErrClosed) || sent != 1 {
+		t.Fatalf("send while the channel is closed = %v, %d sends", err, sent)
 	}
-	if !reported(lost) || !errors.Is(lost.err, errConsumerLost) || !errors.Is(lost.err, refused) || !strings.Contains(lost.err.Error(), tag) {
-		t.Fatalf("lost consumer: reported %v, err %v", reported(lost), lost.err)
-	}
-	if reported(other) {
-		t.Fatal("another subscriber was told its consumer was lost")
+	g.open()
+
+	// The hooks of a channel and of its connection overlap.
+	g.close(amqp.ErrClosed)
+	g.close(&amqp.Error{Code: 320, Reason: "CONNECTION_FORCED"})
+	g.open()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := g.send(ctx, reopening, send); !errors.Is(err, context.DeadlineExceeded) || sent != 1 {
+		t.Fatalf("send through a gate closed twice and opened once = %v, %d sends", err, sent)
 	}
 
-	// A later recovery that fails again keeps the first error.
-	hooks.OnTopologyEntityError(nil, amqp.TopologyRecoveryEntity{EntityType: amqp.TopologyEntityConsumer, EntityName: tag, Err: amqp.ErrClosed})
-	if errors.Is(lost.err, amqp.ErrClosed) {
-		t.Fatalf("second report replaced the first: %v", lost.err)
+	done := make(chan uint64, 1)
+	go func() {
+		losses, _ := g.send(context.Background(), reopening, send)
+		done <- losses
+	}()
+	g.open()
+	select {
+	case losses := <-done:
+		if losses != 3 || sent != 2 {
+			t.Fatalf("send once the gate opened: losses %d, %d sends", losses, sent)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("send kept waiting once the gate opened")
 	}
 
-	b.removeConsumer(otherTag)
-	hooks.OnTopologyEntityError(nil, amqp.TopologyRecoveryEntity{EntityType: amqp.TopologyEntityConsumer, EntityName: otherTag, Err: refused})
-	if reported(other) {
-		t.Fatal("a closed subscriber was told its consumer was lost")
+	if g.lostSince(3) != nil {
+		t.Fatal("a loss was reported without one")
+	}
+	if lost := g.lostSince(2); lost == nil || !strings.Contains(lost.Error(), "CONNECTION_FORCED") {
+		t.Fatalf("lostSince = %v, want the last loss", lost)
+	}
+
+	var nilGate *gate
+	if _, err := nilGate.send(context.Background(), reopening, send); err != nil || sent != 3 || nilGate.lostSince(0) != nil {
+		t.Fatal("a nil gate is not open")
+	}
+}
+
+// A publish in flight holds the gate open: the client cannot reset the channel under it.
+func TestGateCloseWaitsForSend(t *testing.T) {
+	var g gate
+	sending, release := make(chan struct{}), make(chan struct{})
+	go func() {
+		_, _ = g.send(context.Background(), reopening, func() error {
+			close(sending)
+			<-release
+			return nil
+		})
+	}()
+	<-sending
+
+	closed := make(chan struct{})
+	go func() {
+		g.close(amqp.ErrClosed)
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("the gate closed while a publish was being sent")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gate did not close once the publish was sent")
 	}
 }
 
@@ -252,8 +464,7 @@ func TestRecoveryConfig(t *testing.T) {
 	hooks := &recoveryHooks{}
 	r := RecoveryConfig{MaxRetries: 3, RetryInterval: time.Second}.Sanitize().amqpRecovery(hooks)
 	if r == nil || r.ReconnectionConfig.MaxRetryCount != 3 || r.ReconnectionConfig.RetryInterval != time.Second ||
-		r.ConnectionRecovery != hooks || r.TopologyRecovery == nil || r.TopologyRecoveryMode != amqp.TopologyRecoveryAllEnabled ||
-		r.OnTopologyEntityError == nil {
+		r.ConnectionRecovery != hooks || r.TopologyRecovery != hooks || r.TopologyRecoveryMode != amqp.TopologyRecoveryAllEnabled {
 		t.Fatalf("amqpRecovery = %+v", r)
 	}
 

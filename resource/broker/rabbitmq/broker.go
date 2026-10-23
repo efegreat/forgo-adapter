@@ -29,19 +29,28 @@ type broker struct {
 	conf        Config
 	subscribers map[string]SubscriberConfig
 	publishers  map[string]PublisherConfig
-	conn        *amqp.Connection
+	// dial, when set, replaces the client's dialer, for the tests that cut the connections it makes.
+	dial func(network, addr string) (net.Conn, error)
+	conn *amqp.Connection
 	// topology is the channel the exchanges, queues and bindings were declared on. The client
 	// recovers the topology recorded on open channels only, so it stays open until Close.
-	topology *amqp.Channel
+	topology declarer
+	// redeclaring serializes the declarations of redeclare: the recoveries of two subscriber
+	// channels run at once, and the client matches the replies of a channel to calls in order.
+	redeclaring sync.Mutex
 
 	mu sync.Mutex
-	// owned holds the channels to recover, with the ack guard of subscriber channels.
-	owned map[*amqp.Channel]*ackGuard
-	// consumers holds the loss of every open subscriber by consumer tag, the only name the
-	// recovery gives a consumer it could not re-subscribe.
-	consumers map[string]*consumerLoss
+	// owned holds the channels to recover.
+	owned map[*amqp.Channel]ownedChannel
 	// consumerSeq numbers the consumer tags, so they are unique on the connection.
 	consumerSeq uint64
+}
+
+// ownedChannel is what the recovery of an owned channel takes care of: the gate of a publisher
+// channel, or the subscription of a subscriber channel. The topology channel has neither.
+type ownedChannel struct {
+	gate *gate
+	sub  *subscription
 }
 
 // Name returns Config.Name.
@@ -73,11 +82,11 @@ func (r *broker) newPublisher(conf PublisherConfig) (*publisher, error) {
 		return nil, errors.Join(fmt.Errorf("rabbitmq: enable publisher confirms: %w", err), ch.Close())
 	}
 
-	p := &publisher{conf: conf, ch: ch}
+	p := &publisher{conf: conf, ch: ch, gate: &gate{}}
 	if conf.Mandatory {
 		p.returns = ch.NotifyReturn(make(chan amqp.Return, returnBuffer))
 	}
-	r.own(ch, nil)
+	r.own(ch, ownedChannel{gate: p.gate})
 	p.release = func() { r.disown(ch) }
 	return p, nil
 }
@@ -100,25 +109,17 @@ func (r *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 		return nil, fmt.Errorf("rabbitmq: subscriber %s: queue %s: %w", name, conf.Queue, err)
 	}
 
-	guard := &ackGuard{}
-	r.own(ch, guard)
+	sub := newSubscription(conf, ch, r.consumerTag(name))
+	r.own(ch, ownedChannel{sub: sub})
 	retry, err := r.newRetrier(conf.Queue)
 	if err != nil {
 		r.disown(ch)
 		return nil, errors.Join(fmt.Errorf("rabbitmq: subscriber %s: %w", name, err), ch.Close())
 	}
-	tag, lost := r.addConsumer(name)
 	return &subscriber{
-		conf:  conf,
-		ch:    ch,
-		tag:   tag,
-		guard: guard,
-		lost:  lost,
-		retry: retry,
-		release: func() {
-			r.disown(ch)
-			r.removeConsumer(tag)
-		},
+		subscription: sub,
+		retry:        retry,
+		release:      func() { r.disown(ch) },
 	}, nil
 }
 
@@ -157,10 +158,10 @@ func (r *broker) Close() error {
 	return r.conn.Close()
 }
 
-func (r *broker) own(ch *amqp.Channel, guard *ackGuard) {
+func (r *broker) own(ch *amqp.Channel, o ownedChannel) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.owned[ch] = guard
+	r.owned[ch] = o
 }
 
 func (r *broker) disown(ch *amqp.Channel) {
@@ -169,39 +170,30 @@ func (r *broker) disown(ch *amqp.Channel) {
 	delete(r.owned, ch)
 }
 
-func (r *broker) owner(ch *amqp.Channel) (*ackGuard, bool) {
+func (r *broker) owner(ch *amqp.Channel) (ownedChannel, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	guard, ok := r.owned[ch]
-	return guard, ok
+	o, ok := r.owned[ch]
+	return o, ok
 }
 
-// addConsumer returns a new consumer tag for the subscriber name, and the loss the recovery
-// reports to when it cannot re-subscribe that consumer.
-func (r *broker) addConsumer(name string) (string, *consumerLoss) {
+// ownedChannels returns what the broker owns, so the recovery handles it without holding r.mu.
+func (r *broker) ownedChannels() []ownedChannel {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	owned := make([]ownedChannel, 0, len(r.owned))
+	for _, o := range r.owned {
+		owned = append(owned, o)
+	}
+	return owned
+}
+
+// consumerTag returns a new consumer tag for the subscriber name, unique on the connection.
+func (r *broker) consumerTag(name string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.consumerSeq++
-	tag := consumerTag(name, r.consumerSeq)
-	lost := newConsumerLoss()
-	r.consumers[tag] = lost
-	return tag, lost
-}
-
-func (r *broker) removeConsumer(tag string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.consumers, tag)
-}
-
-// consumerLost reports err to the subscriber that consumes under tag, unless it is closed.
-func (r *broker) consumerLost(tag string, err error) {
-	r.mu.Lock()
-	lost, ok := r.consumers[tag]
-	r.mu.Unlock()
-	if ok {
-		lost.report(err)
-	}
+	return consumerTag(name, r.consumerSeq)
 }
 
 // consumerTag names a consumer after its subscriber, so it can be told apart in the management
@@ -214,13 +206,70 @@ func consumerTag(name string, seq uint64) string {
 	return consumerTagPrefix + name + suffix
 }
 
-// invalidateAll marks the deliveries of every subscriber channel as stale.
-func (r *broker) invalidateAll() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, guard := range r.owned {
-		if guard != nil {
-			guard.invalidate()
+// loseConnection marks the deliveries of every subscriber channel stale and holds back the
+// publishes of every publisher channel, before the client reconnects. It returns the gates to
+// open once the client is done.
+func (r *broker) loseConnection(reason error) []*gate {
+	var gates []*gate
+	for _, o := range r.ownedChannels() {
+		if o.sub != nil {
+			o.sub.lose(true)
+		}
+		if o.gate != nil {
+			o.gate.close(reason)
+			gates = append(gates, o.gate)
+		}
+	}
+	return gates
+}
+
+// detach detaches the subscriptions of the reopened channels, and returns them.
+func (r *broker) detach(channels []*amqp.Channel) ([]*subscription, error) {
+	var subs []*subscription
+	for _, ch := range channels {
+		o, ok := r.owner(ch)
+		if !ok || o.sub == nil {
+			continue
+		}
+		detached, err := o.sub.detach()
+		if err != nil {
+			return nil, err
+		}
+		if detached {
+			subs = append(subs, o.sub)
+		}
+	}
+	return subs, nil
+}
+
+// resubscribe subscribes the detached subscriptions again, once the client recovered the rest of
+// the topology.
+func (r *broker) resubscribe(subs []*subscription) {
+	for _, s := range subs {
+		s.resubscribe(func() error { return r.redeclare(s.conf.Queue) })
+	}
+}
+
+// redeclare declares the queue named queue again when it is a configured auto-delete queue. The
+// client forgets an auto-delete queue once no consumer of its own is left on it, which detach
+// brings about, so it neither recovered the queue nor its bindings. The broker deletes such a
+// queue when it loses its last consumer.
+func (r *broker) redeclare(queue string) error {
+	for _, q := range r.conf.Queues {
+		if q.Name == queue && q.AutoDelete {
+			r.redeclaring.Lock()
+			defer r.redeclaring.Unlock()
+			return declareQueue(r.topology, q)
+		}
+	}
+	return nil
+}
+
+// giveUp reports the subscriptions that a failed recovery detached.
+func (r *broker) giveUp() {
+	for _, o := range r.ownedChannels() {
+		if o.sub != nil {
+			o.sub.giveUp(func() bool { return false })
 		}
 	}
 }
@@ -229,9 +278,11 @@ func (r *broker) init() (err error) {
 	cfg := amqp.Config{
 		Vhost:      r.conf.VHost,
 		Properties: amqp.NewConnectionProperties(),
+		Dial:       r.dial,
 		Recovery: r.conf.Recovery.amqpRecovery(&recoveryHooks{
-			broker: r,
-			next:   &amqp.DefaultConnectionRecovery{},
+			broker:   r,
+			next:     &amqp.DefaultConnectionRecovery{},
+			topology: &amqp.DefaultTopologyRecovery{},
 		}),
 	}
 	if r.conf.Username != "" {
@@ -269,7 +320,7 @@ func (r *broker) init() (err error) {
 	if err := declare(ch, r.conf); err != nil {
 		return err
 	}
-	r.own(ch, nil)
+	r.own(ch, ownedChannel{})
 
 	for _, s := range r.conf.Subscribers {
 		r.subscribers[s.Name] = s
@@ -298,34 +349,41 @@ func declare(ch declarer, cfg Config) error {
 	}
 
 	for _, q := range cfg.Queues {
-		if dl := q.DeadLetter; dl.Enabled {
-			if err := ch.ExchangeDeclare(dl.Exchange, amqp.ExchangeDirect, true, false, false, false, nil); err != nil {
-				return fmt.Errorf("rabbitmq: declare dead-letter exchange %s: %w", dl.Exchange, err)
-			}
-			if _, err := ch.QueueDeclare(dl.Queue, true, false, false, false, dl.Args); err != nil {
-				return fmt.Errorf("rabbitmq: declare dead-letter queue %s: %w", dl.Queue, err)
-			}
-			if err := ch.QueueBind(dl.Queue, dl.RoutingKey, dl.Exchange, false, nil); err != nil {
-				return fmt.Errorf("rabbitmq: bind dead-letter queue %s to exchange %s: %w", dl.Queue, dl.Exchange, err)
-			}
+		if err := declareQueue(ch, q); err != nil {
+			return err
 		}
+	}
+	return nil
+}
 
-		if _, err := ch.QueueDeclare(q.Name, q.Durable, q.AutoDelete, q.Exclusive, q.NoWait, q.args()); err != nil {
-			return fmt.Errorf("rabbitmq: declare queue %s: %w", q.Name, err)
+// declareQueue declares q with its dead-letter exchange and queue, its bindings and its retry queues.
+func declareQueue(ch declarer, q QueueConfig) error {
+	if dl := q.DeadLetter; dl.Enabled {
+		if err := ch.ExchangeDeclare(dl.Exchange, amqp.ExchangeDirect, true, false, false, false, nil); err != nil {
+			return fmt.Errorf("rabbitmq: declare dead-letter exchange %s: %w", dl.Exchange, err)
 		}
-
-		for _, b := range q.Bindings {
-			if err := ch.QueueBind(q.Name, b.RoutingKey, b.Exchange, b.NoWait, b.Args); err != nil {
-				return fmt.Errorf("rabbitmq: bind queue %s to exchange %s with routing key %s: %w", q.Name, b.Exchange, b.RoutingKey, err)
-			}
+		if _, err := ch.QueueDeclare(dl.Queue, true, false, false, false, dl.Args); err != nil {
+			return fmt.Errorf("rabbitmq: declare dead-letter queue %s: %w", dl.Queue, err)
 		}
-
-		for _, rq := range q.Retry.queues(q.Name) {
-			if _, err := ch.QueueDeclare(rq.name, true, false, false, false, rq.args); err != nil {
-				return fmt.Errorf("rabbitmq: declare retry queue %s: %w", rq.name, err)
-			}
+		if err := ch.QueueBind(dl.Queue, dl.RoutingKey, dl.Exchange, false, nil); err != nil {
+			return fmt.Errorf("rabbitmq: bind dead-letter queue %s to exchange %s: %w", dl.Queue, dl.Exchange, err)
 		}
 	}
 
+	if _, err := ch.QueueDeclare(q.Name, q.Durable, q.AutoDelete, q.Exclusive, q.NoWait, q.args()); err != nil {
+		return fmt.Errorf("rabbitmq: declare queue %s: %w", q.Name, err)
+	}
+
+	for _, b := range q.Bindings {
+		if err := ch.QueueBind(q.Name, b.RoutingKey, b.Exchange, b.NoWait, b.Args); err != nil {
+			return fmt.Errorf("rabbitmq: bind queue %s to exchange %s with routing key %s: %w", q.Name, b.Exchange, b.RoutingKey, err)
+		}
+	}
+
+	for _, rq := range q.Retry.queues(q.Name) {
+		if _, err := ch.QueueDeclare(rq.name, true, false, false, false, rq.args); err != nil {
+			return fmt.Errorf("rabbitmq: declare retry queue %s: %w", rq.name, err)
+		}
+	}
 	return nil
 }

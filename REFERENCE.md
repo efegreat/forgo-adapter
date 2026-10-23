@@ -466,7 +466,7 @@ To retry, the subscriber publishes a copy of the delivery to the retry queue, wa
 
 #### Recovery
 
-The broker uses the automatic recovery of amqp091-go. When the connection or a channel is lost, the client reconnects and reopens every channel with its prefetch and confirm mode. It then redeclares the exchanges, queues, bindings and dead-letter queues, and resubscribes the consumers. Subscribers keep consuming from the same delivery channel, so the worker does not notice beyond a pause.
+The broker uses the automatic recovery of amqp091-go. When the connection or a channel is lost, the client reconnects and reopens every channel with its prefetch and confirm mode. It then redeclares the exchanges, queues, bindings and dead-letter queues, and the broker subscribes every subscriber again, so the worker does not notice beyond a pause.
 
 ```go
 rabbitmq.Config{
@@ -477,16 +477,17 @@ rabbitmq.Config{
 | `RecoveryConfig` field | Default | Description |
 | --- | --- | --- |
 | `Disabled` | `false` | Turns recovery off. A lost connection then stops every subscriber and fails every publish until the app restarts. |
-| `MaxRetries` | unlimited | Reconnection attempts before giving up. Once they are exhausted, the connection closes and subscribers stop with `rabbitmq: delivery channel closed by the broker`. |
+| `MaxRetries` | unlimited | Reconnection attempts before giving up. Once they are exhausted, the connection closes and subscribers stop with `rabbitmq: delivery channel closed by the broker`, or with `rabbitmq: recovery could not re-subscribe the consumer` when an attempt had reconnected. |
 | `RetryInterval` | `5s` | Wait before each attempt, plus up to 500ms of jitter. |
 
-While the connection is down:
+During a recovery:
 
-- **Publishes fail fast.** The outbox keeps the messages and retries them on its next cycle.
+- **Publishes fail fast while the connection is down.** The outbox keeps the messages and retries them on its next cycle. While the client reopens a publisher's channel, the publish waits for it, within its context, so that no message is sent before the channel is back in confirm mode. A message sent in between would never be confirmed, and every later confirm would be counted against the wrong message.
 - **Unacknowledged deliveries are requeued by the broker.** Delivery tags start over on a recovered channel, so a late acknowledgement from a handler that was still running would settle a different message. The broker marks those deliveries stale before the channel is reopened, and their acknowledgements fail instead (`rabbitmq: delivery belongs to a lost channel`). The message is delivered again, and the inbox recognizes it by its `x-msg-id`. If the handler had completed it, the redelivery is acknowledged and skipped.
-- **Unconfirmed publishes fail.** The client settles pending confirms as nacks when it reopens the channel, so the outbox retries them. A message the broker had already stored is then published twice, and the consumer inbox drops the duplicate.
+- **Deliveries that no handler took are dropped.** With a `Prefetch` above the worker's `Concurrency`, the client holds deliveries that wait for a handler. The broker requeued them with the channel, so the subscriber drops them and consumes them again on the reopened channel, where it subscribes on a new delivery stream.
+- **Unconfirmed publishes fail.** The client settles the pending confirms of a lost channel as nacks when it reopens it, and the publish fails with `rabbitmq: publisher channel lost before the broker confirmed the message`, followed by the reason, such as the `NOT_FOUND` of a publish to an exchange that does not exist. The outbox retries them. A message the broker had already stored is then published twice, and the consumer inbox drops the duplicate.
 
-An exchange, queue, binding or consumer that fails to recover is skipped, so the rest of the topology still recovers. A consumer can fail because its queue was deleted, or because a consumer with `Exclusive` on another connection still holds the queue. Its subscriber would then receive nothing, so it stops with `rabbitmq: recovery could not re-subscribe the consumer`, followed by the broker's error. As when the broker cancels a consumer, the worker server fails and the app stops. When it starts again, the subscriber consumes again, or fails at startup if its queue is gone.
+An exchange, queue or binding that fails to recover is skipped, so the rest of the topology still recovers. An auto-delete queue (`AutoDelete`), which the broker deletes with its last consumer, is declared again with its bindings before its subscriber subscribes again. A subscriber can fail to subscribe again because its queue was deleted, or because a consumer with `Exclusive` on another connection holds the queue. It would then receive nothing, so it stops with `rabbitmq: recovery could not re-subscribe the consumer`, followed by the broker's error. As when the broker cancels a consumer, the worker server fails and the app stops. When it starts again, the subscriber consumes again, or fails at startup if its queue is gone.
 
 The client logs its recovery through `amqp.Logger`, which discards everything by default. Call `amqp.SetLogger` in `main` to see reconnects.
 
@@ -1205,7 +1206,7 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | --- | --- |
 | `sqldb:` | A negative `Logger.SlowThreshold`, and opening or pinging the database. |
 | `redisdb:` | Validation (empty addresses, `ClusterMode` with `MasterName`, an unknown `ReadFrom`, a `DB` on a cluster) and pinging Redis. |
-| `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names and missing queues, a closed delivery channel, nacked and unroutable publishes, retries that could not be delayed, acknowledgements of deliveries from a lost channel. |
+| `rabbitmq:` | Validation, connection, topology, channels, unknown publisher or subscriber names and missing queues, a closed delivery channel, nacked and unroutable publishes, publishes whose channel was lost before the broker confirmed them, retries that could not be delayed, acknowledgements of deliveries from a lost channel, consumers the recovery could not subscribe again. |
 | `pubsub:` | Validation, the client, creating and checking topics and subscriptions (`pubsub: subscription exists with other settings`), unknown subscriber names, publishes without a `Destination` or after `Close`, failed publishes, receiving, acknowledgements, dead-letter copies that could not be published. |
 | `redisstream:` | Validation, connecting (wrapping the `redisdb:` error), creating groups, unknown subscriber names and missing streams or groups, publishes without a `Destination` and failed publishes, reads and claims that stopped a subscriber, acknowledgements, retries and dead-letter copies that failed, deleting a consumer on `Close`. |
 | `sqltx:` | Beginning, committing or rolling back a transaction. Errors returned by your function pass through unchanged. |

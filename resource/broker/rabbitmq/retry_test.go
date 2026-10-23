@@ -98,7 +98,7 @@ func TestDeliveryRetry(t *testing.T) {
 				Acknowledger: ack, DeliveryTag: 7, ContentType: "application/json", Body: []byte(`{}`),
 				Expiration: "60000", UserId: "producer",
 				Headers: amqp.Table{"tenant": "a"}, // no x-msg-id: the delivery generates an ID
-			}, guard, &retrier{pub: pub, queues: queues})
+			}, guard, 0, &retrier{pub: pub, queues: queues})
 			if tt.stale {
 				guard.invalidate()
 			}
