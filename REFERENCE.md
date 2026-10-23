@@ -744,7 +744,7 @@ A subscriber reads no more new entries (`XREADGROUP`) than it has free handler s
 
 On shutdown, the subscriber stops reading within a second and waits for every running handler. It then deletes its consumer from the group, unless the consumer still has pending entries, such as one whose acknowledgement failed: deleting it would drop them from the group.
 
-While Redis cannot be reached, is loading its data or fails over, the subscriber keeps trying, with a pause of a second after every failure. Any other error reply stops it, and the worker server stops the app, for example `redisstream: subscriber billing: read group billing of stream orders: NOGROUP …` once the group was deleted. When the group is listed in `Streams`, the restarted app creates it again.
+While Redis cannot be reached, is loading its data or fails over, the subscriber keeps trying, with a pause of a second after every failure. So it does while Redis refuses commands for a while: a script runs too long (`BUSY`), a snapshot failed (`MISCONF`), a master lacks the replicas it must write to (`NOREPLICAS`), or a master that turned into a replica unblocked the reads (`UNBLOCKED`). Any other error reply stops it, and the worker server stops the app, for example `redisstream: subscriber billing: read group billing of stream orders: NOGROUP …` once the group was deleted. When the group is listed in `Streams`, the restarted app creates it again.
 
 #### Messages on the wire
 
@@ -773,13 +773,13 @@ A settlement that fails, for example while Redis cannot be reached, leaves the e
 
 #### Claiming pending entries
 
-A consumer that stops without settling its entries, because it crashed, was killed or lost its connection, leaves them pending in the group. Every subscriber with a free handler slot claims the entries of its group that were idle for `ClaimIdle` (`XAUTOCLAIM`), about once a second and before it reads new entries, and handles them. So after a crash, its messages are delivered again about `ClaimIdle` later.
+A consumer that stops without settling its entries, because it crashed, was killed or lost its connection, leaves them pending in the group. Every subscriber with a free handler slot claims the entries of its group that were idle for `ClaimIdle`, about once a second and before it reads new entries, and handles them. So after a crash, its messages are delivered again about `ClaimIdle` later. Redis finds the entries that are due (`XPENDING … IDLE`), in one round trip however many entries wait for a retry, and the subscriber claims them (`XCLAIM`), so a large retry backlog never holds back new entries.
 
 While a handler runs, its subscriber resets the idle time of the entry every `ClaimIdle`/3 (`XCLAIM … JUSTID`, which counts no delivery). A handler may therefore run longer than `ClaimIdle`, and only an instance that cannot reach Redis for `ClaimIdle`, for example because of a network partition, loses its entries to another consumer. Both then handle the message: the inbox completes it once, and a `HandlerConfig.Lock` keeps them from running at the same time.
 
 `ClaimIdle` is also the longest retry delay. Raise it for longer delays, at the price of a slower recovery after a crash. Every subscriber of a group needs the same `ClaimIdle`.
 
-An instance that crashed cannot delete its consumer on shutdown, so the consumer stays in the group once its entries are claimed. Every subscriber therefore sweeps its group about every five minutes (`XINFO CONSUMERS`), and deletes the consumers that have no pending entries and were idle for ten times `ClaimIdle` (ten minutes by default). It keeps its own consumer and `forgo-retry`. Since Redis 7.2, a live consumer is never that idle, since it claims about once a second or holds the entries it handles. Before 7.2, a consumer's idle time only resets when it gets entries, so the sweep also deletes the consumers of live instances while their group is quiet. Either way, a consumer that is deleted while it is alive loses nothing, since it has no pending entries, and Redis creates it again with the next entry it reads or claims. A sweep that fails, for example because the ACL user may not run `XINFO`, is left to the next one.
+An instance that crashed cannot delete its consumer on shutdown, so the consumer stays in the group once its entries are claimed. Every subscriber therefore sweeps its group about every five minutes (`XINFO CONSUMERS`), and deletes the consumers that have no pending entries and were idle for ten times `ClaimIdle` (ten minutes by default). It keeps its own consumer and `forgo-retry`. Since Redis 7.2, a live consumer is never that idle, since it reads about once a second or holds the entries it handles. Before 7.2, a consumer's idle time only resets when it gets entries, so the sweep also deletes the consumers of live instances while their group is quiet. Either way, a consumer that is deleted while it is alive loses nothing, since it has no pending entries, and Redis creates it again with the next entry it reads or claims. A sweep that fails, for example because the ACL user may not run `XINFO`, is left to the next one.
 
 #### Delayed retries
 
@@ -842,7 +842,7 @@ Dead letters keep their `x-msg-id`, so the worker rejects a replayed message aga
 
 #### Trimming
 
-Redis keeps every entry of a stream until it is trimmed, also once every group acknowledged it. `MaxLen` trims the stream on every entry the broker adds to it, to about `MaxLen` entries: Redis trims whole nodes of its stream, so it keeps somewhat more. Trimming drops the oldest entries whether or not every group has read and acknowledged them, including the pending ones and the ones waiting for a retry, so a dropped entry is never delivered again. Size `MaxLen` well above the backlog a group can fall behind by. Without `MaxLen`, trim the stream yourself, for example with `XTRIM orders MINID ~ <id>` from a cron job.
+Redis keeps every entry of a stream until it is trimmed, also once every group acknowledged it. `MaxLen` trims the stream on every entry the broker adds to it, to about `MaxLen` entries: Redis trims whole nodes of its stream, so it keeps somewhat more. Trimming drops the oldest entries whether or not every group has read and acknowledged them, including the pending ones and the ones waiting for a retry, so a dropped entry is never delivered again: the first claim drops it from its group. Size `MaxLen` well above the backlog a group can fall behind by. Without `MaxLen`, trim the stream yourself, for example with `XTRIM orders MINID ~ <id>` from a cron job.
 
 ---
 

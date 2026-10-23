@@ -734,6 +734,105 @@ func TestConsumeClaimsAbandoned(t *testing.T) {
 	}
 }
 
+func TestConsumeClaimsInTurn(t *testing.T) {
+	m, cl, cfg := fake(t)
+	m.SetTime(t0)
+	b := open(t, topology(cfg, SubscriberConfig{}))
+	msgs := make([]worker.Message, 5)
+	for i := range msgs {
+		msgs[i] = worker.NewMessage("order.placed", "", "orders", nil)
+		publish(t, b, msgs[i])
+	}
+	// A consumer that crashed after reading every entry, then the second and the fourth entries
+	// wait for a retry, which is not due.
+	res, err := cl.XReadGroup(context.Background(), &redis.XReadGroupArgs{Group: "billing", Consumer: "crashed", Streams: []string{"orders", ">"}, Block: -1}).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SetTime(t0.Add(time.Minute))
+	for _, i := range []int{1, 3} {
+		if err := cl.XClaimJustID(context.Background(), &redis.XClaimArgs{Stream: "orders", Group: "billing", Consumer: retryConsumer, Messages: []string{res[0].Messages[i].ID}}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// One slot: every claim takes one entry, and the next one goes on after it.
+	ch, handle := deliveries()
+	consume(t, openSubscriber(t, b, "billing"), 1, handle)
+	for _, i := range []int{0, 2, 4} {
+		if d := next(t, ch); d.Message().ID != msgs[i].ID {
+			t.Fatalf("claimed %s, want entry %d, %s", d.Message().ID, i, msgs[i].ID)
+		}
+	}
+	none(t, ch)
+}
+
+func TestClaimReply(t *testing.T) {
+	entry := []any{"1-1", []any{PayloadField, "{}", KeyField, "k"}}
+	entries, trimmed, err := claimed([]any{entry, nil})
+	want := []redis.XMessage{{ID: "1-1", Values: map[string]any{PayloadField: "{}", KeyField: "k"}}}
+	if err != nil || !trimmed || !reflect.DeepEqual(entries, want) {
+		t.Fatalf("claimed() = %+v, %v, %v; want %+v, true", entries, trimmed, err, want)
+	}
+	for _, reply := range [][]any{
+		{"1-1"},
+		{[]any{"1-1"}},
+		{[]any{1, []any{}}},
+		{[]any{"1-1", []any{"odd"}}},
+		{[]any{"1-1", []any{1, "v"}}},
+	} {
+		if _, _, err := claimed(reply); !errors.Is(err, errClaimReply) {
+			t.Errorf("claimed(%v) = %v, want errClaimReply", reply, err)
+		}
+	}
+}
+
+func TestDropTrimmed(t *testing.T) {
+	_, cl, cfg := fake(t)
+	b := open(t, topology(cfg, SubscriberConfig{}))
+	for range 3 {
+		publish(t, b, worker.NewMessage("order.placed", "", "orders", nil))
+	}
+	res, err := cl.XReadGroup(context.Background(), &redis.XReadGroupArgs{Group: "billing", Consumer: "crashed", Streams: []string{"orders", ">"}, Block: -1}).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{res[0].Messages[0].ID, res[0].Messages[1].ID, res[0].Messages[2].ID}
+	if err := cl.XDel(context.Background(), "orders", ids[0]).Err(); err != nil {
+		t.Fatal(err)
+	}
+	due := make([]redis.XPendingExt, len(ids))
+	for i, id := range ids {
+		due[i] = redis.XPendingExt{ID: id}
+	}
+
+	// The claim returned the third entry and skipped the second, which another consumer claimed
+	// first: only the trimmed first one leaves the group.
+	s := openSubscriber(t, b, "billing")
+	s.dropTrimmed(context.Background(), due, []redis.XMessage{{ID: ids[2]}})
+	var left []string
+	for _, p := range pending(t, cl) {
+		left = append(left, p.ID)
+	}
+	if !reflect.DeepEqual(left, ids[1:]) {
+		t.Fatalf("pending = %v, want %v", left, ids[1:])
+	}
+}
+
+func TestAfter(t *testing.T) {
+	for id, want := range map[string]string{
+		"1700000000123-4":                    "1700000000123-5",
+		"1700000000123-18446744073709551615": "1700000000124-0",
+		"1700000000123":                      claimStart,
+		"x-1":                                claimStart,
+		"1-x":                                claimStart,
+	} {
+		if got := after(id); got != want {
+			t.Errorf("after(%s) = %s, want %s", id, got, want)
+		}
+	}
+}
+
 func TestHeartbeat(t *testing.T) {
 	m, cl, cfg := fake(t)
 	m.SetTime(t0)
@@ -782,25 +881,38 @@ func TestConsumeErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("loading", func(t *testing.T) {
-		m, _, cfg := fake(t)
-		b := open(t, topology(cfg, SubscriberConfig{}))
-		ch, handle := deliveries()
-		_, done := consume(t, openSubscriber(t, b, "billing"), 1, handle)
-		m.SetError("LOADING Redis is loading the dataset in memory")
-		time.Sleep(100 * time.Millisecond)
-		m.SetError("")
-		msg := worker.NewMessage("order.placed", "", "orders", nil)
-		publish(t, b, msg)
-		if d := next(t, ch); d.Message().ID != msg.ID {
-			t.Fatalf("delivered %s, want %s", d.Message().ID, msg.ID)
-		}
-		select {
-		case <-done:
-			t.Fatal("Consume returned during the outage")
-		default:
-		}
-	})
+	// Replies that pass, which every command gets for a while. TestIntegrationBroker unblocks a
+	// read on Redis; the others take the whole server, which the other packages' integration tests
+	// share.
+	for _, reply := range []string{
+		"LOADING Redis is loading the dataset in memory",
+		"UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)",
+		"BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+		"MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk.",
+		"NOREPLICAS Not enough good replicas to write.",
+	} {
+		t.Run(strings.Fields(reply)[0], func(t *testing.T) {
+			m, _, cfg := fake(t)
+			b := open(t, topology(cfg, SubscriberConfig{}))
+			ch, handle := deliveries()
+			_, done := consume(t, openSubscriber(t, b, "billing"), 1, handle)
+			m.SetError(reply)
+			// Longer than go-redis retries a command itself, up to about 170ms, which it does
+			// for some of the replies.
+			time.Sleep(300 * time.Millisecond)
+			m.SetError("")
+			msg := worker.NewMessage("order.placed", "", "orders", nil)
+			publish(t, b, msg)
+			if d := next(t, ch); d.Message().ID != msg.ID {
+				t.Fatalf("delivered %s, want %s", d.Message().ID, msg.ID)
+			}
+			select {
+			case <-done:
+				t.Fatal("Consume returned during the outage")
+			default:
+			}
+		})
+	}
 
 	t.Run("restart", func(t *testing.T) {
 		m, _, cfg := fake(t)
@@ -939,9 +1051,16 @@ func TestTransient(t *testing.T) {
 		{reply("LOADING Redis is loading the dataset in memory"), true},
 		{reply("READONLY You can't write against a read only replica."), true},
 		{reply("CLUSTERDOWN The cluster is down"), true},
+		{reply("UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)"), true},
+		{reply("UNBLOCKED client unblocked via CLIENT UNBLOCK"), true},
+		{reply("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE."), true},
+		{reply("MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk."), true},
+		{reply("NOREPLICAS Not enough good replicas to write."), true},
 		{reply("NOGROUP No such key 'orders' or consumer group 'billing'"), false},
 		{reply("NOPERM this user has no permissions"), false},
-		{reply("ERR unknown command 'XAUTOCLAIM'"), false},
+		{reply("BUSYGROUP Consumer Group name already exists"), false},
+		{reply("ERR syntax error"), false},
+		{redis.Nil, false},
 	}
 	for _, tt := range tests {
 		if got := transient(tt.err); got != tt.want {

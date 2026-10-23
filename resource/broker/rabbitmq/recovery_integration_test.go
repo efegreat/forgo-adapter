@@ -421,24 +421,67 @@ func TestIntegrationAutoDeleteQueueRecovery(t *testing.T) {
 	ids = append(ids, r.publish(t, "before", 1)...)
 	c.waitAcked(t, len(ids), 10*time.Second)
 
+	gen := c.sub.guard.generation()
 	if err := c.sub.ch.(*amqp.Channel).Ack(1_000_000, false); err != nil {
 		t.Fatal(err)
 	}
-	waitQueue(t, r)
-	ids = append(ids, r.publish(t, "after-channel", 1)...)
+	waitResubscribed(t, r, c, gen)
+	ids = append(ids, r.publishConfirmed(t, "after-channel"))
 	c.waitAcked(t, len(ids), 10*time.Second)
 
+	gen = c.sub.guard.generation()
 	r.network.cut()
-	waitQueue(t, r)
-	ids = append(ids, r.publish(t, "after-connection", 1)...)
+	waitResubscribed(t, r, c, gen)
+	ids = append(ids, r.publishConfirmed(t, "after-connection"))
 	c.waitAcked(t, len(ids), 10*time.Second)
 
 	c.checkAll(t, ids, 1)
 }
 
-// waitQueue waits until the test's queue exists again and has a consumer.
-func waitQueue(t *testing.T, r *recoveryTest) {
+// publishConfirmed publishes the message prefix-0 like publish, and again while the broker nacks
+// it, as the outbox would. Right after a recovery, the publisher's channel can still learn that the
+// deleted auto-delete queue of the same name went away, and nack a message routed to the new one.
+func (r *recoveryTest) publishConfirmed(t *testing.T, prefix string) string {
 	t.Helper()
+	pub, err := r.broker.NewDefaultPublisher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	msg := worker.NewMessage("m", "k", r.name, []byte(`{}`))
+	msg.ID = prefix + "-0"
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := pub.Publish(ctx, msg)
+		cancel()
+		if err == nil {
+			return msg.ID
+		}
+		if !errors.Is(err, errNacked) || attempt == 10 {
+			t.Fatalf("Publish %s: %v", msg.ID, err)
+		}
+		t.Logf("Publish %s: %v; publishing it again", msg.ID, err)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// waitResubscribed waits until the subscriber of c subscribed again, on a later incarnation of its
+// channel than the one of guard generation gen, then until the test's queue exists with a
+// consumer. Ack returns before the broker closes the channel, and the broker notices a cut
+// connection a moment later, so until then the old queue is still there with its old consumer.
+func waitResubscribed(t *testing.T, r *recoveryTest, c *consumption, gen uint64) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		c.sub.mu.Lock()
+		st := c.sub.stream
+		c.sub.mu.Unlock()
+		if st != nil && st.gen > gen {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the subscriber did not subscribe again")
+		}
+	}
 	conn, err := amqp.Dial(r.url)
 	if err != nil {
 		t.Fatal(err)
