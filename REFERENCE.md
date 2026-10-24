@@ -732,7 +732,7 @@ func Broker() redisstream.Config {
 | `MaxLen` | no trimming | Trims the stream to about `MaxLen` entries on every entry the broker adds to it (`XADD MAXLEN ~`). See [Trimming](#trimming). |
 | `Groups` | | Consumer groups to create: `Name`, and `StartID`, the last entry the group counts as delivered when it is created. `$` (the default) delivers only the entries added afterwards, `0` every entry the stream holds. |
 
-`New` connects with `Redis` like the `redisdb` resource, with its validation and startup ping. It then creates every group of `Streams` that does not exist, and its stream with it (`XGROUP CREATE … MKSTREAM`). A group that exists is kept as it is, with its position, so `StartID` only applies when a group is created. Any failure closes the client and fails the bootstrap, for example `redisstream: create group billing of stream orders: WRONGTYPE …` when the key holds another type.
+`New` connects with `Redis` like the `redisdb` resource, with its validation and startup ping. It then creates every group of `Streams` that does not exist, and its stream with it (`XGROUP CREATE … MKSTREAM`). A group that exists is kept as it is, with its position, so `StartID` only applies when a group is created. While Redis is out of memory (see [Durability and memory](#durability-and-memory)), it refuses to create a group even when the group exists, so `New` then only checks that it does. Any failure closes the client and fails the bootstrap, for example `redisstream: create group billing of stream orders: WRONGTYPE …` when the key holds another type.
 
 List the groups in the config the producer uses too. With `$`, a group created after a message was published never receives it, so the group must exist before the first publish. When both servers share the broker config, whichever starts first creates the groups.
 
@@ -750,7 +750,7 @@ Publishers have no settings. `NewPublisher` accepts every `worker.PublisherConfi
 - the key holds another type (`WRONGTYPE`), or Redis is out of memory with the `noeviction` policy (`OOM`),
 - Redis cannot be reached or does not answer in time.
 
-Redis acknowledges an entry once it is in memory. It is on disk after the next `fsync` of the append-only file (`appendfsync everysec` by default), and it reaches replicas asynchronously, so a crash or a failover can lose entries Redis acknowledged, which the outbox no longer holds. For durable messages, enable the append-only file and keep the failover window small.
+Redis acknowledges an entry once it is in memory, so a crash or a failover can lose entries the outbox no longer holds, and Redis refuses new entries once it is out of memory: see [Durability and memory](#durability-and-memory).
 
 | `SubscriberConfig` field | Default | Description |
 | --- | --- | --- |
@@ -761,7 +761,7 @@ Redis acknowledges an entry once it is in memory. It is on disk after the next `
 | `Retry` | disabled | Delays retried entries, see [Delayed retries](#delayed-retries). |
 | `DeadLetter` | disabled | A dead-letter stream, see [Dead-letter streams](#dead-letter-streams). |
 
-Each subscriber reads as a consumer of its own, named after the host with a random suffix, such as `billing-7d9f-x2k4p-UJ4K5N7QRA`, which the worker server creates when it starts (`XGROUP CREATECONSUMER`). An unknown subscriber name, or a stream or group that does not exist, fails the server at startup: `redisstream: subscriber billing: create consumer in group billing of stream orders: NOGROUP …`.
+Each subscriber reads as a consumer of its own, named after the host with a random suffix, such as `billing-7d9f-x2k4p-UJ4K5N7QRA`, which the worker server creates when it starts (`XGROUP CREATECONSUMER`), or, while Redis is out of memory, its first read. An unknown subscriber name, or a stream or group that does not exist, fails the server at startup: `redisstream: subscriber billing: create consumer in group billing of stream orders: NOGROUP …`.
 
 A subscriber reads no more new entries (`XREADGROUP`) than it has free handler slots, so the rest of the backlog stays in the stream for other instances, and waits up to a second for new ones. The worker's `SubscriberConfig.Concurrency` bounds how many entries are handled at once. Entries are read in the order of the stream, but handled in parallel, and retried entries come back after newer ones, so there is no ordering by `Key`.
 
@@ -857,7 +857,7 @@ To reject an entry, the subscriber adds a copy of it to `orders:billing:dlq`, th
 - a message whose payload cannot be bound (`msg_bind`, inbox *rejected*),
 - a message no handler is registered for (`msg_no_handler`).
 
-**A copy that cannot be added.** When the key holds another type or Redis does not answer within the worker's `SubscriberConfig.AckTimeout`, `Reject` fails with `redisstream: dead-letter <id> to <stream>, delivering it again` and the entry is claimed again at once, within about a second. The worker then rejects it again, until the copy is added.
+**A copy that cannot be added.** When the key holds another type, Redis is out of memory or does not answer within the worker's `SubscriberConfig.AckTimeout`, `Reject` fails with `redisstream: dead-letter <id> to <stream>, delivering it again in <delay>`, and the entry waits for the longest retry delay, `Retry.Max`, or `ClaimIdle` without `Retry`. It is then claimed again, and the worker rejects it again, until the copy is added. Coming back at once instead, 2,000 such entries took about 15,000 Redis commands and 4,000 inbox queries a second while the dead-letter stream could not be written.
 
 Dead letters keep their `x-msg-id`, so the worker rejects a replayed message again, back to the dead-letter stream, while its inbox row is *failed* or *rejected*. To process one again, first set its inbox row back to *waiting* with zero attempts, then add it to the original stream again, for example with `XADD` of its fields. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages). Read them with `XRANGE orders:billing:dlq - +`, and delete one with `XDEL` once handled.
 
@@ -866,6 +866,23 @@ Dead letters keep their `x-msg-id`, so the worker rejects a replayed message aga
 #### Trimming
 
 Redis keeps every entry of a stream until it is trimmed, also once every group acknowledged it. `MaxLen` trims the stream on every entry the broker adds to it, to about `MaxLen` entries: Redis trims whole nodes of its stream, so it keeps somewhat more. Trimming drops the oldest entries whether or not every group has read and acknowledged them, including the pending ones and the ones waiting for a retry, so a dropped entry is never delivered again: the first claim drops it from its group. Size `MaxLen` well above the backlog a group can fall behind by. Without `MaxLen`, trim the stream yourself, for example with `XTRIM orders MINID ~ <id>` from a cron job.
+
+#### Durability and memory
+
+Redis acknowledges an entry once it is in memory. It is on disk after the next `fsync` of the append-only file (`appendfsync everysec` by default), and it reaches replicas asynchronously, so a crash or a failover can lose entries Redis acknowledged, which the outbox no longer holds. For durable messages, enable the append-only file and keep the failover window small.
+
+What a loss costs, as measured on a scaffold under steady load:
+
+- **Without persistence,** a restart or a `FLUSHALL` loses the streams with their groups. Every subscriber then stops with `NOGROUP`, and with it its app and the app's outbox relay, so the instances that start again create the groups before any message is published to them. The messages lost are the entries that were not handled yet: 172, the backlog of the group, in a run whose consumers lagged, and none when they kept up. A producer that keeps publishing while no consumer runs, such as a deployment of its own, adds entries before the groups exist, and a group created at `$` never receives them.
+- **With the append-only file,** a `docker kill` of Redis lost nothing, and the subscribers carried on: only the machine crashing loses the last second of writes.
+- **A Sentinel failover,** graceful or after the master was killed, lost nothing either, since the replicas were in sync or the entries they missed had been handled already.
+
+**Memory.** Run the broker's Redis with `maxmemory-policy noeviction`. Under an `allkeys-*` policy, Redis evicts a stream to make room, its groups with it: its entries are lost and the subscribers stop with `NOGROUP`. Under `noeviction`, a Redis that reached `maxmemory` refuses what would add data (`OOM`), and goes on with the rest:
+
+- publishes fail, and the outbox keeps the messages until memory is freed;
+- reads, claims, retries and acknowledgements go on, so the workers keep handling the entries the streams hold;
+- dead-letter copies fail, and their entries wait (see [Dead-letter streams](#dead-letter-streams));
+- a worker that starts only checks that its groups exist, and its consumer is created by its first read.
 
 ---
 

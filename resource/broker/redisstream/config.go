@@ -168,6 +168,15 @@ func (s SubscriberConfig) Sanitize() SubscriberConfig {
 	return s
 }
 
+// longestDelay is the longest wait before a parked entry is claimed again: Retry.Max, or ClaimIdle
+// without delayed retries.
+func (s SubscriberConfig) longestDelay() time.Duration {
+	if s.Retry.enabled() {
+		return s.Retry.Max
+	}
+	return s.ClaimIdle
+}
+
 func (s SubscriberConfig) validate() error {
 	switch {
 	case s.Stream == "":
