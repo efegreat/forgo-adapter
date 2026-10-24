@@ -719,6 +719,20 @@ func (c *recordingPublishChannel) PublishWithDeferredConfirmWithContext(_ contex
 
 func (c *recordingPublishChannel) IsClosed() bool { return c.closed.Load() }
 
+// closingPublishChannel fails its first publish with amqp.ErrClosed, as a channel the client closed
+// before it ran the recovery hooks, and records the later ones.
+type closingPublishChannel struct {
+	recordingPublishChannel
+	failed atomic.Bool
+}
+
+func (c *closingPublishChannel) PublishWithDeferredConfirmWithContext(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) (*amqp.DeferredConfirmation, error) {
+	if c.failed.CompareAndSwap(false, true) {
+		return nil, amqp.ErrClosed
+	}
+	return c.recordingPublishChannel.PublishWithDeferredConfirmWithContext(ctx, exchange, key, mandatory, immediate, msg)
+}
+
 func (c *recordingPublishChannel) Close() error { return nil }
 
 func TestPublisherPublish(t *testing.T) {
@@ -795,15 +809,61 @@ func TestPublisherWaitsForRecoveryWhileDown(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- p.Publish(context.Background(), worker.Message{ID: "id"}) }()
 	time.Sleep(20 * time.Millisecond)
+	// The client reopened the channel. Publish reads ch only once the gate opens.
+	ch.err, ch.notConfirming = nil, true
 	ch.closed.Store(false)
 	p.gate.open()
 	select {
 	case err := <-done:
-		if !errors.Is(err, amqp.ErrClosed) || ch.publishes.Load() != 1 {
+		if !errors.Is(err, errNotConfirming) || ch.publishes.Load() != 1 {
 			t.Fatalf("Publish once the connection is back = %v after %d publishes", err, ch.publishes.Load())
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Publish kept waiting once the connection was back")
+	}
+}
+
+// The client closes a lost channel before it runs the recovery hooks. A publisher that waits for
+// recovery and finds its channel closed while the gate is still open waits for the hooks, and sends
+// once the channel is back, while one that does not wait fails at once.
+func TestPublisherWaitsForTheHooksOfAClosedChannel(t *testing.T) {
+	newChannel := func() *closingPublishChannel {
+		return &closingPublishChannel{recordingPublishChannel: recordingPublishChannel{notConfirming: true}}
+	}
+	ch := newChannel()
+	p := &publisher{conf: PublisherConfig{DeliveryMode: amqp.Persistent}, ch: ch, gate: &gate{}, waitsForRecovery: true}
+	done := make(chan error, 1)
+	go func() { done <- p.Publish(context.Background(), worker.Message{ID: "id"}) }()
+	for !ch.failed.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("Publish on a channel closed before the hooks ran = %v, want it to wait", err)
+	default:
+	}
+
+	// The hooks close the gate, and open it once the client reopened the channel.
+	p.gate.close(amqp.ErrClosed)
+	time.Sleep(20 * time.Millisecond)
+	if n := ch.publishes.Load(); n != 0 {
+		t.Fatalf("Publish sent %d messages while the channel was reopened", n)
+	}
+	p.gate.open()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errNotConfirming) || ch.publishes.Load() != 1 {
+			t.Fatalf("Publish once the channel is back = %v after %d publishes", err, ch.publishes.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Publish kept waiting once the channel was back")
+	}
+
+	ch = newChannel()
+	p = &publisher{conf: PublisherConfig{DeliveryMode: amqp.Persistent}, ch: ch, gate: &gate{}}
+	if err := p.Publish(context.Background(), worker.Message{ID: "id"}); !errors.Is(err, amqp.ErrClosed) || ch.publishes.Load() != 0 {
+		t.Fatalf("Publish of a publisher that does not wait = %v after %d publishes, want amqp.ErrClosed at once", err, ch.publishes.Load())
 	}
 }
 

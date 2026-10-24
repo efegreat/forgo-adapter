@@ -80,6 +80,9 @@ type gate struct {
 	// publishes whose confirm a loss cut short.
 	losses uint64
 	reason error
+	// lost, when set, is closed by the next close, for the publishes that found the channel closed
+	// before the hooks closed the gate.
+	lost chan struct{}
 }
 
 // close holds publishes back until open, for a loss of the channel for reason.
@@ -92,6 +95,10 @@ func (g *gate) close(reason error) {
 	g.closed++
 	g.losses++
 	g.reason = reason
+	if g.lost != nil {
+		close(g.lost)
+		g.lost = nil
+	}
 }
 
 // open lets publishes through again once every close is matched.
@@ -107,21 +114,32 @@ func (g *gate) open() {
 // send runs publish once the gate is open, holding it open until publish returns, and returns the
 // losses counted so far, for lostSince. While the gate is closed, it fails with amqp.ErrClosed as
 // long as closed reports the channel closed, as publishing would while the connection is down, and
-// otherwise waits for the client to finish reopening the channel, until ctx ends. A nil gate is
+// otherwise waits for the client to finish reopening the channel, until ctx ends. A publisher that
+// recovers waits for the client to reopen the channel either way. The client closes a lost channel
+// before it runs the hooks, so such a publisher can also find the channel closed while the gate is
+// still open: send then waits for the hooks to close the gate, and goes on as above. A nil gate is
 // always open.
-func (g *gate) send(ctx context.Context, closed func() bool, publish func() error) (uint64, error) {
+func (g *gate) send(ctx context.Context, recovers bool, closed func() bool, publish func() error) (uint64, error) {
 	if g == nil {
 		return 0, publish()
 	}
 	for {
 		g.mu.RLock()
 		if g.closed == 0 {
-			defer g.mu.RUnlock()
-			return g.losses, publish()
+			losses := g.losses
+			err := publish()
+			g.mu.RUnlock()
+			if !recovers || !errors.Is(err, amqp.ErrClosed) {
+				return losses, err
+			}
+			if err := g.waitLoss(ctx, losses); err != nil {
+				return 0, err
+			}
+			continue
 		}
 		opened := g.opened
 		g.mu.RUnlock()
-		if closed() {
+		if !recovers && closed() {
 			return 0, amqp.ErrClosed
 		}
 
@@ -130,6 +148,27 @@ func (g *gate) send(ctx context.Context, closed func() bool, publish func() erro
 		case <-ctx.Done():
 			return 0, fmt.Errorf("wait for the recovery of the channel: %w", ctx.Err())
 		}
+	}
+}
+
+// waitLoss waits until the hooks closed the gate for a loss after the first losses, or ctx ends.
+func (g *gate) waitLoss(ctx context.Context, losses uint64) error {
+	g.mu.Lock()
+	if g.losses != losses {
+		g.mu.Unlock()
+		return nil
+	}
+	if g.lost == nil {
+		g.lost = make(chan struct{})
+	}
+	lost := g.lost
+	g.mu.Unlock()
+
+	select {
+	case <-lost:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait for the recovery of the channel: %w", ctx.Err())
 	}
 }
 

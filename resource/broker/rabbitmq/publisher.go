@@ -51,7 +51,7 @@ type publisher struct {
 	gate *gate
 	flow *flow
 	// waitsForRecovery waits, while the connection is down, for the client to reopen the channel,
-	// instead of failing at once.
+	// instead of failing at once, also when a publish finds the channel closed before the hooks ran.
 	waitsForRecovery bool
 	release          func()
 
@@ -75,7 +75,7 @@ func (p *publisher) publish(ctx context.Context, exchange, key string, msg amqp.
 		return fmt.Errorf("rabbitmq: publish %s: %w", id, err)
 	}
 	var dc *amqp.DeferredConfirmation
-	losses, err := p.gate.send(ctx, p.closed, func() (err error) {
+	losses, err := p.gate.send(ctx, p.waitsForRecovery, p.ch.IsClosed, func() (err error) {
 		dc, err = p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, p.conf.Mandatory, false, msg)
 		return err
 	})
@@ -86,12 +86,6 @@ func (p *publisher) publish(ctx context.Context, exchange, key string, msg amqp.
 		return fmt.Errorf("%w: %s", errNotConfirming, id)
 	}
 	return p.await(ctx, dc, id, losses)
-}
-
-// closed reports the channel closed for a publish to fail at once while the client reopens it: never
-// when the publisher waits for recovery.
-func (p *publisher) closed() bool {
-	return !p.waitsForRecovery && p.ch.IsClosed()
 }
 
 // await waits for the confirm of the message with the given ID, sent once the channel had been lost
