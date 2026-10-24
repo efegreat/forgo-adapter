@@ -655,7 +655,10 @@ func TestConsumeWaitsForHandlers(t *testing.T) {
 	if completeErr != nil {
 		t.Fatal(completeErr)
 	}
-	eventually(t, "the ack", func() bool { return acks(srv, msg.ID) == 1 })
+	// The client sent the acknowledgement before Consume returned.
+	if n := acks(srv, msg.ID); n != 1 {
+		t.Fatalf("%d acks when Consume returned, want 1", n)
+	}
 }
 
 func TestConsumeMissingSubscription(t *testing.T) {
@@ -786,6 +789,122 @@ func TestConsumeReceivesAgain(t *testing.T) {
 			t.Fatalf("Consume() = %v", err)
 		}
 	})
+}
+
+// While Pub/Sub does not answer, the client retries the last acknowledgements for about a minute
+// before Receive returns. Consume waits for its handlers, then only for flushWait.
+func TestConsumeStopsWhileAcksHang(t *testing.T) {
+	srv := pstest.NewServer()
+	answer := make(chan struct{})
+	conn, err := grpc.NewClient(srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+			if strings.HasSuffix(method, "/Acknowledge") {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-answer:
+				}
+			}
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+		_ = srv.Close()
+	})
+	b := open(t, topology(Config{Name: "events", ProjectID: project, Options: []option.ClientOption{option.WithGRPCConn(conn)}}, SubscriptionConfig{}))
+	t.Cleanup(func() { close(answer) }) // before the broker closes, which waits for nothing hung
+	msg := worker.NewMessage("order.placed", "", "orders", nil)
+	publish(t, b, msg)
+
+	s := quickRetries(t, b, "billing")
+	s.flushWait = 200 * time.Millisecond
+	started, finish := make(chan struct{}), make(chan struct{})
+	stop := consumeWith(t, s, 1, func(ctx context.Context, d worker.IDelivery) {
+		close(started)
+		<-finish
+		_ = d.Complete(context.WithoutCancel(ctx))
+	})
+	<-started
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- stop() }()
+	select {
+	case err := <-stopped:
+		t.Fatalf("Consume() returned %v while a handler was running", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(finish)
+	finished := time.Now()
+	if err := <-stopped; err != nil {
+		t.Fatalf("Consume() = %v", err)
+	}
+	if waited := time.Since(finished); waited > 2*time.Second {
+		t.Fatalf("Consume returned %s after the handler, want about flushWait", waited)
+	}
+	if n := acks(srv, msg.ID); n != 0 {
+		t.Fatalf("%d acks reached the server, which did not answer", n)
+	}
+}
+
+// While Pub/Sub does not answer, the client retries a publish its caller gave up on for a minute.
+// Close waits for it for stopWait only.
+func TestCloseWhilePublishesHang(t *testing.T) {
+	srv := pstest.NewServer()
+	answer := make(chan struct{})
+	conn, err := grpc.NewClient(srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+			if strings.HasSuffix(method, "/Publish") {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-answer:
+				}
+			}
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		close(answer)
+		_ = conn.Close()
+		_ = srv.Close()
+	})
+	cfg := Config{Name: "events", ProjectID: project, Options: []option.ClientOption{option.WithGRPCConn(conn)}, Topics: []TopicConfig{{Name: "orders"}}}
+	res, err := cfg.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := res.(*broker)
+	b.topics.stopWait = 200 * time.Millisecond
+
+	p, err := b.NewDefaultPublisher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := p.Publish(ctx, worker.NewMessage("order.placed", "", "orders", nil)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Publish() = %v, want a deadline exceeded", err)
+	}
+
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() { closed <- b.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close() = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited for the publish its caller gave up on")
+	}
+	if waited := time.Since(start); waited < 150*time.Millisecond {
+		t.Fatalf("Close returned after %s, want it to wait about stopWait for the pending publish", waited)
+	}
 }
 
 func TestRetryable(t *testing.T) {

@@ -101,6 +101,7 @@ func (b *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 		sub:          b.client.Subscriber(conf.Subscription),
 		retryInitial: receiveRetryInitial,
 		retryMax:     receiveRetryMax,
+		flushWait:    ackFlushWait,
 	}
 	if conf.DeadLetterTopic != "" {
 		s.deadLetter = &deadLetter{topics: b.topics, topic: conf.DeadLetterTopic}
@@ -113,7 +114,7 @@ func (b *broker) Value() any {
 	return worker.IBroker(b)
 }
 
-// Close sends the messages still being published, then closes the client.
+// Close sends the messages still being published, for up to five seconds, then closes the client.
 func (b *broker) Close() error {
 	b.topics.stop()
 	return b.client.Close()
