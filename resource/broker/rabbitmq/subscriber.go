@@ -25,11 +25,14 @@ type consumeChannel interface {
 	Close() error
 }
 
-// subscriber is the worker.ISubscriber of a SubscriberConfig. It consumes on a channel of its own.
+// subscriber is the worker.ISubscriber of a SubscriberConfig. It consumes on a channel of its own,
+// and publishes the copies that retries and rejections need through copier, on another connection.
 type subscriber struct {
 	*subscription
-	retry   *retrier
-	release func()
+	copier     *publisher
+	retry      *retrier
+	deadLetter *deadLetter
+	release    func()
 }
 
 // Consume sets the prefetch, subscribes to the queue and hands every delivery to state.Handler,
@@ -70,7 +73,7 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 				// acknowledgement would settle a message of the reopened channel.
 				continue
 			}
-			d := newDelivery(msg, s.guard, st.gen, s.retry)
+			d := newDelivery(msg, s.guard, st.gen, s.retry, s.deadLetter)
 			err := runner.Run(ctx, func() {
 				state.Handler(ctx, d)
 			})
@@ -86,16 +89,15 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 	}
 }
 
-// Close closes the subscriber's channel, and the publisher of its queue's retry queues.
+// Close closes the subscriber's channel, and the publisher of its copies.
 func (s *subscriber) Close() error {
 	if s.release != nil {
 		s.release()
 	}
-	err := s.ch.Close()
-	if s.retry != nil {
-		err = errors.Join(err, s.retry.pub.Close())
+	if s.copier == nil {
+		return closeWithin(closeTimeout, s.ch.Close)
 	}
-	return err
+	return closeAll(closeTimeout, s.ch.Close, s.copier.Close)
 }
 
 // prefetch returns the prefetch count for a subscriber: configured when positive, the worker's

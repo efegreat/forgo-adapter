@@ -150,6 +150,11 @@ func TestIntegrationBroker(t *testing.T) {
 	if deadLetter.MessageId != msg.ID {
 		t.Fatalf("dead letter = %q, want %q", deadLetter.MessageId, msg.ID)
 	}
+	// The subscriber's copy arrives as RabbitMQ's own dead-lettering would send it, and keeps what the
+	// retry recorded.
+	if deadLetter.Exchange != name+".dlx" || deadLetter.RoutingKey != name || deadLetter.Headers["x-death"] == nil {
+		t.Fatalf("dead letter from exchange %q with routing key %q and headers %v", deadLetter.Exchange, deadLetter.RoutingKey, deadLetter.Headers)
+	}
 
 	// The default publisher needs no config.
 	def, err := b.NewDefaultPublisher()

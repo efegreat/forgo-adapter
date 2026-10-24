@@ -20,6 +20,9 @@ var (
 	// errRecoveryFailed is the loss of a consumer whose connection or channel the client could not
 	// recover once the recovery had canceled the consumer.
 	errRecoveryFailed = errors.New("rabbitmq: the connection or channel could not be recovered")
+	// errBlocked is returned by a publish that waited in vain for the broker to stop blocking the
+	// publishing connection, which it does while it is low on memory or disk space.
+	errBlocked = errors.New("rabbitmq: the broker blocks publishing")
 )
 
 // ackGuard keeps acknowledgements of deliveries from a lost channel off its recovered successor.
@@ -143,6 +146,88 @@ func (g *gate) lostSince(losses uint64) error {
 	return g.reason
 }
 
+// flow holds the publishes of a connection back while the broker blocks it. RabbitMQ blocks every
+// connection that publishes while it is low on memory or disk space, and stops reading from it.
+// The client would still write a publish, and once the socket's buffer is full, block in the write
+// for as long as the alarm lasts, whatever the publish's context, holding the publisher's lock and
+// its gate: the relay could not stop, nor the app shut down. A publish waits for the broker to
+// unblock the connection instead, until its context ends. One the broker blocks between the check
+// and the write waits for its confirm, which its context bounds.
+type flow struct {
+	mu sync.Mutex
+	// reason is why the broker blocks the connection, such as "low on memory". unblocked is closed
+	// while it does not.
+	reason    string
+	unblocked chan struct{}
+}
+
+func newFlow() *flow {
+	unblocked := make(chan struct{})
+	close(unblocked)
+	return &flow{unblocked: unblocked}
+}
+
+// watch follows the notices of conn that the broker blocks it, and unblocks it, until the client
+// closes the connection for good. The client waits for every notice to be received.
+func (f *flow) watch(conn *amqp.Connection) {
+	blocks := conn.NotifyBlocked(make(chan amqp.Blocking, 1))
+	go func() {
+		for b := range blocks {
+			if b.Active {
+				f.block(b.Reason)
+			} else {
+				f.unblock()
+			}
+		}
+	}()
+}
+
+func (f *flow) block(reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.isUnblocked() {
+		f.unblocked = make(chan struct{})
+	}
+	f.reason = reason
+}
+
+// unblock lets publishes through again. A lost connection unblocks too: the broker blocks the next
+// one anew while its alarm lasts.
+func (f *flow) unblock() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.isUnblocked() {
+		close(f.unblocked)
+	}
+}
+
+// isUnblocked reports whether unblocked is closed. The caller holds f.mu.
+func (f *flow) isUnblocked() bool {
+	select {
+	case <-f.unblocked:
+		return true
+	default:
+		return false
+	}
+}
+
+// wait returns once the broker does not block the connection, or with errBlocked and ctx's error
+// once ctx ends. A nil flow never blocks.
+func (f *flow) wait(ctx context.Context) error {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	unblocked, reason := f.unblocked, f.reason
+	f.mu.Unlock()
+	select {
+	case <-unblocked:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w (%s): %w", errBlocked, reason, ctx.Err())
+	}
+}
+
 // consumerLoss hands the first failure to re-subscribe a subscriber's consumer to its Consume.
 type consumerLoss struct {
 	once sync.Once
@@ -172,13 +257,18 @@ func (l *consumerLoss) reported() bool {
 	}
 }
 
-// recoveryHooks wraps the client's connection and topology recovery. The close hooks run on the
-// client's close watchers, after the lost connection or channel is closed. The client's recovery,
-// which they call, reopens it and recovers the topology through RecoverTopology before it returns.
+// recoveryHooks wraps the client's connection and topology recovery of one of the broker's
+// connections. The close hooks run on the client's close watchers, after the lost connection or
+// channel is closed. The client's recovery, which they call, reopens it and recovers the topology
+// through RecoverTopology before it returns.
 type recoveryHooks struct {
 	broker   *broker
 	next     amqp.ConnectionRecovery
 	topology amqp.TopologyRecovery
+	// publishers is set on the hooks of the publishing connection, whose flow is flow. The other
+	// connection carries the subscribers.
+	publishers bool
+	flow       *flow
 	// reconnecting counts the connection recoveries in progress. The channels of a lost connection
 	// are closed too, and their hooks leave them to the connection's.
 	reconnecting atomic.Int32
@@ -195,7 +285,10 @@ func (h *recoveryHooks) OnConnectionClose(conn *amqp.Connection, err *amqp.Error
 		return
 	}
 	h.reconnecting.Add(1)
-	gates := h.broker.loseConnection(lossReason(err))
+	gates := h.broker.loseConnection(h.publishers, lossReason(err))
+	if h.flow != nil {
+		h.flow.unblock()
+	}
 	h.next.OnConnectionClose(conn, err)
 	h.reconnecting.Add(-1)
 
@@ -204,7 +297,7 @@ func (h *recoveryHooks) OnConnectionClose(conn *amqp.Connection, err *amqp.Error
 	}
 	// A recovered connection re-subscribed every subscriber it detached. One that gave up, or that
 	// Close stopped, leaves them waiting.
-	if conn == nil || conn.IsClosed() {
+	if !h.publishers && (conn == nil || conn.IsClosed()) {
 		h.broker.giveUp()
 	}
 }
