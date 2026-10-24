@@ -902,8 +902,9 @@ func TestIntegrationConsumerTimeout(t *testing.T) {
 	r.publish(t, "held", 1)
 	heldDue := time.Now().Add(timeout)
 
+	var cancelledTag string
 	select {
-	case <-cancels:
+	case cancelledTag = <-cancels:
 	case <-time.After(3 * timeout):
 		t.Fatal("the broker did not cancel the consumer")
 	}
@@ -929,6 +930,15 @@ func TestIntegrationConsumerTimeout(t *testing.T) {
 	}
 	if queued := r.queued(t); queued != 0 {
 		t.Fatalf("the queue still holds %d messages", queued)
+	}
+	// A quorum queue keeps a consumer that timed out, which could be delivered to again into the
+	// stream the client dropped, until the subscriber cancels it: its tag stays in use meanwhile, and
+	// consuming under it would close the channel with NOT_ALLOWED.
+	if _, err := ch.Consume(r.name, cancelledTag, false, false, false, false, nil); err != nil {
+		t.Fatalf("the broker still holds the consumer %s it cancelled: %v", cancelledTag, err)
+	}
+	if err := ch.Cancel(cancelledTag, false); err != nil {
+		t.Fatal(err)
 	}
 }
 

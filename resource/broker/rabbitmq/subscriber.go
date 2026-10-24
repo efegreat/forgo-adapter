@@ -240,8 +240,18 @@ func (s *subscription) next(ctx context.Context, cur *stream) (*stream, error) {
 // new stream keeps the guard generation: delivery tags go on, and the handlers of the cancelled
 // consumer's deliveries still settle them. A subscription that cannot subscribe again, such as one
 // whose queue was deleted, is lost.
+//
+// A quorum queue keeps a consumer that timed out, and can deliver to it again, although it told the
+// client it cancelled it and the client dropped its stream: those deliveries would wait,
+// unacknowledged, until the broker timed them out too and closed the channel. So consumeAgain first
+// cancels the consumer itself, which removes it. The broker acknowledges the cancellation of a
+// consumer it no longer has, such as that of a deleted queue.
 func (s *subscription) consumeAgain() (*stream, error) {
 	cancelled := s.tag
+	if err := s.ch.Cancel(cancelled, false); err != nil {
+		s.lost.report(fmt.Errorf("consumer %s of queue %s, which the broker cancelled: cancel it: %w", cancelled, s.conf.Queue, err))
+		return nil, s.lost.err
+	}
 	s.tag = s.tags()
 	if err := s.subscribe(); err != nil {
 		s.lost.report(fmt.Errorf("consumer %s of queue %s, replacing %s, which the broker cancelled: %w", s.tag, s.conf.Queue, cancelled, err))
