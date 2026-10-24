@@ -46,9 +46,14 @@ type publisher struct {
 	ch   publishChannel
 	// returns receives unroutable mandatory messages. It is nil unless conf.Mandatory is set.
 	returns <-chan amqp.Return
-	// gate holds publishes back while the client reopens the channel.
-	gate    *gate
-	release func()
+	// gate holds publishes back while the client reopens the channel, and flow while the broker
+	// blocks the connection.
+	gate *gate
+	flow *flow
+	// waitsForRecovery waits, while the connection is down, for the client to reopen the channel,
+	// instead of failing at once.
+	waitsForRecovery bool
+	release          func()
 
 	// mu keeps one publish in flight per channel, so a return can be matched to its publish.
 	mu sync.Mutex
@@ -66,8 +71,11 @@ func (p *publisher) publish(ctx context.Context, exchange, key string, msg amqp.
 	defer p.mu.Unlock()
 
 	p.dropReturns()
+	if err := p.flow.wait(ctx); err != nil {
+		return fmt.Errorf("rabbitmq: publish %s: %w", id, err)
+	}
 	var dc *amqp.DeferredConfirmation
-	losses, err := p.gate.send(ctx, p.ch.IsClosed, func() (err error) {
+	losses, err := p.gate.send(ctx, p.closed, func() (err error) {
 		dc, err = p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, p.conf.Mandatory, false, msg)
 		return err
 	})
@@ -78,6 +86,12 @@ func (p *publisher) publish(ctx context.Context, exchange, key string, msg amqp.
 		return fmt.Errorf("%w: %s", errNotConfirming, id)
 	}
 	return p.await(ctx, dc, id, losses)
+}
+
+// closed reports the channel closed for a publish to fail at once while the client reopens it: never
+// when the publisher waits for recovery.
+func (p *publisher) closed() bool {
+	return !p.waitsForRecovery && p.ch.IsClosed()
 }
 
 // await waits for the confirm of the message with the given ID, sent once the channel had been lost
@@ -131,7 +145,7 @@ func (p *publisher) Close() error {
 	if p.release != nil {
 		p.release()
 	}
-	return p.ch.Close()
+	return closeWithin(closeTimeout, p.ch.Close)
 }
 
 // publishing converts msg to an AMQP message. The identity headers are written from the message

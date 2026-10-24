@@ -39,19 +39,20 @@ func (r *retrier) retry(ctx context.Context, d *delivery, attempt int) error {
 		return errStaleDelivery
 	}
 	q := r.queue(attempt)
-	if err := r.pub.publish(ctx, "", q.name, retryPublishing(d), d.msg.ID); err != nil {
+	if err := r.pub.publish(ctx, "", q.name, copyPublishing(d), d.msg.ID); err != nil {
 		err = fmt.Errorf("rabbitmq: delay the retry of %s through %s, requeuing it at once: %w", d.msg.ID, q.name, err)
 		return errors.Join(err, d.requeue())
 	}
 	return d.settle(func() error { return d.delivery.Ack(false) })
 }
 
-// retryPublishing copies a delivery for its retry queue. The copy is persistent and carries the
-// message ID in its identity header and property, so a message that arrived without an ID keeps the
-// one it was given, and a return of the copy is matched to its publish. Expiration and UserId are
-// dropped: the retry queue decides when the copy expires, and RabbitMQ checks UserId against the
-// user of the connection.
-func retryPublishing(d *delivery) amqp.Publishing {
+// copyPublishing copies a delivery for a retry queue or the dead-letter exchange. The copy is
+// persistent and carries the message ID in its identity header and property, so a message that
+// arrived without an ID keeps the one it was given, and a return of the copy is matched to its
+// publish. Expiration and UserId are dropped: a retry queue decides when its copy expires, a dead
+// letter does not expire, as with RabbitMQ's own dead-lettering, and RabbitMQ checks UserId against
+// the user of the connection.
+func copyPublishing(d *delivery) amqp.Publishing {
 	src := d.delivery
 	headers := make(amqp.Table, len(src.Headers)+1)
 	maps.Copy(headers, src.Headers)

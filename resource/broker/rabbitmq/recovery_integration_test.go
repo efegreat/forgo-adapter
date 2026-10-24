@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,44 +20,116 @@ import (
 )
 
 // faultyNetwork dials the broker for the recovery tests, and fails like a network: cut closes every
-// connection it made, while it refuses, dials fail, and while it hangs up, dials succeed and the
-// other end closes the connection at once.
+// connection it made and cutPublishing those of the publishing connection, while it refuses, dials
+// fail, while it hangs up, dials of the subscribers' connection succeed and the other end closes
+// the connection at once, and once it stalls, nothing gets through either way, as with a broker
+// that hangs or a network that drops every packet.
 type faultyNetwork struct {
 	mu     sync.Mutex
-	conns  []net.Conn
+	conns  []dialedConn
 	refuse bool
 	// hangUps counts the dials still to hang up, and hungUp those hung up so far.
 	hangUps, hungUp int
+	// dialed counts the connections made.
+	dialed  int
+	stalled atomic.Bool
 }
 
-func (n *faultyNetwork) dial(network, addr string) (net.Conn, error) {
+// dialedConn is a connection the network made, for the publishing connection or the other one.
+type dialedConn struct {
+	net.Conn
+	publishing bool
+}
+
+func (n *faultyNetwork) dial(publishing bool, network, addr string) (net.Conn, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.refuse {
 		return nil, errors.New("network unreachable")
 	}
-	if n.hangUps > 0 {
+	if n.hangUps > 0 && !publishing {
 		n.hangUps--
 		n.hungUp++
 		client, server := net.Pipe()
 		_ = server.Close()
 		return client, nil
 	}
-	conn, err := net.DialTimeout(network, addr, 5*time.Second)
-	if err == nil {
-		n.conns = append(n.conns, conn)
+	tcp, err := net.DialTimeout(network, addr, 5*time.Second)
+	if err != nil {
+		return nil, err
 	}
-	return conn, err
+	conn := &stallableConn{Conn: tcp, stalled: &n.stalled}
+	n.conns = append(n.conns, dialedConn{Conn: conn, publishing: publishing})
+	n.dialed++
+	return conn, nil
+}
+
+// waitDialed waits until the network made n connections in all.
+func (n *faultyNetwork) waitDialed(t *testing.T, dials int) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		n.mu.Lock()
+		dialed := n.dialed
+		n.mu.Unlock()
+		if dialed >= dials {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d connections made, want %d", dialed, dials)
+		}
+	}
+}
+
+// stall lets nothing through anymore, on the connections made so far and the next ones.
+func (n *faultyNetwork) stall() {
+	n.stalled.Store(true)
+}
+
+// stallableConn drops what is written to it and what it reads while its network stalls. A read
+// still ends with the connection's deadline or close.
+type stallableConn struct {
+	net.Conn
+	stalled *atomic.Bool
+}
+
+func (c *stallableConn) Read(b []byte) (int, error) {
+	for {
+		n, err := c.Conn.Read(b)
+		if err != nil || !c.stalled.Load() {
+			return n, err
+		}
+	}
+}
+
+func (c *stallableConn) Write(b []byte) (int, error) {
+	if c.stalled.Load() {
+		return len(b), nil
+	}
+	return c.Conn.Write(b)
 }
 
 // cut closes the connections, as a lost network would.
 func (n *faultyNetwork) cut() {
+	n.cutWhere(func(dialedConn) bool { return true })
+}
+
+// cutPublishing closes the connections of the publishing connection only.
+func (n *faultyNetwork) cutPublishing() {
+	n.cutWhere(func(c dialedConn) bool { return c.publishing })
+}
+
+func (n *faultyNetwork) cutWhere(cut func(dialedConn) bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	for _, conn := range n.conns {
-		_ = conn.Close()
+	kept := n.conns[:0]
+	for _, c := range n.conns {
+		if cut(c) {
+			_ = c.Close()
+		} else {
+			kept = append(kept, c)
+		}
 	}
-	n.conns = nil
+	n.conns = kept
 }
 
 func (n *faultyNetwork) setRefuse(refuse bool) {
@@ -64,7 +138,8 @@ func (n *faultyNetwork) setRefuse(refuse bool) {
 	n.refuse = refuse
 }
 
-// hangUp hangs up the next dials, as a load balancer does while the broker behind it is down.
+// hangUp hangs up the next dials of the subscribers' connection, as a load balancer does while the
+// broker behind it is down.
 func (n *faultyNetwork) hangUp(dials int) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -85,6 +160,8 @@ type recoveryTest struct {
 	name    string
 	network *faultyNetwork
 	broker  *broker
+	// pub is the broker's default publisher, opened with the broker, as a producer's are.
+	pub worker.IPublisher
 }
 
 // newRecoveryTest opens a broker for cfg, which it completes with the address of the RabbitMQ, the
@@ -120,32 +197,42 @@ func newRecoveryTest(t *testing.T, cfg Config, queue QueueConfig, sub Subscriber
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	pub, err := b.NewDefaultPublisher()
+	if err != nil {
+		_ = b.Close()
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
+		_ = pub.Close()
 		_ = b.Close()
 		deleteTopology(t, url, cfg.Sanitize())
 	})
-	return &recoveryTest{url: url, name: name, network: n, broker: b}
+	return &recoveryTest{url: url, name: name, network: n, broker: b, pub: pub}
 }
 
-// publish publishes n messages to the test's exchange through the broker's default publisher, with
-// the IDs prefix-0 to prefix-n-1, and returns the IDs.
+// publish publishes n messages to the test's exchange through the test's publisher, with the IDs
+// prefix-0 to prefix-n-1, and returns the IDs. As the outbox would, it publishes a message again
+// until the broker confirms it: while the publishing connection is down, which outlasts the
+// recovery of the subscribers' connection, or while the broker nacks it, as the publisher's channel
+// can do right after a recovery once it learns that the deleted auto-delete queue of the same name
+// went away.
 func (r *recoveryTest) publish(t *testing.T, prefix string, n int) []string {
 	t.Helper()
-	pub, err := r.broker.NewDefaultPublisher()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pub.Close()
 	ids := make([]string, n)
 	for i := range ids {
 		ids[i] = fmt.Sprintf("%s-%d", prefix, i)
 		msg := worker.NewMessage("m", "k", r.name, []byte(`{}`))
 		msg.ID = ids[i]
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := pub.Publish(ctx, msg)
-		cancel()
-		if err != nil {
-			t.Fatalf("Publish %s: %v", msg.ID, err)
+		for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := r.pub.Publish(ctx, msg)
+			cancel()
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("Publish %s: %v", msg.ID, err)
+			}
 		}
 	}
 	return ids
@@ -407,6 +494,287 @@ func TestIntegrationConnectionRecoveryConsumes(t *testing.T) {
 	}
 }
 
+// The publishers have a connection of their own, so the subscribers keep consuming, and their
+// deliveries stay current, while it is lost and cannot reconnect.
+func TestIntegrationPublishingConnectionLost(t *testing.T) {
+	r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true}, SubscriberConfig{})
+	ids := r.publish(t, "before", 200)
+	c := r.consume(t, 1, 2*time.Millisecond)
+	c.waitAcked(t, 20, 10*time.Second)
+
+	gen := c.sub.guard.generation()
+	r.network.setRefuse(true)
+	r.network.cutPublishing()
+	c.waitAcked(t, len(ids), 15*time.Second)
+	if !r.broker.publishConn.IsClosed() || r.broker.conn.IsClosed() {
+		t.Fatalf("publishing connection closed %v, subscribers' connection closed %v, want only the first", r.broker.publishConn.IsClosed(), r.broker.conn.IsClosed())
+	}
+	if c.sub.guard.generation() != gen {
+		t.Fatal("the loss of the publishing connection marked the deliveries stale")
+	}
+
+	r.network.setRefuse(false)
+	ids = append(ids, r.publish(t, "after", 20)...)
+	c.waitAcked(t, len(ids), 10*time.Second)
+	c.checkAll(t, ids, 0)
+}
+
+// A retry waits for the publishing connection to come back, within its context, instead of
+// requeueing the delivery at once, so its handler does not run again until the retry queue returns
+// the message.
+func TestIntegrationRetryWaitsForPublishingConnection(t *testing.T) {
+	r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true, Retry: RetryConfig{Initial: 100 * time.Millisecond, Max: 100 * time.Millisecond}}, SubscriberConfig{})
+	r.publish(t, "msg", 1)
+	s, err := r.broker.NewSubscriber("sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type handled struct {
+		retried bool // the message came back from a retry queue, which adds x-death
+		err     error
+	}
+	results := make(chan handled, 4)
+	var runs atomic.Int32
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Consume(ctx, worker.ConsumerState{Concurrency: 1, Handler: func(ctx context.Context, d worker.IDelivery) {
+			_, retried := d.Message().Headers.Get("x-death")
+			if runs.Add(1) > 1 {
+				results <- handled{retried: retried, err: d.Complete(ctx)}
+				return
+			}
+			r.network.setRefuse(true)
+			r.network.cutPublishing()
+			for r.broker.publishConn != nil && !r.broker.publishConn.IsClosed() {
+				time.Sleep(time.Millisecond)
+			}
+			time.AfterFunc(500*time.Millisecond, func() { r.network.setRefuse(false) })
+			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			results <- handled{err: d.Retry(rctx, 1)}
+		}})
+	}()
+	t.Cleanup(func() {
+		stop()
+		<-done
+		_ = s.Close()
+	})
+
+	for i, want := range []string{"the retry", "the delivery from the retry queue"} {
+		select {
+		case h := <-results:
+			if h.err != nil {
+				t.Fatalf("%s failed: %v", want, h.err)
+			}
+			if i == 1 && !h.retried {
+				t.Fatal("the message came back without going through the retry queue: it was requeued")
+			}
+		case err := <-done:
+			t.Fatalf("Consume returned %v before %s", err, want)
+		case <-time.After(15 * time.Second):
+			t.Fatalf("no %s", want)
+		}
+	}
+	if n := runs.Load(); n != 2 {
+		t.Fatalf("the handler ran %d times, want 2", n)
+	}
+}
+
+// RabbitMQ's own dead-lettering drops a message whose dead-letter queue is deleted or full. The
+// subscriber publishes the copy itself instead, and while the copy cannot be stored, it requeues the
+// delivery, or parks it in the last retry queue when the queue has retry queues, so that it does not
+// keep the subscriber's handlers from the other messages: the message comes back, is rejected again,
+// and is acknowledged once its copy is stored.
+func TestIntegrationDeadLetterNotStored(t *testing.T) {
+	deleted := func(ch *amqp.Channel, dlq, _, _ string) error {
+		_, err := ch.QueueDelete(dlq, false, false, false)
+		return err
+	}
+	redeclared := func(ch *amqp.Channel, dlq, dlx, key string) error {
+		if _, err := ch.QueueDeclare(dlq, true, false, false, false, nil); err != nil {
+			return err
+		}
+		return ch.QueueBind(dlq, key, dlx, false, nil)
+	}
+	tests := []struct {
+		name string
+		// args are the dead-letter queue's, and retry the queue's.
+		args  map[string]any
+		retry RetryConfig
+		// rejects is the number of messages the handler rejects, and others the number it
+		// completes, published after them.
+		rejects, others int
+		// breakIt makes the dead-letter queue refuse copies, and repair lets it store them again.
+		breakIt, repair func(ch *amqp.Channel, dlq, dlx, key string) error
+	}{
+		{name: "dead-letter queue deleted", rejects: 1, breakIt: deleted, repair: redeclared},
+		{
+			name:    "dead-letter queue full",
+			args:    map[string]any{"x-max-length": 1, "x-overflow": "reject-publish"},
+			rejects: 2,
+			breakIt: func(*amqp.Channel, string, string, string) error { return nil }, // the first copy fills it
+			repair: func(ch *amqp.Channel, dlq, _, _ string) error {
+				_, err := ch.QueuePurge(dlq, false)
+				return err
+			},
+		},
+		{
+			name:    "dead-letter queue deleted, with retry queues",
+			retry:   RetryConfig{Initial: 50 * time.Millisecond, Max: 100 * time.Millisecond},
+			rejects: 3, others: 200,
+			breakIt: deleted, repair: redeclared,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true, DeadLetter: DeadLetterConfig{Enabled: true, Args: tt.args}, Retry: tt.retry}, SubscriberConfig{})
+			dlq, dlx := r.name+".dlq", r.name+".dlx"
+			conn, err := amqp.Dial(r.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			ch, err := conn.Channel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tt.breakIt(ch, dlq, dlx, r.name); err != nil {
+				t.Fatal(err)
+			}
+
+			var failed, rejected, completed, parked atomic.Int32
+			s, err := r.broker.NewSubscriber("sub")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, stop := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				done <- s.Consume(ctx, worker.ConsumerState{Concurrency: 1, Handler: func(ctx context.Context, d worker.IDelivery) {
+					if strings.HasPrefix(d.Message().ID, "other-") {
+						if d.Complete(ctx) == nil {
+							completed.Add(1)
+						}
+						return
+					}
+					if _, ok := d.Message().Headers.Get("x-death"); ok {
+						parked.Add(1) // it came back through a retry queue
+					}
+					if err := d.Reject(ctx); err != nil {
+						failed.Add(1)
+						return
+					}
+					rejected.Add(1)
+				}})
+			}()
+			t.Cleanup(func() {
+				stop()
+				<-done
+				_ = s.Close()
+			})
+			ids := r.publish(t, "msg", tt.rejects)
+			r.publish(t, "other", tt.others)
+
+			// A copy that cannot be stored brings its message back, again and again, and the
+			// other messages are handled meanwhile.
+			for deadline := time.Now().Add(15 * time.Second); failed.Load() < int32(3*tt.rejects) || completed.Load() < int32(tt.others); time.Sleep(10 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("%d rejections failed, %d went through, and %d of %d other messages were completed while the dead-letter queue refused copies", failed.Load(), rejected.Load(), completed.Load(), tt.others)
+				}
+			}
+			if tt.retry.Initial > 0 && parked.Load() == 0 {
+				t.Fatal("the rejected messages came back without going through a retry queue: they were requeued")
+			}
+			if err := tt.repair(ch, dlq, dlx, r.name); err != nil {
+				t.Fatal(err)
+			}
+			for deadline := time.Now().Add(15 * time.Second); rejected.Load() < int32(tt.rejects); time.Sleep(10 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("%d of %d messages dead-lettered once the dead-letter queue was repaired", rejected.Load(), tt.rejects)
+				}
+			}
+			last := getMessage(t, r.url, dlq)
+			if !slices.Contains(ids, last.MessageId) {
+				t.Fatalf("the dead-letter queue holds %q, want one of %v", last.MessageId, ids)
+			}
+			if queued := r.queued(t); queued != 0 {
+				t.Fatalf("the queue still holds %d messages", queued)
+			}
+			t.Logf("%d rejections failed before the copies were stored, %d of them parked", failed.Load(), parked.Load())
+		})
+	}
+}
+
+// A SIGTERM can come while the broker is unreachable. The subscribers, the publishers and the broker
+// then close without failing, within closeTimeout each, whether the connections are down and being
+// recovered, the broker does not answer, or the client is reconnecting to a broker that does not
+// answer.
+func TestIntegrationCloseWhileUnreachable(t *testing.T) {
+	tests := []struct {
+		name  string
+		fault func(*testing.T, *faultyNetwork)
+	}{
+		{name: "connections down", fault: func(_ *testing.T, n *faultyNetwork) { n.setRefuse(true); n.cut() }},
+		{name: "broker not answering", fault: func(_ *testing.T, n *faultyNetwork) { n.stall() }},
+		{
+			// Both connections reconnect into a broker that does not answer, and wait for its
+			// handshake, which the dialer of the test bounds by no deadline.
+			name: "reconnecting to a broker not answering",
+			fault: func(t *testing.T, n *faultyNetwork) {
+				n.mu.Lock()
+				dialed := n.dialed
+				n.mu.Unlock()
+				n.stall()
+				n.cut()
+				n.waitDialed(t, dialed+2)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true}, SubscriberConfig{})
+			s, err := r.broker.NewSubscriber("sub")
+			if err != nil {
+				t.Fatal(err)
+			}
+			handled := make(chan struct{}, 1)
+			ctx, stop := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				done <- s.Consume(ctx, worker.ConsumerState{Concurrency: 1, Handler: func(ctx context.Context, d worker.IDelivery) {
+					_ = d.Complete(ctx)
+					handled <- struct{}{}
+				}})
+			}()
+			r.publish(t, "msg", 1)
+			<-handled
+
+			tt.fault(t, r.network)
+			time.Sleep(100 * time.Millisecond)
+			stop()
+			if err := <-done; err != nil {
+				t.Fatalf("Consume = %v", err)
+			}
+			for _, c := range []struct {
+				what  string
+				close func() error
+			}{
+				{"subscriber", s.Close},
+				{"publisher", r.pub.Close},
+				{"broker", r.broker.Close},
+			} {
+				start := time.Now()
+				err := c.close()
+				if limit := closeTimeout + time.Second; err != nil || time.Since(start) > limit {
+					t.Errorf("closing the %s = %v after %s, want nil within %s", c.what, err, time.Since(start).Round(time.Millisecond), limit)
+				}
+			}
+		})
+	}
+}
+
 // Reconnection attempts fail after they dialed, as through a load balancer while the broker behind
 // it is down. The client hands the close of each one to the recovery hooks once a later attempt
 // reconnected, and the subscriber keeps consuming on the stream it subscribed on.
@@ -639,43 +1007,16 @@ func TestIntegrationAutoDeleteQueueRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitResubscribed(t, r, c, gen)
-	ids = append(ids, r.publishConfirmed(t, "after-channel"))
+	ids = append(ids, r.publish(t, "after-channel", 1)...)
 	c.waitAcked(t, len(ids), 10*time.Second)
 
 	gen = c.sub.guard.generation()
 	r.network.cut()
 	waitResubscribed(t, r, c, gen)
-	ids = append(ids, r.publishConfirmed(t, "after-connection"))
+	ids = append(ids, r.publish(t, "after-connection", 1)...)
 	c.waitAcked(t, len(ids), 10*time.Second)
 
 	c.checkAll(t, ids, 1)
-}
-
-// publishConfirmed publishes the message prefix-0 like publish, and again while the broker nacks
-// it, as the outbox would. Right after a recovery, the publisher's channel can still learn that the
-// deleted auto-delete queue of the same name went away, and nack a message routed to the new one.
-func (r *recoveryTest) publishConfirmed(t *testing.T, prefix string) string {
-	t.Helper()
-	pub, err := r.broker.NewDefaultPublisher()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pub.Close()
-	msg := worker.NewMessage("m", "k", r.name, []byte(`{}`))
-	msg.ID = prefix + "-0"
-	for attempt := 1; ; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := pub.Publish(ctx, msg)
-		cancel()
-		if err == nil {
-			return msg.ID
-		}
-		if !errors.Is(err, errNacked) || attempt == 10 {
-			t.Fatalf("Publish %s: %v", msg.ID, err)
-		}
-		t.Logf("Publish %s: %v; publishing it again", msg.ID, err)
-		time.Sleep(100 * time.Millisecond)
-	}
 }
 
 // waitResubscribed waits until the subscriber of c subscribed again, on a later incarnation of its

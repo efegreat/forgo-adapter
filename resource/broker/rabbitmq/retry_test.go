@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"maps"
 	"reflect"
 	"testing"
 	"time"
@@ -60,9 +61,47 @@ func TestRetryQueues(t *testing.T) {
 		})
 	}
 
+	// Retry queues are at-least-once quorum queues unless Args say otherwise.
+	argTests := []struct {
+		name string
+		args map[string]any
+		want amqp.Table
+	}{
+		{name: "default", want: amqp.Table{queueTypeArg: "quorum", deadLetterStrategyArg: "at-least-once", overflowArg: "reject-publish"}},
+		{name: "classic", args: map[string]any{queueTypeArg: "classic"}, want: amqp.Table{queueTypeArg: "classic"}},
+		{
+			name: "quorum with an overflow of its own",
+			args: map[string]any{overflowArg: "drop-head", "x-delivery-limit": 5},
+			want: amqp.Table{queueTypeArg: "quorum", deadLetterStrategyArg: "at-least-once", overflowArg: "drop-head", "x-delivery-limit": 5},
+		},
+	}
+	for _, tt := range argTests {
+		t.Run("args "+tt.name, func(t *testing.T) {
+			given := maps.Clone(tt.args)
+			retry := RetryConfig{Initial: time.Second, Max: time.Second, Args: tt.args}
+			args := retry.queues("orders")[0].args
+			for _, arg := range []string{messageTTLArg, deadLetterExchangeArg, deadLetterRoutingKeyArg} {
+				delete(args, arg)
+			}
+			if !reflect.DeepEqual(args, tt.want) {
+				t.Fatalf("args %v, want %v", args, tt.want)
+			}
+			// Configs are shared values: Args itself is never modified.
+			if !reflect.DeepEqual(tt.args, given) {
+				t.Fatalf("Args became %v", tt.args)
+			}
+		})
+	}
+
 	cfg := Config{Queues: []QueueConfig{{Name: "plain"}, {Name: "orders", Retry: RetryConfig{Initial: time.Second}}}}.Sanitize()
-	if len(retryQueues(cfg, "orders")) == 0 || retryQueues(cfg, "plain") != nil || retryQueues(cfg, "undeclared") != nil {
-		t.Fatal("retryQueues does not follow the queue's Retry")
+	if q, ok := queueConfig(cfg, "orders"); !ok || len(q.Retry.queues(q.Name)) == 0 {
+		t.Fatal("queueConfig lost the queue's Retry")
+	}
+	if q, ok := queueConfig(cfg, "plain"); !ok || q.Retry.queues(q.Name) != nil {
+		t.Fatal("a queue without Retry has retry queues")
+	}
+	if _, ok := queueConfig(cfg, "undeclared"); ok {
+		t.Fatal("queueConfig found a queue that is not configured")
 	}
 }
 
@@ -98,7 +137,7 @@ func TestDeliveryRetry(t *testing.T) {
 				Acknowledger: ack, DeliveryTag: 7, ContentType: "application/json", Body: []byte(`{}`),
 				Expiration: "60000", UserId: "producer",
 				Headers: amqp.Table{"tenant": "a"}, // no x-msg-id: the delivery generates an ID
-			}, guard, 0, &retrier{pub: pub, queues: queues})
+			}, guard, 0, &retrier{pub: pub, queues: queues}, nil)
 			if tt.stale {
 				guard.invalidate()
 			}

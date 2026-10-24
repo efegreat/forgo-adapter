@@ -22,7 +22,10 @@ const (
 
 	deadLetterExchangeArg   = "x-dead-letter-exchange"
 	deadLetterRoutingKeyArg = "x-dead-letter-routing-key"
+	deadLetterStrategyArg   = "x-dead-letter-strategy"
 	messageTTLArg           = "x-message-ttl"
+	queueTypeArg            = "x-queue-type"
+	overflowArg             = "x-overflow"
 
 	defaultRetryMax = 10 * time.Minute
 	// maxRetryDelay is the longest x-message-ttl RabbitMQ accepts.
@@ -42,7 +45,8 @@ var (
 // New connects and declares every exchange, queue, binding and dead-letter queue, so a topology
 // error fails the bootstrap instead of the first publish or consume.
 type Config struct {
-	// Name identifies the resource and names the connection in the RabbitMQ management UI. Required.
+	// Name identifies the resource and names its two connections in the RabbitMQ management UI:
+	// Name for the topology and the subscribers, and Name-publish for the publishers. Required.
 	Name string
 	// Addr is the broker host. Default: localhost.
 	Addr string
@@ -108,7 +112,7 @@ func (c Config) New() (forgo.Resource, error) {
 
 // open is New, dialing through dial unless it is nil. The tests of recovery dial through a network
 // they can cut.
-func (c Config) open(dial func(network, addr string) (net.Conn, error)) (*broker, error) {
+func (c Config) open(dial func(publishing bool, network, addr string) (net.Conn, error)) (*broker, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -242,10 +246,12 @@ func (q QueueConfig) args() amqp.Table {
 // DeadLetterConfig declares a dead-letter exchange and queue for a queue, and points the queue at
 // them with the x-dead-letter-exchange and x-dead-letter-routing-key arguments.
 //
-// RabbitMQ dead-letters the messages the worker rejects: messages whose attempts reached
-// MaxAttempt, messages that cannot be bound and messages no handler is registered for. Messages
-// that expire or overflow the queue are dead-lettered as well. Retried messages are not
-// dead-lettered: they are requeued, or go through the retry queues of Retry.
+// The subscriber dead-letters the messages the worker rejects itself: messages whose attempts
+// reached MaxAttempt, messages that cannot be bound and messages no handler is registered for. It
+// publishes a copy to the exchange, waits for the broker's confirm and acknowledges the delivery,
+// because RabbitMQ's own dead-lettering is at most once. RabbitMQ dead-letters the messages that
+// expire or overflow the queue itself. Retried messages are not dead-lettered: they are requeued,
+// or go through the retry queues of Retry.
 //
 // The exchange is a durable direct exchange and the queue is durable, so dead letters survive a
 // broker restart.
@@ -289,6 +295,10 @@ func (d DeadLetterConfig) sanitize(queue string) DeadLetterConfig {
 // publishes a copy of the delivery to the retry queue of the failed attempt, waits for the
 // broker's confirm and acknowledges the delivery. A waiting message holds no prefetch slot.
 //
+// The retry queues are quorum queues with x-dead-letter-strategy: at-least-once and x-overflow:
+// reject-publish by default. RabbitMQ's own dead-lettering is otherwise at most once, and a node
+// failure can lose a message on its way back to its queue.
+//
 // Retried messages fall behind newer ones, and come back with the routing key of their queue.
 // Changing Initial or Max declares new retry queues; the old ones still return what they hold,
 // and can be deleted once empty.
@@ -298,9 +308,8 @@ type RetryConfig struct {
 	Initial time.Duration
 	// Max is the longest delay. Default: 10 minutes, or Initial when it is longer.
 	Max time.Duration
-	// Args are the arguments of every retry queue, such as x-queue-type. RabbitMQ does not confirm
-	// its own dead-lettering, so a node failure can lose a message on its way back. Quorum retry
-	// queues with x-dead-letter-strategy: at-least-once and x-overflow: reject-publish prevent that.
+	// Args are the arguments of every retry queue. They replace the defaults they name, such as
+	// x-queue-type: classic, which also drops the at-least-once defaults.
 	Args map[string]any
 }
 
@@ -355,8 +364,16 @@ func (r RetryConfig) queues(queue string) []retryQueue {
 	var queues []retryQueue
 	for delay := r.Initial; ; delay *= 2 {
 		delay = min(delay, r.Max)
-		args := make(amqp.Table, len(r.Args)+3)
+		args := make(amqp.Table, len(r.Args)+6)
+		args[queueTypeArg] = amqp.QueueTypeQuorum
 		maps.Copy(args, r.Args)
+		if args[queueTypeArg] == amqp.QueueTypeQuorum {
+			for arg, value := range map[string]string{deadLetterStrategyArg: "at-least-once", overflowArg: "reject-publish"} {
+				if _, ok := args[arg]; !ok {
+					args[arg] = value
+				}
+			}
+		}
 		args[messageTTLArg] = delay.Milliseconds()
 		args[deadLetterExchangeArg] = ""
 		args[deadLetterRoutingKeyArg] = queue

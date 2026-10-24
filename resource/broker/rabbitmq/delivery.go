@@ -24,14 +24,18 @@ type delivery struct {
 	gen   uint64
 	// retry delays retries through the retry queues of the delivery's queue. Nil requeues at once.
 	retry *retrier
+	// deadLetter copies rejected messages to the dead-letter exchange of the delivery's queue. Nil
+	// rejects them to the broker.
+	deadLetter *deadLetter
 }
 
 // newDelivery wraps raw, an AMQP delivery of a subscriber channel that guard protects against
 // recovery, delivered by the incarnation of the channel whose generation is gen, and whose queue
-// has the retry queues of retry, if any. Header values that are not strings are converted by
-// headerValue. Messages published without the identity headers, for example by another producer,
-// take their ID from the message_id property and their name from the type property.
-func newDelivery(raw amqp.Delivery, guard *ackGuard, gen uint64, retry *retrier) *delivery {
+// has the retry queues of retry and the dead-letter exchange of deadLetter, if any. Header values
+// that are not strings are converted by headerValue. Messages published without the identity
+// headers, for example by another producer, take their ID from the message_id property and their
+// name from the type property.
+func newDelivery(raw amqp.Delivery, guard *ackGuard, gen uint64, retry *retrier, deadLetter *deadLetter) *delivery {
 	headers := types.NewJSONMap[string]()
 	for k, v := range raw.Headers {
 		headers.Set(k, headerValue(v))
@@ -44,11 +48,12 @@ func newDelivery(raw amqp.Delivery, guard *ackGuard, gen uint64, retry *retrier)
 	}
 
 	return &delivery{
-		delivery: raw,
-		msg:      worker.NewMessageFromDelivery(raw.RoutingKey, raw.Exchange, raw.Body, headers),
-		guard:    guard,
-		gen:      gen,
-		retry:    retry,
+		delivery:   raw,
+		msg:        worker.NewMessageFromDelivery(raw.RoutingKey, raw.Exchange, raw.Body, headers),
+		guard:      guard,
+		gen:        gen,
+		retry:      retry,
+		deadLetter: deadLetter,
 	}
 }
 
@@ -76,8 +81,13 @@ func (d *delivery) requeue() error {
 	return d.settle(func() error { return d.delivery.Nack(false, true) })
 }
 
-// Reject discards the message, or dead-letters it when its queue has DeadLetter enabled.
-func (d *delivery) Reject(context.Context) error {
+// Reject dead-letters the message when its queue has DeadLetter enabled, and otherwise rejects it to
+// the broker, which drops it, or dead-letters it itself when a policy or Args point the queue at an
+// exchange.
+func (d *delivery) Reject(ctx context.Context) error {
+	if d.deadLetter != nil {
+		return d.deadLetter.reject(ctx, d)
+	}
 	return d.settle(func() error { return d.delivery.Reject(false) })
 }
 

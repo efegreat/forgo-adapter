@@ -142,7 +142,7 @@ func TestDeliveryAcknowledgements(t *testing.T) {
 			ack := &fakeAcknowledger{}
 			guard := &ackGuard{}
 
-			d := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, guard.generation(), nil)
+			d := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, guard.generation(), nil, nil)
 			if err := tt.settle(d); err != nil {
 				t.Fatal(err)
 			}
@@ -150,7 +150,7 @@ func TestDeliveryAcknowledgements(t *testing.T) {
 				t.Fatalf("acknowledgements = %q, want %q", ack.calls, tt.want)
 			}
 
-			stale := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, guard.generation(), nil)
+			stale := newDelivery(amqp.Delivery{Acknowledger: ack, DeliveryTag: 7}, guard, guard.generation(), nil, nil)
 			guard.invalidate()
 			if err := tt.settle(stale); !errors.Is(err, errStaleDelivery) {
 				t.Fatalf("settle after recovery = %v, want errStaleDelivery", err)
@@ -219,16 +219,35 @@ func TestRecoveryHooks(t *testing.T) {
 		t.Fatal("the topology channel was not recovered")
 	}
 
+	// The subscribers' connection: its loss marks the deliveries stale and leaves the publishers be.
 	next.during = func() { during = gateState(pubGate) }
 	hooks.OnConnectionClose(nil, &amqp.Error{Code: 320})
-	if next.connections != 1 || sub.guard.generation() != 2 || during != "closed" || gateState(pubGate) != "open" {
-		t.Fatalf("connection close: recoveries %d, guard %d, gate %s while reconnecting and %s after", next.connections, sub.guard.generation(), during, gateState(pubGate))
+	if next.connections != 1 || sub.guard.generation() != 2 || during != "open" || pubGate.lostSince(1) != nil {
+		t.Fatalf("subscribers' connection close: recoveries %d, guard %d, gate %s while reconnecting, loss %v", next.connections, sub.guard.generation(), during, pubGate.lostSince(1))
+	}
+
+	// The publishing connection: its loss holds the publishes back, unblocks them, and leaves the
+	// deliveries be.
+	flow := newFlow()
+	flow.block("low on memory")
+	pubHooks := &recoveryHooks{broker: b, next: next, publishers: true, flow: flow}
+	pubHooks.OnConnectionClose(nil, &amqp.Error{Code: 320})
+	if next.connections != 2 || sub.guard.generation() != 2 || during != "closed" || gateState(pubGate) != "open" || pubGate.lostSince(1) == nil {
+		t.Fatalf("publishing connection close: recoveries %d, guard %d, gate %s while reconnecting and %s after", next.connections, sub.guard.generation(), during, gateState(pubGate))
+	}
+	if err := flow.wait(context.Background()); err != nil {
+		t.Fatalf("the flow of a lost connection still blocks: %v", err)
+	}
+	if fake.closed || sub.lost.reported() {
+		t.Fatal("the publishing connection's recovery touched a subscription")
 	}
 
 	// The close of a reconnection attempt that failed once it dialed comes after a later attempt
 	// reconnected, while the connection is open.
-	hooks.OnConnectionClose(new(amqp.Connection), &amqp.Error{Code: amqp.FrameError})
-	if next.connections != 1 || sub.guard.generation() != 2 || pubGate.lostSince(2) != nil {
+	for _, h := range []*recoveryHooks{hooks, pubHooks} {
+		h.OnConnectionClose(new(amqp.Connection), &amqp.Error{Code: amqp.FrameError})
+	}
+	if next.connections != 2 || sub.guard.generation() != 2 || pubGate.lostSince(2) != nil {
 		t.Fatalf("close of an open connection: recoveries %d, guard %d, gate loss %v", next.connections, sub.guard.generation(), pubGate.lostSince(2))
 	}
 
@@ -420,6 +439,78 @@ func TestGate(t *testing.T) {
 }
 
 // A publish in flight holds the gate open: the client cannot reset the channel under it.
+func TestFlow(t *testing.T) {
+	f := newFlow()
+	if err := f.wait(context.Background()); err != nil {
+		t.Fatalf("wait on a new flow = %v", err)
+	}
+
+	f.block("low on memory")
+	f.block("low on disk space")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := f.wait(ctx)
+	if !errors.Is(err, errBlocked) || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "(low on disk space)") {
+		t.Fatalf("wait while blocked = %v, want errBlocked with the reason and the context's error", err)
+	}
+
+	waited := make(chan error, 1)
+	go func() { waited <- f.wait(context.Background()) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("wait returned %v while blocked", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	f.unblock()
+	f.unblock()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("wait once unblocked = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait did not return once unblocked")
+	}
+
+	var none *flow
+	if err := none.wait(ctx); err != nil {
+		t.Fatalf("wait on a nil flow = %v", err)
+	}
+}
+
+func TestCloseWithin(t *testing.T) {
+	refused := errors.New("refused")
+	blocked := make(chan struct{})
+	defer close(blocked)
+	tests := []struct {
+		name  string
+		close func() error
+		want  error
+	}{
+		{name: "closed", close: func() error { return nil }},
+		{name: "closed already", close: func() error { return amqp.ErrClosed }},
+		{name: "socket failed", close: func() error { return &amqp.Error{Code: amqp.FrameError, Reason: "i/o timeout"} }},
+		{name: "refused", close: func() error { return refused }, want: refused},
+		{name: "no answer", close: func() error { <-blocked; return refused }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := closeWithin(20*time.Millisecond, tt.close); !errors.Is(err, tt.want) || (tt.want == nil && err != nil) {
+				t.Fatalf("closeWithin = %v, want %v", err, tt.want)
+			}
+		})
+	}
+
+	start := time.Now()
+	slow := func() error { <-blocked; return nil }
+	if err := closeAll(50*time.Millisecond, slow, slow, func() error { return refused }); !errors.Is(err, refused) {
+		t.Fatalf("closeAll = %v, want the refusal", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("closeAll waited %s for closes that do not return, want them waited for at once", elapsed)
+	}
+}
+
 func TestGateCloseWaitsForSend(t *testing.T) {
 	var g gate
 	sending, release := make(chan struct{}), make(chan struct{})

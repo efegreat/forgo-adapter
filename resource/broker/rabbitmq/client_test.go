@@ -746,6 +746,67 @@ func TestPublisherPublish(t *testing.T) {
 	}
 }
 
+// While the broker blocks the connection, Publish sends nothing and waits, until its context ends or
+// the broker unblocks the connection.
+func TestPublisherWaitsWhileBlocked(t *testing.T) {
+	ch := &recordingPublishChannel{}
+	p := &publisher{conf: PublisherConfig{DeliveryMode: amqp.Persistent}, ch: ch, gate: &gate{}, flow: newFlow()}
+	p.flow.block("low on memory")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := p.Publish(ctx, worker.Message{ID: "id"}); !errors.Is(err, errBlocked) || ch.publishes.Load() != 0 {
+		t.Fatalf("Publish while blocked = %v after %d publishes, want errBlocked without a publish", err, ch.publishes.Load())
+	}
+
+	ch.err = amqp.ErrClosed // settles the publish at once
+	done := make(chan error, 1)
+	go func() { done <- p.Publish(context.Background(), worker.Message{ID: "id"}) }()
+	time.Sleep(20 * time.Millisecond)
+	if ch.publishes.Load() != 0 {
+		t.Fatal("Publish sent while blocked")
+	}
+	p.flow.unblock()
+	select {
+	case err := <-done:
+		if !errors.Is(err, amqp.ErrClosed) || ch.publishes.Load() != 1 {
+			t.Fatalf("Publish once unblocked = %v after %d publishes", err, ch.publishes.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Publish kept waiting once unblocked")
+	}
+}
+
+// A publisher that waits for recovery, as the subscribers' retry and dead-letter copies do, waits
+// while its connection is down, instead of failing at once, and sends once the channel is back.
+func TestPublisherWaitsForRecoveryWhileDown(t *testing.T) {
+	ch := &recordingPublishChannel{err: amqp.ErrClosed}
+	p := &publisher{conf: PublisherConfig{DeliveryMode: amqp.Persistent}, ch: ch, gate: &gate{}, waitsForRecovery: true}
+	p.gate.close(amqp.ErrClosed)
+	ch.closed.Store(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := p.Publish(ctx, worker.Message{ID: "id"})
+	if !errors.Is(err, context.DeadlineExceeded) || ch.publishes.Load() != 0 {
+		t.Fatalf("Publish while the connection is down = %v after %d publishes, want the context's error", err, ch.publishes.Load())
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- p.Publish(context.Background(), worker.Message{ID: "id"}) }()
+	time.Sleep(20 * time.Millisecond)
+	ch.closed.Store(false)
+	p.gate.open()
+	select {
+	case err := <-done:
+		if !errors.Is(err, amqp.ErrClosed) || ch.publishes.Load() != 1 {
+			t.Fatalf("Publish once the connection is back = %v after %d publishes", err, ch.publishes.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Publish kept waiting once the connection was back")
+	}
+}
+
 // Publish fails at once while the channel is closed, sends nothing while the client reopens it, and
 // goes on once it is back.
 func TestPublisherWaitsForRecovery(t *testing.T) {

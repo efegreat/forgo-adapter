@@ -317,7 +317,7 @@ func Broker() rabbitmq.Config {
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `Name` | | The resource name, also shown as the connection name in the RabbitMQ management UI. |
+| `Name` | | The resource name. It also names the two connections in the RabbitMQ management UI: `<Name>` and `<Name>-publish`. |
 | `Addr` | `localhost` | Broker host. |
 | `Port` | `5672`, or `5671` with `TLSConfig` | Broker port. |
 | `TLSConfig` | plaintext | Connects with TLS (`amqps`) when set. The certificate is verified against `Addr` unless it sets a `ServerName`. |
@@ -330,6 +330,8 @@ func Broker() rabbitmq.Config {
 | `Subscribers` | | Named subscribers, see below. |
 
 Without `TLSConfig`, the credentials and every message travel in clear text. Managed brokers usually accept only TLS, on port 5671. Their certificates are publicly trusted, so an empty config is enough: `TLSConfig: &tls.Config{}`. `New` copies the config before the client sees it, so a shared `tls.Config` stays as it is.
+
+**Two connections.** `New` opens one connection for the topology and the subscribers, and one, `<Name>-publish`, for the publishers and for the copies the subscribers publish, of their retries and dead letters. While RabbitMQ is low on memory or disk space, it blocks every connection that publishes, with all its channels. On a connection of their own, the subscribers keep consuming meanwhile, which frees what the broker lacks.
 
 `New` connects, then declares every exchange, then every queue with its bindings. A queue's dead-letter exchange and queue are declared just before the queue itself, and its retry queues just after it. Any failure closes the connection and fails the bootstrap. The channel the topology was declared on stays open, because the client only redeclares the topology recorded on open channels after a reconnect. Declarations are idempotent, but redeclaring an existing exchange or queue with different properties or arguments is refused by RabbitMQ with `PRECONDITION_FAILED`.
 
@@ -354,7 +356,8 @@ Every publisher channel is in confirm mode. `Publish` waits, up to the worker's 
 
 - the broker nacks it (`rabbitmq: broker nacked the message`), for example because a queue with `x-overflow: reject-publish` is full,
 - no confirm arrives in time, or the channel is lost meanwhile,
-- `Mandatory` is set and no queue receives it (`rabbitmq: mandatory message is unroutable`).
+- `Mandatory` is set and no queue receives it (`rabbitmq: mandatory message is unroutable`),
+- RabbitMQ blocks publishing during a memory or disk alarm, and the publish times out waiting for it to end (`rabbitmq: the broker blocks publishing (low on memory)`). The publisher sends nothing while blocked: the client would otherwise block in the socket's write once its buffer is full, past every timeout, for as long as the alarm lasts.
 
 A publisher sends one message at a time and waits for its confirm. Raise the worker publisher's `Concurrency` for throughput: each unit is its own channel.
 
@@ -405,6 +408,11 @@ rabbitmq.QueueConfig{
 
 This declares a durable direct exchange `billing.dlx` and a durable queue `billing.dlq` bound to it with the key `billing`. It then declares `billing` with the arguments `x-dead-letter-exchange: billing.dlx` and `x-dead-letter-routing-key: billing`.
 
+**The subscriber dead-letters what the worker rejects itself.** RabbitMQ's own dead-lettering is at most once: it drops a message whose dead-letter queue was deleted, is full, or is on a node that is down, and nothing reports it, while the inbox already marked the message *failed* or *rejected*. So instead of rejecting the delivery to RabbitMQ, the subscriber publishes a copy to `billing.dlx` with the key `billing`, waits for the broker's confirm, and then acknowledges the delivery, as it does for [retries](#retry-queues).
+
+- **A copy that cannot be stored brings the message back,** to be rejected again from its inbox status until the copy is stored. The copy is mandatory, so a dead-letter queue that was deleted or unbound fails it, and a full one with `x-overflow: reject-publish` nacks it. When the queue has [`Retry`](#retry-queues), the message waits in its last retry queue, and `Reject` returns `rabbitmq: dead-letter <id> to <exchange>: …; parked in <retry queue> until it is rejected again`. Without `Retry`, it is requeued (`…; requeuing it`), and comes back at once, ahead of the queue's other messages: until an operator repairs the dead-letter queue, a few such messages take every handler of the subscriber. Enable `Retry` with `DeadLetter`.
+- **A crash between the confirm and the acknowledgement** stores the dead letter twice.
+
 | `DeadLetterConfig` field | Default | Description |
 | --- | --- | --- |
 | `Enabled` | `false` | Declares the dead-letter exchange and queue and points the queue at them. |
@@ -419,9 +427,9 @@ This declares a durable direct exchange `billing.dlx` and a durable queue `billi
 - a message whose payload cannot be bound (`msg_bind`, inbox *rejected*),
 - a message no handler is registered for (`msg_no_handler`).
 
-RabbitMQ also dead-letters messages that expire through `x-message-ttl` or overflow a queue with `x-overflow: reject-publish-dlx`. Retried messages are not dead-lettered: they are requeued, or wait in a retry queue.
+RabbitMQ itself dead-letters messages that expire through `x-message-ttl`, overflow a queue with `x-overflow: reject-publish-dlx`, or reach the delivery limit of a quorum queue, at most once. Retried messages are not dead-lettered: they are requeued, or wait in a retry queue.
 
-Dead letters keep their body, properties and headers. RabbitMQ adds an `x-death` header recording the source queue, the reason and a count. To replay messages, consume `<queue>.dlq` with another subscriber or use a shovel. Because a replayed message keeps its `x-msg-id`, the worker rejects it again, back to `<queue>.dlq`, while its inbox row is *failed* or *rejected*. To process it again, first set its inbox row back to *waiting* with zero attempts, then replay it. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages).
+Dead letters keep their body, properties and headers, with the message ID set in `message_id` and `x-msg-id`, and they arrive from the dead-letter exchange with its routing key, as RabbitMQ's would. The ones RabbitMQ dead-letters itself carry its `x-death` header, which records the source queue, the reason and a count; the worker's copies carry only the `x-death` of the retry queues they went through. To replay messages, consume `<queue>.dlq` with another subscriber or use a shovel. Because a replayed message keeps its `x-msg-id`, the worker rejects it again, back to `<queue>.dlq`, while its inbox row is *failed* or *rejected*. To process it again, first set its inbox row back to *waiting* with zero attempts, then replay it. See forgo's [Retrying failed messages](https://github.com/efegreat/forgo/blob/main/REFERENCE.md#retrying-failed-messages).
 
 **Validation.** `New` fails before connecting when a queue enables `DeadLetter` without a `Name`, or also sets `x-dead-letter-exchange` or `x-dead-letter-routing-key` in its `Args`. Use one or the other.
 
@@ -439,6 +447,8 @@ rabbitmq.QueueConfig{
 
 The delay doubles with every failed attempt, from `Initial` up to `Max`. Each delay has its own durable queue, declared after `billing`: `billing.retry.1s`, `billing.retry.2s`, `billing.retry.4s` and so on up to `billing.retry.1m0s`. Each one has the arguments `x-message-ttl` (its delay), `x-dead-letter-exchange: ""` and `x-dead-letter-routing-key: billing`. An expired message goes back to `billing` through the default exchange, so no other queue bound to the original exchange receives it again.
 
+Retry queues are quorum queues with `x-dead-letter-strategy: at-least-once` and `x-overflow: reject-publish`, unless `Args` set other values. RabbitMQ's own dead-lettering is otherwise at most once, and a node failure loses the messages on their way back to `billing`: in a live test on a three-node cluster, the queue's leader failing while 3,000 retried messages expired lost 189 of them with classic retry queues, and none with these. A single node runs quorum queues too.
+
 The worker passes the attempt that failed, as counted by its inbox, to `Retry`:
 
 | Attempt | Retry queue |
@@ -448,25 +458,24 @@ The worker passes the attempt that failed, as counted by its inbox, to `Retry`:
 
 To retry, the subscriber publishes a copy of the delivery to the retry queue, waits for the broker's confirm, and then acknowledges the delivery. The waiting message holds no prefetch slot and no handler. The copy keeps the body, properties and headers, with the message ID set in `message_id` and `x-msg-id`. It is persistent, and it drops `expiration` and `user_id`.
 
-- **A failed publish falls back to an immediate requeue,** and `Retry` returns `rabbitmq: delay the retry of <id> through <retry queue>, requeuing it at once`. That happens when the channel was lost or the retry queue no longer exists (the copy is published as mandatory).
+- **A failed publish falls back to an immediate requeue,** and `Retry` returns `rabbitmq: delay the retry of <id> through <retry queue>, requeuing it at once`. That happens when the subscriber's channel was lost, the retry queue no longer exists (the copy is published as mandatory), or the publishing connection stayed down or blocked for the whole `AckTimeout` of the worker's subscriber. The copy waits for it meanwhile, so that the message is not requeued, and handled again, at once and again and again.
 - **A crash between the confirm and the acknowledgement** delivers the message twice: the requeued original at once, and the copy after its delay. The inbox absorbs the duplicate.
 - **Retried messages fall behind newer ones,** and come back with the routing key `billing` from the default exchange.
 - **Changing `Initial` or `Max`** declares new retry queues. The old ones still return what they hold, and can be deleted once empty.
-- **RabbitMQ does not confirm its own dead-lettering,** so a node failure can lose a message on its way back from a retry queue. Quorum retry queues with `x-dead-letter-strategy: at-least-once` and `x-overflow: reject-publish` in `Args` prevent that.
 
 | `RetryConfig` field | Default | Description |
 | --- | --- | --- |
 | `Initial` | disabled | Delay after the first failed attempt, at least 1ms. Zero keeps immediate requeues. |
 | `Max` | `10m`, or `Initial` when longer | The longest delay. It bounds the number of retry queues: `Initial: time.Second` with the default `Max` declares 11. |
-| `Args` | | Arguments of every retry queue, such as `x-queue-type: quorum`. |
+| `Args` | `x-queue-type: quorum`, `x-dead-letter-strategy: at-least-once`, `x-overflow: reject-publish` | Arguments of every retry queue. They replace the defaults they set: `x-queue-type: classic` declares classic retry queues, without the at-least-once defaults, which only quorum queues support. |
 
 **Validation.** `New` fails before connecting when a queue enables `Retry` without a `Name`, with a negative value, an `Initial` under 1ms, a `Max` under `Initial` or over 49 days (the longest `x-message-ttl`), or `Args` that set `x-message-ttl`, `x-dead-letter-exchange` or `x-dead-letter-routing-key`.
 
-**Existing queues.** Queue arguments cannot change after a queue is declared. Enabling `DeadLetter` on a queue that already exists without it fails with `PRECONDITION_FAILED`. Either delete and recreate the queue, or leave `DeadLetter` off and set the dead-letter exchange through a RabbitMQ policy.
+**Existing queues.** Queue arguments cannot change after a queue is declared. Enabling `DeadLetter` on a queue that already exists without it fails with `PRECONDITION_FAILED`. Either delete and recreate the queue, or leave `DeadLetter` off and set the dead-letter exchange through a RabbitMQ policy. Retry queues declared as classic queues by an earlier version fail the same way: delete them once empty, or keep them with `Args: map[string]any{"x-queue-type": "classic"}`.
 
 #### Recovery
 
-The broker uses the automatic recovery of amqp091-go. When the connection or a channel is lost, the client reconnects and reopens every channel with its prefetch and confirm mode. It then redeclares the exchanges, queues, bindings and dead-letter queues, and the broker subscribes every subscriber again, so the worker does not notice beyond a pause.
+The broker uses the automatic recovery of amqp091-go, on each of its two connections. When a connection or a channel is lost, the client reconnects and reopens every channel with its prefetch and confirm mode. It then redeclares the exchanges, queues, bindings and dead-letter queues, and the broker subscribes every subscriber again, so the worker does not notice beyond a pause.
 
 ```go
 rabbitmq.Config{
@@ -477,13 +486,13 @@ rabbitmq.Config{
 | `RecoveryConfig` field | Default | Description |
 | --- | --- | --- |
 | `Disabled` | `false` | Turns recovery off. A lost connection then stops every subscriber and fails every publish until the app restarts. |
-| `MaxRetries` | unlimited | Reconnection attempts before giving up. Once they are exhausted, the connection closes and subscribers stop with `rabbitmq: delivery channel closed by the broker`, or with `rabbitmq: recovery could not re-subscribe the consumer` when an attempt had reconnected. |
+| `MaxRetries` | unlimited | Reconnection attempts of each connection before giving up. Once they are exhausted, the connection closes. On the subscribers' connection, subscribers then stop with `rabbitmq: delivery channel closed by the broker`, or with `rabbitmq: recovery could not re-subscribe the consumer` when an attempt had reconnected. On the publishing connection, every publish fails. |
 | `RetryInterval` | `5s` | Wait before each attempt, plus up to 500ms of jitter. |
 
 During a recovery:
 
-- **Publishes fail fast while the connection is down.** The outbox keeps the messages and retries them on its next cycle. While the client reopens a publisher's channel, the publish waits for it, within its context, so that no message is sent before the channel is back in confirm mode. A message sent in between would never be confirmed, and every later confirm would be counted against the wrong message.
-- **Unacknowledged deliveries are requeued by the broker.** Delivery tags start over on a recovered channel, so a late acknowledgement from a handler that was still running would settle a different message. The broker marks those deliveries stale before the channel is reopened, and their acknowledgements fail instead (`rabbitmq: delivery belongs to a lost channel`). The message is delivered again, and the inbox recognizes it by its `x-msg-id`. If the handler had completed it, the redelivery is acknowledged and skipped.
+- **Publishes fail fast while the publishing connection is down.** The outbox keeps the messages and retries them on its next cycle. The copies of the subscribers' retries and dead letters wait for the connection instead, within the worker's `AckTimeout`, so that their deliveries are not requeued and handled again at once. While the client reopens a publisher's channel, the publish waits for it, within its context, so that no message is sent before the channel is back in confirm mode. A message sent in between would never be confirmed, and every later confirm would be counted against the wrong message.
+- **Unacknowledged deliveries are requeued by the broker.** Delivery tags start over on a recovered channel, so a late acknowledgement from a handler that was still running would settle a different message. The broker marks those deliveries stale before the channel is reopened, and their acknowledgements fail instead (`rabbitmq: delivery belongs to a lost channel`). The message is delivered again, and the inbox recognizes it by its `x-msg-id`. If the handler had completed it, the redelivery is acknowledged and skipped. On a quorum queue, each such return counts toward the queue's delivery limit (`x-delivery-limit`, 20 by default since RabbitMQ 4.0), while the worker's requeues do not. RabbitMQ dead-letters a message that reaches it, or drops it without a dead-letter queue, whatever its inbox status, so set the limit above `MaxAttempt` with room for connection losses.
 - **Deliveries that no handler took are dropped.** With a `Prefetch` above the worker's `Concurrency`, the client holds deliveries that wait for a handler. The broker requeued them with the channel, so the subscriber drops them and consumes them again on the reopened channel, where it subscribes on a new delivery stream.
 - **Unconfirmed publishes fail.** The client settles the pending confirms of a lost channel as nacks when it reopens it, and the publish fails with `rabbitmq: publisher channel lost before the broker confirmed the message`, followed by the reason, such as the `NOT_FOUND` of a publish to an exchange that does not exist. The outbox retries them. A message the broker had already stored is then published twice, and the consumer inbox drops the duplicate.
 
@@ -491,11 +500,13 @@ An exchange, queue or binding that fails to recover is skipped, so the rest of t
 
 **Consumer cancellations.** RabbitMQ cancels a consumer whose queue is deleted, and from 4.3 on, a consumer of a quorum queue whose delivery outlives the consumer timeout (`consumer_timeout`, or the queue's `x-consumer-timeout`). The subscriber then consumes again at once, on the same channel and under a new consumer tag:
 
-- **A message that timed out goes back to the queue,** and is delivered again even while its first handler still runs, so it can be handled twice at the same time. Set the consumer timeout above the longest handler.
+- **A message that timed out goes back to the queue,** and is delivered again even while its first handler still runs, so it can be handled twice at the same time. The inbox commits only one of them, but what a handler does outside its transaction, such as calling another service, happens twice. Set the consumer timeout above the longest handler.
 - **The other messages the cancelled consumer held stay with it,** and their handlers acknowledge them as usual.
 - **A deleted queue cannot be consumed again,** and the subscriber stops with `rabbitmq: recovery could not re-subscribe the consumer`, followed by the broker's `NOT_FOUND`.
 
 Before 4.3, RabbitMQ closes the channel of a consumer that timed out instead, and the recovery reopens it.
+
+**Shutting down during an outage.** `Close` stops a recovery in progress, and waits at most 3 seconds for a broker that does not answer, for each channel and connection, such as one that hangs or that the network cut off. Neither fails the close, so a SIGTERM during an outage stops the app cleanly: RabbitMQ requeues what the connections had not acknowledged once it notices they are gone.
 
 The client logs its recovery through `amqp.Logger`, which discards everything by default. Call `amqp.SetLogger` in `main` to see reconnects.
 
