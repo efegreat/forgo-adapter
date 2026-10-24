@@ -115,8 +115,18 @@ func (l *callLog) String() string {
 	return strings.Join(l.calls, ", ")
 }
 
+// tagsOf returns the consumer tags of the subscriber name, forgo-<name>-1 first, as a broker hands
+// them out to its only subscriber.
+func tagsOf(name string) func() string {
+	var seq uint64
+	return func() string {
+		seq++
+		return consumerTag(name, seq)
+	}
+}
+
 func newTestSubscriber(ch *fakeConsumeChannel) *subscriber {
-	return &subscriber{subscription: newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, "forgo-s-1")}
+	return &subscriber{subscription: newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s"))}
 }
 
 // consume runs s.Consume in the background with the handler, and returns its result.
@@ -159,7 +169,7 @@ func TestPrefetch(t *testing.T) {
 
 func TestSubscriberConsume(t *testing.T) {
 	ch := &fakeConsumeChannel{}
-	s := &subscriber{subscription: newSubscription(SubscriberConfig{Name: "billing", Queue: "billing"}, ch, "forgo-billing-1")}
+	s := &subscriber{subscription: newSubscription(SubscriberConfig{Name: "billing", Queue: "billing"}, ch, tagsOf("billing"))}
 
 	ack := &fakeAcknowledger{}
 	var (
@@ -218,15 +228,101 @@ func TestSubscriberConsumeErrors(t *testing.T) {
 	}
 }
 
-// A stream that ends without a recovery replacing it, because the broker cancelled the consumer or
-// the recovery is disabled or gave up, ends Consume.
+// A stream that ends with its channel, without a recovery replacing it, because the recovery is
+// disabled or gave up, ends Consume.
 func TestSubscriberStreamClosed(t *testing.T) {
 	ch := &fakeConsumeChannel{}
 	_, done := consume(newTestSubscriber(ch), 1, func(context.Context, worker.IDelivery) {})
-	close(ch.stream(t, 0))
+	stream := ch.stream(t, 0)
+	ch.setClosed(true)
+	close(stream)
 
 	if err := waitConsume(t, done); !errors.Is(err, errDeliveriesClosed) {
 		t.Fatalf("Consume = %v, want errDeliveriesClosed", err)
+	}
+	if len(ch.streams) != 1 {
+		t.Fatalf("%d streams, want 1: Consume subscribed again on a closed channel", len(ch.streams))
+	}
+}
+
+// The broker cancels the consumer while its channel stays open, as a quorum queue does once a
+// delivery outlives its consumer timeout. Consume subscribes again, and the delivery that was in
+// flight is still acknowledged on the channel, under its own tag.
+func TestSubscriberConsumesAgainWhenCancelled(t *testing.T) {
+	ch := &fakeConsumeChannel{}
+	s := newTestSubscriber(ch)
+	ack := &fakeAcknowledger{}
+	type handled struct {
+		id  string
+		err error
+	}
+	results := make(chan handled, 10)
+	started, release := make(chan struct{}), make(chan struct{})
+	cancel, done := consume(s, 2, func(ctx context.Context, d worker.IDelivery) {
+		if d.Message().ID == "in-flight" {
+			close(started)
+			<-release
+		}
+		results <- handled{id: d.Message().ID, err: d.Complete(ctx)}
+	})
+
+	ch.stream(t, 0) <- amqp.Delivery{MessageId: "in-flight", Acknowledger: ack, DeliveryTag: 1}
+	<-started
+	close(ch.stream(t, 0))
+	ch.stream(t, 1) <- amqp.Delivery{MessageId: "after", Acknowledger: ack, DeliveryTag: 2}
+	close(release)
+
+	got := map[string]error{}
+	for range 2 {
+		select {
+		case h := <-results:
+			got[h.id] = h.err
+		case <-time.After(5 * time.Second):
+			t.Fatalf("handled %v, want in-flight and after", got)
+		}
+	}
+	for _, id := range []string{"in-flight", "after"} {
+		if err, ok := got[id]; !ok || err != nil {
+			t.Fatalf("%s completed with %v, handled %v", id, err, got)
+		}
+	}
+	ack.mu.Lock()
+	calls := strings.Join(ack.calls, ", ")
+	ack.mu.Unlock()
+	if !strings.Contains(calls, "ack 1 multiple=false") || !strings.Contains(calls, "ack 2 multiple=false") {
+		t.Fatalf("acknowledgements %q, want tags 1 and 2", calls)
+	}
+	// The broker keeps the cancelled consumer's tag in use.
+	if ch.tag != "forgo-s-2" {
+		t.Fatalf("subscribed again under %q, want forgo-s-2", ch.tag)
+	}
+
+	cancel()
+	if err := waitConsume(t, done); err != nil {
+		t.Fatalf("Consume = %v", err)
+	}
+}
+
+// A consumer that the broker cancelled and that cannot subscribe again, such as one whose queue was
+// deleted, is lost.
+func TestSubscriberLostWhenCancelled(t *testing.T) {
+	notFound := &amqp.Error{Code: amqp.NotFound, Reason: "NOT_FOUND - no queue 'q' in vhost '/'"}
+	ch := &fakeConsumeChannel{}
+	s := newTestSubscriber(ch)
+	_, done := consume(s, 1, func(context.Context, worker.IDelivery) {})
+	stream := ch.stream(t, 0)
+	ch.mu.Lock()
+	ch.consumeErr = notFound
+	ch.mu.Unlock()
+	close(stream)
+
+	err := waitConsume(t, done)
+	if !errors.Is(err, errConsumerLost) || !errors.Is(err, notFound) || !strings.Contains(err.Error(), "consumer forgo-s-2 of queue q, replacing forgo-s-1, which the broker cancelled") {
+		t.Fatalf("Consume = %v, want errConsumerLost with NOT_FOUND", err)
+	}
+	// The broker closed the channel: its recovery does not subscribe the lost subscription again.
+	if detached, err := s.detach(); detached || err != nil {
+		t.Fatalf("detach of a lost subscription = %v, %v", detached, err)
 	}
 }
 
@@ -432,7 +528,7 @@ func TestSubscriberStopsWhenConsumerLost(t *testing.T) {
 
 func TestSubscriptionLose(t *testing.T) {
 	ch := &fakeConsumeChannel{}
-	s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, "forgo-s-1")
+	s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s"))
 
 	// The hook of a channel that is open again, because its connection's recovery reopened it,
 	// keeps the new stream.
@@ -455,7 +551,7 @@ func TestSubscriptionLose(t *testing.T) {
 func TestSubscriptionDetach(t *testing.T) {
 	t.Run("not consuming", func(t *testing.T) {
 		ch := &fakeConsumeChannel{}
-		s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, "forgo-s-1")
+		s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s"))
 		if detached, err := s.detach(); detached || err != nil || ch.cancels != 0 {
 			t.Fatalf("detach without a consumer = %v, %v, %d cancels", detached, err, ch.cancels)
 		}
@@ -463,7 +559,7 @@ func TestSubscriptionDetach(t *testing.T) {
 
 	t.Run("cancel failed", func(t *testing.T) {
 		ch := &fakeConsumeChannel{cancelErr: amqp.ErrClosed}
-		s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, "forgo-s-1")
+		s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s"))
 		if _, err := s.start(); err != nil {
 			t.Fatal(err)
 		}
@@ -478,7 +574,7 @@ func TestSubscriptionDetach(t *testing.T) {
 
 	t.Run("twice", func(t *testing.T) {
 		ch := &fakeConsumeChannel{}
-		s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, "forgo-s-1")
+		s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s"))
 		if _, err := s.start(); err != nil {
 			t.Fatal(err)
 		}
@@ -495,7 +591,7 @@ func TestSubscriptionDetach(t *testing.T) {
 
 	t.Run("after Consume returned", func(t *testing.T) {
 		ch := &fakeConsumeChannel{}
-		s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, "forgo-s-1")
+		s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s"))
 		if _, err := s.start(); err != nil {
 			t.Fatal(err)
 		}
