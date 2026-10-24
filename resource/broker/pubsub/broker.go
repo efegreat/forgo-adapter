@@ -96,7 +96,12 @@ func (b *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	if !ok {
 		return nil, fmt.Errorf("pubsub: subscriber config not found for name: %s", name)
 	}
-	s := &subscriber{conf: conf, sub: b.client.Subscriber(conf.Subscription)}
+	s := &subscriber{
+		conf:         conf,
+		sub:          b.client.Subscriber(conf.Subscription),
+		retryInitial: receiveRetryInitial,
+		retryMax:     receiveRetryMax,
+	}
 	if conf.DeadLetterTopic != "" {
 		s.deadLetter = &deadLetter{topics: b.topics, topic: conf.DeadLetterTopic}
 	}
