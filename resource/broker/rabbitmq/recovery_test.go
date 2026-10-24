@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -389,13 +390,13 @@ func TestGate(t *testing.T) {
 	sent := 0
 	send := func() error { sent++; return nil }
 
-	if losses, err := g.send(context.Background(), reopening, send); err != nil || losses != 0 || sent != 1 {
+	if losses, err := g.send(context.Background(), false, reopening, send); err != nil || losses != 0 || sent != 1 {
 		t.Fatalf("send through an open gate = %d, %v, %d sends", losses, err, sent)
 	}
 
 	// While the channel is closed, a publish fails at once, as the client's would.
 	g.close(amqp.ErrClosed)
-	if _, err := g.send(context.Background(), func() bool { return true }, send); !errors.Is(err, amqp.ErrClosed) || sent != 1 {
+	if _, err := g.send(context.Background(), false, func() bool { return true }, send); !errors.Is(err, amqp.ErrClosed) || sent != 1 {
 		t.Fatalf("send while the channel is closed = %v, %d sends", err, sent)
 	}
 	g.open()
@@ -406,13 +407,13 @@ func TestGate(t *testing.T) {
 	g.open()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := g.send(ctx, reopening, send); !errors.Is(err, context.DeadlineExceeded) || sent != 1 {
+	if _, err := g.send(ctx, false, reopening, send); !errors.Is(err, context.DeadlineExceeded) || sent != 1 {
 		t.Fatalf("send through a gate closed twice and opened once = %v, %d sends", err, sent)
 	}
 
 	done := make(chan uint64, 1)
 	go func() {
-		losses, _ := g.send(context.Background(), reopening, send)
+		losses, _ := g.send(context.Background(), false, reopening, send)
 		done <- losses
 	}()
 	g.open()
@@ -433,8 +434,65 @@ func TestGate(t *testing.T) {
 	}
 
 	var nilGate *gate
-	if _, err := nilGate.send(context.Background(), reopening, send); err != nil || sent != 3 || nilGate.lostSince(0) != nil {
+	if _, err := nilGate.send(context.Background(), false, reopening, send); err != nil || sent != 3 || nilGate.lostSince(0) != nil {
 		t.Fatal("a nil gate is not open")
+	}
+}
+
+// The client closes a lost channel before it runs the hooks. A publisher that recovers and finds the
+// channel closed while the gate is still open waits for the hooks to close the gate, or for its
+// context, and sends once the gate opens again. One that does not recover fails at once.
+func TestGateRecovers(t *testing.T) {
+	var g gate
+	var sent atomic.Int32
+	closedFirst := func() error {
+		if sent.Add(1) == 1 {
+			return amqp.ErrClosed
+		}
+		return nil
+	}
+
+	if _, err := g.send(context.Background(), false, reopening, closedFirst); !errors.Is(err, amqp.ErrClosed) || sent.Load() != 1 {
+		t.Fatalf("send of a publisher that does not recover = %v, %d sends", err, sent.Load())
+	}
+
+	sent.Store(0)
+	done := make(chan error, 1)
+	go func() {
+		_, err := g.send(context.Background(), true, reopening, closedFirst)
+		done <- err
+	}()
+	for sent.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	g.close(amqp.ErrClosed)
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("send returned %v before the gate opened", err)
+	default:
+	}
+	g.open()
+	select {
+	case err := <-done:
+		if err != nil || sent.Load() != 2 {
+			t.Fatalf("send once the gate opened = %v, %d sends", err, sent.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("send kept waiting once the gate opened")
+	}
+
+	// The hooks closed the gate before the publisher started waiting.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := g.waitLoss(ctx, 0); err != nil {
+		t.Fatalf("waitLoss after the loss = %v", err)
+	}
+
+	sent.Store(0)
+	if _, err := g.send(ctx, true, reopening, closedFirst); !errors.Is(err, context.DeadlineExceeded) || sent.Load() != 1 {
+		t.Fatalf("send without hooks = %v, %d sends, want the context's error", err, sent.Load())
 	}
 }
 
@@ -515,7 +573,7 @@ func TestGateCloseWaitsForSend(t *testing.T) {
 	var g gate
 	sending, release := make(chan struct{}), make(chan struct{})
 	go func() {
-		_, _ = g.send(context.Background(), reopening, func() error {
+		_, _ = g.send(context.Background(), false, reopening, func() error {
 			close(sending)
 			<-release
 			return nil

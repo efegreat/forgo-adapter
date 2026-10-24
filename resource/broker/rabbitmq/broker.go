@@ -158,7 +158,8 @@ func (r *broker) newCopier(queue string) (*publisher, *retrier, *deadLetter, err
 	// instead of losing it, and the delivery is requeued. The publisher waits while its connection
 	// is down, within the acknowledgement's context: a copy that failed at once would requeue the
 	// delivery at once, and its handler would run again and again until the connection is back.
-	pub, err := r.newPublisher(PublisherConfig{Name: "copies", Mandatory: true, DeliveryMode: amqp.Persistent}, true)
+	// Without recovery, nothing brings the connection back.
+	pub, err := r.newPublisher(PublisherConfig{Name: "copies", Mandatory: true, DeliveryMode: amqp.Persistent}, !r.conf.Recovery.Disabled)
 	if err != nil {
 		return nil, nil, nil, err
 	}
