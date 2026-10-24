@@ -14,8 +14,8 @@ var (
 	// errStaleDelivery is returned when a delivery is settled after the channel that delivered it
 	// was lost. The broker requeued the message when the channel closed and delivers it again.
 	errStaleDelivery = errors.New("rabbitmq: delivery belongs to a lost channel; the broker redelivers it")
-	// errConsumerLost is returned by Consume when the recovery could not re-subscribe the
-	// subscriber's consumer. Its channel is open again but delivers nothing.
+	// errConsumerLost is returned by Consume when the subscriber's consumer could not subscribe
+	// again, after a recovery or after the broker cancelled it. Its channel delivers nothing.
 	errConsumerLost = errors.New("rabbitmq: recovery could not re-subscribe the consumer")
 	// errRecoveryFailed is the loss of a consumer whose connection or channel the client could not
 	// recover once the recovery had canceled the consumer.
@@ -184,7 +184,16 @@ type recoveryHooks struct {
 	reconnecting atomic.Int32
 }
 
+// OnConnectionClose recovers a lost connection. The client also closes the connection of every
+// reconnection attempt that fails once it dialed, such as a handshake that a load balancer cuts
+// short while the broker behind it is down, and hands those closes to the hook once it returns
+// from the recovery that reconnected. The connection is open by then, and the client's recovery
+// would return at once: marking every delivery stale would leave each subscriber dropping its
+// deliveries for good, with no recovery left to subscribe it again.
 func (h *recoveryHooks) OnConnectionClose(conn *amqp.Connection, err *amqp.Error) {
+	if conn != nil && !conn.IsClosed() {
+		return
+	}
 	h.reconnecting.Add(1)
 	gates := h.broker.loseConnection(lossReason(err))
 	h.next.OnConnectionClose(conn, err)

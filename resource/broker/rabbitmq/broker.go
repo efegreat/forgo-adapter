@@ -109,7 +109,7 @@ func (r *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 		return nil, fmt.Errorf("rabbitmq: subscriber %s: queue %s: %w", name, conf.Queue, err)
 	}
 
-	sub := newSubscription(conf, ch, r.consumerTag(name))
+	sub := newSubscription(conf, ch, func() string { return r.consumerTag(name) })
 	r.own(ch, ownedChannel{sub: sub})
 	retry, err := r.newRetrier(conf.Queue)
 	if err != nil {

@@ -18,11 +18,14 @@ import (
 )
 
 // faultyNetwork dials the broker for the recovery tests, and fails like a network: cut closes every
-// connection it made, and while it refuses, dials fail.
+// connection it made, while it refuses, dials fail, and while it hangs up, dials succeed and the
+// other end closes the connection at once.
 type faultyNetwork struct {
 	mu     sync.Mutex
 	conns  []net.Conn
 	refuse bool
+	// hangUps counts the dials still to hang up, and hungUp those hung up so far.
+	hangUps, hungUp int
 }
 
 func (n *faultyNetwork) dial(network, addr string) (net.Conn, error) {
@@ -30,6 +33,13 @@ func (n *faultyNetwork) dial(network, addr string) (net.Conn, error) {
 	defer n.mu.Unlock()
 	if n.refuse {
 		return nil, errors.New("network unreachable")
+	}
+	if n.hangUps > 0 {
+		n.hangUps--
+		n.hungUp++
+		client, server := net.Pipe()
+		_ = server.Close()
+		return client, nil
 	}
 	conn, err := net.DialTimeout(network, addr, 5*time.Second)
 	if err == nil {
@@ -52,6 +62,20 @@ func (n *faultyNetwork) setRefuse(refuse bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.refuse = refuse
+}
+
+// hangUp hangs up the next dials, as a load balancer does while the broker behind it is down.
+func (n *faultyNetwork) hangUp(dials int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.hangUps = dials
+}
+
+// hungUpCount returns the number of dials hung up so far.
+func (n *faultyNetwork) hungUpCount() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.hungUp
 }
 
 // recoveryTest is a broker on the RabbitMQ of integrationEnv, which recovers at once, with a queue
@@ -380,6 +404,195 @@ func TestIntegrationConnectionRecoveryConsumes(t *testing.T) {
 	t.Logf("%d handlers for %d messages, %d acknowledgements dropped as stale, %d lost with the connection", handlers, total, stale, lost)
 	if queued := r.queued(t); queued != 0 {
 		t.Errorf("the queue still holds %d messages", queued)
+	}
+}
+
+// Reconnection attempts fail after they dialed, as through a load balancer while the broker behind
+// it is down. The client hands the close of each one to the recovery hooks once a later attempt
+// reconnected, and the subscriber keeps consuming on the stream it subscribed on.
+func TestIntegrationRecoveryAfterHangUps(t *testing.T) {
+	const hangUps = 3
+	r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true}, SubscriberConfig{})
+	c := r.consume(t, 1, 0)
+	ids := r.publish(t, "before", 1)
+	c.waitAcked(t, len(ids), 10*time.Second)
+
+	gen := c.sub.guard.generation()
+	r.network.hangUp(hangUps)
+	r.network.cut()
+	waitResubscribed(t, r, c, gen)
+	if n := r.network.hungUpCount(); n != hangUps {
+		t.Fatalf("%d dials hung up, want %d", n, hangUps)
+	}
+
+	ids = append(ids, r.publish(t, "after", 20)...)
+	c.waitAcked(t, len(ids), 10*time.Second)
+	c.checkAll(t, ids, 0)
+}
+
+// serverAtLeast reports whether the test's RabbitMQ is at least version major.minor, and returns
+// its version.
+func (r *recoveryTest) serverAtLeast(major, minor int) (string, bool) {
+	version, _ := r.broker.conn.Properties["version"].(string)
+	var gotMajor, gotMinor int
+	if _, err := fmt.Sscanf(version, "%d.%d", &gotMajor, &gotMinor); err != nil {
+		return version, false
+	}
+	return version, gotMajor > major || gotMajor == major && gotMinor >= minor
+}
+
+// From RabbitMQ 4.3 on, a quorum queue cancels a consumer whose delivery outlives the consumer
+// timeout and returns that message to the queue, while the consumer's other deliveries stay with
+// it. The subscriber subscribes again: the message is delivered again while its first handler still
+// runs, a delivery that had not timed out is acknowledged by its handler after the cancellation, and
+// Consume goes on.
+func TestIntegrationConsumerTimeout(t *testing.T) {
+	const timeout = 2 * time.Second
+	r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true, Args: map[string]any{
+		"x-queue-type":       "quorum",
+		"x-consumer-timeout": timeout.Milliseconds(),
+	}}, SubscriberConfig{})
+	if version, ok := r.serverAtLeast(4, 3); !ok {
+		t.Skipf("RabbitMQ %s closes the channel of a consumer that timed out, which the channel's recovery covers", version)
+	}
+
+	s, err := r.broker.NewSubscriber("sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := s.(*subscriber).ch.(*amqp.Channel)
+	cancels := ch.NotifyCancel(make(chan string, 4))
+	closes := ch.NotifyClose(make(chan *amqp.Error, 4))
+
+	type handled struct {
+		id  string
+		err error
+	}
+	results := make(chan handled, 32)
+	var slowRuns atomic.Int32
+	slowStarted, redelivered, cancelled := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Consume(ctx, worker.ConsumerState{Concurrency: 3, Handler: func(ctx context.Context, d worker.IDelivery) {
+			id := d.Message().ID
+			switch {
+			case id == "slow-0" && slowRuns.Add(1) == 1:
+				close(slowStarted)
+				<-redelivered
+			case id == "held-0":
+				<-cancelled
+			}
+			results <- handled{id: id, err: d.Complete(ctx)}
+		}})
+	}()
+	// release lets the handlers waiting for c go on. Only the test closes these channels.
+	release := func(c chan struct{}) {
+		select {
+		case <-c:
+		default:
+			close(c)
+		}
+	}
+	t.Cleanup(func() {
+		release(cancelled)
+		release(redelivered)
+		stop()
+		<-done
+		_ = s.Close()
+	})
+
+	// wait waits for the handlers of want to complete their deliveries, in any order.
+	count := map[string]int{}
+	wait := func(want ...string) {
+		t.Helper()
+		pending := map[string]int{}
+		for _, id := range want {
+			pending[id]++
+		}
+		for range want {
+			select {
+			case h := <-results:
+				if pending[h.id] == 0 || h.err != nil {
+					t.Fatalf("%s completed with %v, want one of %v", h.id, h.err, pending)
+				}
+				pending[h.id]--
+				count[h.id]++
+			case err := <-done:
+				done <- err // for the cleanup
+				t.Fatalf("Consume returned %v while %v were due", err, pending)
+			case <-time.After(3 * timeout):
+				t.Fatalf("%v were not handled", pending)
+			}
+		}
+	}
+
+	r.publish(t, "slow", 1)
+	<-slowStarted
+	// Delivered later than slow-0, it times out later too.
+	time.Sleep(timeout / 2)
+	r.publish(t, "held", 1)
+	heldDue := time.Now().Add(timeout)
+
+	select {
+	case <-cancels:
+	case <-time.After(3 * timeout):
+		t.Fatal("the broker did not cancel the consumer")
+	}
+	release(cancelled)
+	wait("held-0", "slow-0")
+	release(redelivered)
+	wait("slow-0")
+	ids := r.publish(t, "after", 5)
+	wait(ids...)
+
+	// The broker would deliver held-0 again once it timed out, had the acknowledgement after the
+	// cancellation not settled it.
+	time.Sleep(time.Until(heldDue) + timeout/2)
+	select {
+	case h := <-results:
+		t.Fatalf("%s was handled again", h.id)
+	case err := <-closes:
+		t.Fatalf("the broker closed the channel: %v", err)
+	default:
+	}
+	if count["slow-0"] != 2 || count["held-0"] != 1 {
+		t.Fatalf("handled %v, want slow-0 twice and held-0 once", count)
+	}
+	if queued := r.queued(t); queued != 0 {
+		t.Fatalf("the queue still holds %d messages", queued)
+	}
+}
+
+// The broker cancels the consumer of a queue that is deleted. The subscriber cannot consume it again,
+// and Consume fails with the broker's NOT_FOUND instead of waiting for deliveries forever.
+func TestIntegrationQueueDeleted(t *testing.T) {
+	r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true}, SubscriberConfig{})
+	c := r.consume(t, 1, 0)
+	ids := r.publish(t, "before", 1)
+	c.waitAcked(t, len(ids), 10*time.Second)
+
+	conn, err := amqp.Dial(r.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.QueueDelete(r.name, false, false, false); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-c.done:
+		if !errors.Is(err, errConsumerLost) || !containsCode(err, amqp.NotFound) {
+			t.Fatalf("Consume = %v, want errConsumerLost with NOT_FOUND", err)
+		}
+		c.done <- err // for the cleanup
+	case <-time.After(15 * time.Second):
+		t.Fatal("Consume kept waiting on a deleted queue")
 	}
 }
 

@@ -487,7 +487,15 @@ During a recovery:
 - **Deliveries that no handler took are dropped.** With a `Prefetch` above the worker's `Concurrency`, the client holds deliveries that wait for a handler. The broker requeued them with the channel, so the subscriber drops them and consumes them again on the reopened channel, where it subscribes on a new delivery stream.
 - **Unconfirmed publishes fail.** The client settles the pending confirms of a lost channel as nacks when it reopens it, and the publish fails with `rabbitmq: publisher channel lost before the broker confirmed the message`, followed by the reason, such as the `NOT_FOUND` of a publish to an exchange that does not exist. The outbox retries them. A message the broker had already stored is then published twice, and the consumer inbox drops the duplicate.
 
-An exchange, queue or binding that fails to recover is skipped, so the rest of the topology still recovers. An auto-delete queue (`AutoDelete`), which the broker deletes with its last consumer, is declared again with its bindings before its subscriber subscribes again. A subscriber can fail to subscribe again because its queue was deleted, or because a consumer with `Exclusive` on another connection holds the queue. It would then receive nothing, so it stops with `rabbitmq: recovery could not re-subscribe the consumer`, followed by the broker's error. As when the broker cancels a consumer, the worker server fails and the app stops. When it starts again, the subscriber consumes again, or fails at startup if its queue is gone.
+An exchange, queue or binding that fails to recover is skipped, so the rest of the topology still recovers. An auto-delete queue (`AutoDelete`), which the broker deletes with its last consumer, is declared again with its bindings before its subscriber subscribes again. A subscriber can fail to subscribe again because its queue was deleted, or because a consumer with `Exclusive` on another connection holds the queue. It would then receive nothing, so it stops with `rabbitmq: recovery could not re-subscribe the consumer`, followed by the broker's error. The worker server then fails and the app stops. When it starts again, the subscriber consumes again, or fails at startup if its queue is gone.
+
+**Consumer cancellations.** RabbitMQ cancels a consumer whose queue is deleted, and from 4.3 on, a consumer of a quorum queue whose delivery outlives the consumer timeout (`consumer_timeout`, or the queue's `x-consumer-timeout`). The subscriber then consumes again at once, on the same channel and under a new consumer tag:
+
+- **A message that timed out goes back to the queue,** and is delivered again even while its first handler still runs, so it can be handled twice at the same time. Set the consumer timeout above the longest handler.
+- **The other messages the cancelled consumer held stay with it,** and their handlers acknowledge them as usual.
+- **A deleted queue cannot be consumed again,** and the subscriber stops with `rabbitmq: recovery could not re-subscribe the consumer`, followed by the broker's `NOT_FOUND`.
+
+Before 4.3, RabbitMQ closes the channel of a consumer that timed out instead, and the recovery reopens it.
 
 The client logs its recovery through `amqp.Logger`, which discards everything by default. Call `amqp.SetLogger` in `main` to see reconnects.
 

@@ -12,8 +12,8 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// errDeliveriesClosed reports that the delivery channel closed while consuming: the broker
-// cancelled the consumer, or the connection was lost and recovery is disabled or gave up.
+// errDeliveriesClosed reports that the delivery channel closed while consuming, together with its
+// channel, and no recovery replaces it: recovery is disabled or gave up.
 var errDeliveriesClosed = errors.New("rabbitmq: delivery channel closed by the broker")
 
 // consumeChannel is the part of *amqp.Channel a Subscriber uses.
@@ -34,8 +34,8 @@ type subscriber struct {
 
 // Consume sets the prefetch, subscribes to the queue and hands every delivery to state.Handler,
 // with at most state.Concurrency in flight. It returns once ctx ends and every handler finished,
-// or with an error once the consumer is gone: the delivery channel closed, or the recovery could
-// not re-subscribe the consumer.
+// or with an error once the consumer is gone: the delivery channel closed with its channel, or the
+// consumer could not subscribe again after a recovery or after the broker cancelled it.
 func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
 	if err := s.ch.Qos(prefetch(s.conf.Prefetch, state.Concurrency), 0, false); err != nil {
 		return fmt.Errorf("rabbitmq: subscriber %s: set prefetch: %w", s.conf.Name, err)
@@ -124,12 +124,15 @@ func prefetch(configured, concurrency int) int {
 type subscription struct {
 	conf SubscriberConfig
 	ch   consumeChannel
-	// tag is the consumer tag, unique on the connection.
-	tag   string
+	// tags returns a new consumer tag, unique on the connection.
+	tags  func() string
 	guard *ackGuard
 	lost  *consumerLoss
 
 	mu sync.Mutex
+	// tag is the consumer's tag. The broker keeps the tag of a consumer it cancelled in use on the
+	// channel, so consuming again after a cancellation takes a new one.
+	tag string
 	// stream is the current stream, nil until Consume subscribes.
 	stream *stream
 	// consuming is set while Consume runs. The recovery subscribes again only then.
@@ -148,11 +151,12 @@ type stream struct {
 	gen        uint64
 }
 
-func newSubscription(conf SubscriberConfig, ch consumeChannel, tag string) *subscription {
+func newSubscription(conf SubscriberConfig, ch consumeChannel, tags func() string) *subscription {
 	return &subscription{
 		conf:    conf,
 		ch:      ch,
-		tag:     tag,
+		tags:    tags,
+		tag:     tags(),
 		guard:   &ackGuard{},
 		lost:    newConsumerLoss(),
 		changed: make(chan struct{}),
@@ -196,11 +200,17 @@ func (s *subscription) stop() {
 
 // next returns the stream that replaces cur, which ended. Without one, it returns nil and what
 // Consume returns: errDeliveriesClosed when no recovery replaces cur, the consumer's loss, or nil
-// once ctx ends.
+// once ctx ends. A stream that ends while its channel is open, and no recovery replaces it, ended
+// because the broker cancelled the consumer, and next subscribes again.
 func (s *subscription) next(ctx context.Context, cur *stream) (*stream, error) {
 	for {
 		s.mu.Lock()
 		st, replacing, changed := s.stream, s.replacing, s.changed
+		if st == cur && !replacing && !s.lost.reported() && !s.ch.IsClosed() {
+			again, err := s.consumeAgain()
+			s.mu.Unlock()
+			return again, err
+		}
 		s.mu.Unlock()
 
 		if s.lost.reported() {
@@ -220,6 +230,22 @@ func (s *subscription) next(ctx context.Context, cur *stream) (*stream, error) {
 			return nil, nil
 		}
 	}
+}
+
+// consumeAgain subscribes again on a new stream, under a new tag, once the broker cancelled the
+// consumer, which it does when the queue is deleted, and from RabbitMQ 4.3 on when a delivery of a
+// quorum queue outlives its consumer timeout. The caller holds s.mu. The channel stays open, so the
+// new stream keeps the guard generation: delivery tags go on, and the handlers of the cancelled
+// consumer's deliveries still settle them. A subscription that cannot subscribe again, such as one
+// whose queue was deleted, is lost.
+func (s *subscription) consumeAgain() (*stream, error) {
+	cancelled := s.tag
+	s.tag = s.tags()
+	if err := s.subscribe(); err != nil {
+		s.lost.report(fmt.Errorf("consumer %s of queue %s, replacing %s, which the broker cancelled: %w", s.tag, s.conf.Queue, cancelled, err))
+		return nil, s.lost.err
+	}
+	return s.stream, nil
 }
 
 // lose marks the deliveries of the channel stale, before the client reopens it. The hook of a

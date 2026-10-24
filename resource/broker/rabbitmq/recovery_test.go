@@ -175,7 +175,7 @@ func gateState(g *gate) string {
 func TestRecoveryHooks(t *testing.T) {
 	subCh, pubCh, topologyCh, unowned := new(amqp.Channel), new(amqp.Channel), new(amqp.Channel), new(amqp.Channel)
 	fake := &fakeConsumeChannel{}
-	sub := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, fake, "forgo-s-1")
+	sub := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, fake, tagsOf("s"))
 	pubGate := &gate{}
 	next := &recordingRecovery{}
 	b := &broker{owned: map[*amqp.Channel]ownedChannel{
@@ -225,6 +225,13 @@ func TestRecoveryHooks(t *testing.T) {
 		t.Fatalf("connection close: recoveries %d, guard %d, gate %s while reconnecting and %s after", next.connections, sub.guard.generation(), during, gateState(pubGate))
 	}
 
+	// The close of a reconnection attempt that failed once it dialed comes after a later attempt
+	// reconnected, while the connection is open.
+	hooks.OnConnectionClose(new(amqp.Connection), &amqp.Error{Code: amqp.FrameError})
+	if next.connections != 1 || sub.guard.generation() != 2 || pubGate.lostSince(2) != nil {
+		t.Fatalf("close of an open connection: recoveries %d, guard %d, gate loss %v", next.connections, sub.guard.generation(), pubGate.lostSince(2))
+	}
+
 	b.disown(subCh)
 	hooks.OnChannelClose(subCh, &amqp.Error{Code: 406})
 	if len(next.channels) != 4 {
@@ -237,7 +244,7 @@ func TestRecoveryHooks(t *testing.T) {
 func consumingSubscription(t *testing.T, log *callLog) (*subscription, *fakeConsumeChannel) {
 	t.Helper()
 	ch := &fakeConsumeChannel{log: log}
-	s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, "forgo-s-1")
+	s := newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s"))
 	if _, err := s.start(); err != nil {
 		t.Fatal(err)
 	}
