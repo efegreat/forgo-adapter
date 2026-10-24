@@ -27,6 +27,8 @@ type fakeConsumeChannel struct {
 	tag        string
 	cancels    int
 	streams    []chan amqp.Delivery
+	// ended holds the streams that already ended, which Cancel leaves alone, as the client does.
+	ended map[chan amqp.Delivery]bool
 	// log, when set, records the calls, to check their order against other fakes.
 	log *callLog
 }
@@ -60,8 +62,29 @@ func (c *fakeConsumeChannel) Cancel(tag string, _ bool) error {
 	}
 	c.cancels++
 	// A closed channel with a buffer still hands out what it holds, like the client's stream.
-	close(c.streams[len(c.streams)-1])
+	c.end(c.streams[len(c.streams)-1])
 	return nil
+}
+
+// end ends stream s once. The caller holds c.mu.
+func (c *fakeConsumeChannel) end(s chan amqp.Delivery) {
+	if c.ended[s] {
+		return
+	}
+	if c.ended == nil {
+		c.ended = make(map[chan amqp.Delivery]bool)
+	}
+	c.ended[s] = true
+	close(s)
+}
+
+// cancelByBroker ends the i-th stream, as the client does when the broker cancels its consumer.
+func (c *fakeConsumeChannel) cancelByBroker(t *testing.T, i int) {
+	t.Helper()
+	s := c.stream(t, i)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.end(s)
 }
 
 func (c *fakeConsumeChannel) IsClosed() bool {
@@ -233,9 +256,8 @@ func TestSubscriberConsumeErrors(t *testing.T) {
 func TestSubscriberStreamClosed(t *testing.T) {
 	ch := &fakeConsumeChannel{}
 	_, done := consume(newTestSubscriber(ch), 1, func(context.Context, worker.IDelivery) {})
-	stream := ch.stream(t, 0)
 	ch.setClosed(true)
-	close(stream)
+	ch.cancelByBroker(t, 0)
 
 	if err := waitConsume(t, done); !errors.Is(err, errDeliveriesClosed) {
 		t.Fatalf("Consume = %v, want errDeliveriesClosed", err)
@@ -249,7 +271,7 @@ func TestSubscriberStreamClosed(t *testing.T) {
 // delivery outlives its consumer timeout. Consume subscribes again, and the delivery that was in
 // flight is still acknowledged on the channel, under its own tag.
 func TestSubscriberConsumesAgainWhenCancelled(t *testing.T) {
-	ch := &fakeConsumeChannel{}
+	ch := &fakeConsumeChannel{log: &callLog{}}
 	s := newTestSubscriber(ch)
 	ack := &fakeAcknowledger{}
 	type handled struct {
@@ -268,7 +290,7 @@ func TestSubscriberConsumesAgainWhenCancelled(t *testing.T) {
 
 	ch.stream(t, 0) <- amqp.Delivery{MessageId: "in-flight", Acknowledger: ack, DeliveryTag: 1}
 	<-started
-	close(ch.stream(t, 0))
+	ch.cancelByBroker(t, 0)
 	ch.stream(t, 1) <- amqp.Delivery{MessageId: "after", Acknowledger: ack, DeliveryTag: 2}
 	close(release)
 
@@ -292,9 +314,13 @@ func TestSubscriberConsumesAgainWhenCancelled(t *testing.T) {
 	if !strings.Contains(calls, "ack 1 multiple=false") || !strings.Contains(calls, "ack 2 multiple=false") {
 		t.Fatalf("acknowledgements %q, want tags 1 and 2", calls)
 	}
-	// The broker keeps the cancelled consumer's tag in use.
+	// The broker keeps the cancelled consumer's tag in use. A quorum queue keeps the consumer too,
+	// so the subscriber cancels it first.
 	if ch.tag != "forgo-s-2" {
 		t.Fatalf("subscribed again under %q, want forgo-s-2", ch.tag)
+	}
+	if got, want := ch.log.String(), "consume forgo-s-1, cancel forgo-s-1, consume forgo-s-2"; got != want {
+		t.Fatalf("calls %q, want %q", got, want)
 	}
 
 	cancel()
@@ -310,11 +336,11 @@ func TestSubscriberLostWhenCancelled(t *testing.T) {
 	ch := &fakeConsumeChannel{}
 	s := newTestSubscriber(ch)
 	_, done := consume(s, 1, func(context.Context, worker.IDelivery) {})
-	stream := ch.stream(t, 0)
+	ch.stream(t, 0)
 	ch.mu.Lock()
 	ch.consumeErr = notFound
 	ch.mu.Unlock()
-	close(stream)
+	ch.cancelByBroker(t, 0)
 
 	err := waitConsume(t, done)
 	if !errors.Is(err, errConsumerLost) || !errors.Is(err, notFound) || !strings.Contains(err.Error(), "consumer forgo-s-2 of queue q, replacing forgo-s-1, which the broker cancelled") {
@@ -323,6 +349,24 @@ func TestSubscriberLostWhenCancelled(t *testing.T) {
 	// The broker closed the channel: its recovery does not subscribe the lost subscription again.
 	if detached, err := s.detach(); detached || err != nil {
 		t.Fatalf("detach of a lost subscription = %v, %v", detached, err)
+	}
+}
+
+// A consumer that the broker cancelled and that the subscriber cannot cancel itself, because its
+// channel failed meanwhile, is lost.
+func TestSubscriberLostWhenCancelFails(t *testing.T) {
+	cancelErr := &amqp.Error{Code: amqp.ChannelError, Reason: "channel closed"}
+	ch := &fakeConsumeChannel{cancelErr: cancelErr}
+	s := newTestSubscriber(ch)
+	_, done := consume(s, 1, func(context.Context, worker.IDelivery) {})
+	ch.cancelByBroker(t, 0)
+
+	err := waitConsume(t, done)
+	if !errors.Is(err, errConsumerLost) || !errors.Is(err, cancelErr) || !strings.Contains(err.Error(), "consumer forgo-s-1 of queue q, which the broker cancelled: cancel it") {
+		t.Fatalf("Consume = %v, want errConsumerLost with the cancellation's error", err)
+	}
+	if len(ch.streams) != 1 {
+		t.Fatalf("%d streams, want 1: Consume subscribed again", len(ch.streams))
 	}
 }
 
