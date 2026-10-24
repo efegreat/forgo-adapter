@@ -46,8 +46,10 @@ func (d *delivery) Retry(ctx context.Context, attempt int) error {
 }
 
 // Reject adds a copy of the entry to the dead-letter stream and acknowledges the entry, or only
-// acknowledges it without a dead-letter stream. If the copy cannot be added, the entry is
-// delivered again at once instead of being acknowledged.
+// acknowledges it without a dead-letter stream. If the copy cannot be added, the entry is not
+// acknowledged: it is delivered again after the longest retry delay, to be rejected again. At once,
+// every claim would hand such entries to the handlers again until the dead-letter stream can be
+// written, which keeps Redis and the inbox busy, and many of them would hold back the new entries.
 func (d *delivery) Reject(ctx context.Context) error {
 	d.sub.inflight.remove(d)
 	dl := d.sub.conf.DeadLetter
@@ -55,8 +57,9 @@ func (d *delivery) Reject(ctx context.Context) error {
 		return d.ack(ctx)
 	}
 	if err := d.sub.streams.add(ctx, dl.Stream, deadLetterFields(d)); err != nil {
-		err = fmt.Errorf("redisstream: dead-letter %s to %s, delivering it again: %w", d.msg.ID, dl.Stream, err)
-		return errors.Join(err, d.park(ctx, 0))
+		wait := d.sub.conf.longestDelay()
+		err = fmt.Errorf("redisstream: dead-letter %s to %s, delivering it again in %s: %w", d.msg.ID, dl.Stream, wait, err)
+		return errors.Join(err, d.park(ctx, wait))
 	}
 	return d.ack(ctx)
 }

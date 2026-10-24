@@ -77,7 +77,10 @@ func (b *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 		return nil, fmt.Errorf("redisstream: subscriber config not found for name: %s", name)
 	}
 	s := newSubscriber(b.client, b.streams, conf, consumerName())
-	if err := b.client.XGroupCreateConsumer(context.Background(), conf.Stream, conf.Group, s.consumer).Err(); err != nil {
+	ctx := context.Background()
+	// Out of memory, Redis refuses to create the consumer, which the subscriber's first read creates.
+	err := b.client.XGroupCreateConsumer(ctx, conf.Stream, conf.Group, s.consumer).Err()
+	if err != nil && !(outOfMemory(err) && hasGroup(ctx, b.client, conf.Stream, conf.Group)) {
 		return nil, fmt.Errorf("redisstream: subscriber %s: create consumer in group %s of stream %s: %w", name, conf.Group, conf.Stream, err)
 	}
 	return s, nil
@@ -94,17 +97,41 @@ func (b *broker) Close() error {
 }
 
 // declare creates every group of streams that does not exist, and its stream when needed. An
-// existing group is kept as it is.
+// existing group is kept as it is. Out of memory, Redis refuses to create a group even when it
+// exists, so declare then only checks that it does.
 func declare(ctx context.Context, client redis.UniversalClient, streams []StreamConfig) error {
 	for _, s := range streams {
 		for _, g := range s.Groups {
 			err := client.XGroupCreateMkStream(ctx, s.Name, g.Name, g.StartID).Err()
-			if err != nil && !redis.HasErrorPrefix(err, "BUSYGROUP") {
-				return fmt.Errorf("redisstream: create group %s of stream %s: %w", g.Name, s.Name, err)
+			if err == nil || redis.HasErrorPrefix(err, "BUSYGROUP") || outOfMemory(err) && hasGroup(ctx, client, s.Name, g.Name) {
+				continue
 			}
+			return fmt.Errorf("redisstream: create group %s of stream %s: %w", g.Name, s.Name, err)
 		}
 	}
 	return nil
+}
+
+// outOfMemory reports the reply of Redis to a command it refuses while it is out of memory with the
+// noeviction policy: the commands that may add data, such as XADD, XGROUP CREATE and XGROUP
+// CREATECONSUMER, even when they would add nothing. Reads, claims and acknowledgements still work.
+func outOfMemory(err error) bool {
+	return redis.HasErrorPrefix(err, "OOM ")
+}
+
+// hasGroup reports whether stream has the consumer group, through XINFO GROUPS, which Redis answers
+// while it is out of memory.
+func hasGroup(ctx context.Context, client redis.UniversalClient, stream, group string) bool {
+	groups, err := client.XInfoGroups(ctx, stream).Result()
+	if err != nil {
+		return false
+	}
+	for _, g := range groups {
+		if g.Name == group {
+			return true
+		}
+	}
+	return false
 }
 
 // consumerName returns a consumer name unique to a subscriber of this process: the host name, which

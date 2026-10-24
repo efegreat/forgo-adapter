@@ -3,6 +3,7 @@ package redisstream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -619,28 +620,126 @@ func TestReject(t *testing.T) {
 		}
 	})
 
-	t.Run("dead letter fails", func(t *testing.T) {
-		m, cl, cfg := fake(t)
-		b := open(t, topology(cfg, SubscriberConfig{DeadLetter: DeadLetterConfig{Enabled: true}}))
-		msg := worker.NewMessage("order.placed", "", "orders", nil)
-		publish(t, b, msg)
-		if err := m.Set("orders:billing:dlq", "x"); err != nil {
-			t.Fatal(err)
-		}
+	// A copy that cannot be added leaves the entry pending, parked for the longest retry delay.
+	for _, tc := range []struct {
+		name  string
+		retry RetryConfig
+		wait  time.Duration
+	}{
+		{"dead letter fails", RetryConfig{}, time.Minute},
+		{"dead letter fails with retries", RetryConfig{Initial: time.Second, Max: 10 * time.Second}, 10 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, cl, cfg := fake(t)
+			m.SetTime(t0)
+			b := open(t, topology(cfg, SubscriberConfig{Retry: tc.retry, DeadLetter: DeadLetterConfig{Enabled: true}}))
+			msg := worker.NewMessage("order.placed", "", "orders", nil)
+			publish(t, b, msg)
+			if err := m.Set("orders:billing:dlq", "x"); err != nil {
+				t.Fatal(err)
+			}
 
-		ch, handle := deliveries()
-		consume(t, openSubscriber(t, b, "billing"), 1, handle)
-		err := next(t, ch).Reject(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "redisstream: dead-letter "+msg.ID+" to orders:billing:dlq, delivering it again") {
-			t.Fatalf("Reject() = %v", err)
+			ch, handle := deliveries()
+			consume(t, openSubscriber(t, b, "billing"), 1, handle)
+			err := next(t, ch).Reject(context.Background())
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("redisstream: dead-letter %s to orders:billing:dlq, delivering it again in %s: WRONGTYPE", msg.ID, tc.wait)) {
+				t.Fatalf("Reject() = %v", err)
+			}
+			if p := pending(t, cl); len(p) != 1 || p[0].Consumer != retryConsumer || p[0].Idle != time.Minute-tc.wait {
+				t.Fatalf("pending = %+v, want one entry of %s idle for %s", p, retryConsumer, time.Minute-tc.wait)
+			}
+			none(t, ch)
+			m.SetTime(t0.Add(tc.wait - time.Second))
+			none(t, ch)
+			m.SetTime(t0.Add(tc.wait))
+			if d := next(t, ch); d.Message().ID != msg.ID {
+				t.Fatalf("redelivered %s, want %s", d.Message().ID, msg.ID)
+			}
+		})
+	}
+}
+
+// replyError is an error reply of Redis, as go-redis returns them.
+type replyError string
+
+func (e replyError) Error() string { return string(e) }
+
+func (replyError) RedisError() {}
+
+// refuse fails the commands that match with its reply, without sending them.
+type refuse struct {
+	reply replyError
+	match func(args []any) bool
+}
+
+func (r refuse) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (r refuse) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if r.match(cmd.Args()) {
+			cmd.SetErr(r.reply)
+			return r.reply
 		}
-		if d := next(t, ch); d.Message().ID != msg.ID {
-			t.Fatalf("redelivered %s, want %s", d.Message().ID, msg.ID)
+		return next(ctx, cmd)
+	}
+}
+
+func (r refuse) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// outOfMemoryReplies refuses XGROUP CREATE and CREATECONSUMER as Redis does while it is out of memory with the
+// noeviction policy, even for a group or consumer that exists. miniredis has no maxmemory.
+var outOfMemoryReplies = refuse{
+	reply: "OOM command not allowed when used memory > 'maxmemory'.",
+	match: func(args []any) bool {
+		sub := fmt.Sprint(args[1:2]...)
+		return strings.EqualFold(fmt.Sprint(args[0]), "xgroup") && (strings.EqualFold(sub, "create") || strings.EqualFold(sub, "createconsumer"))
+	},
+}
+
+// Out of memory, New and NewSubscriber only check that the groups exist, so an instance can start
+// and consume while Redis refuses new entries. Its first read creates its consumer.
+func TestOutOfMemory(t *testing.T) {
+	_, cl, cfg := fake(t)
+	cfg = topology(cfg, SubscriberConfig{})
+	cfg.Subscribers = append(cfg.Subscribers, SubscriberConfig{Name: "shipping", Stream: "orders"})
+	b := open(t, cfg)
+	ctx := context.Background()
+	cl.AddHook(outOfMemoryReplies)
+	b.client.AddHook(outOfMemoryReplies)
+
+	if err := declare(ctx, cl, cfg.Streams); err != nil {
+		t.Fatalf("declare of an existing group = %v", err)
+	}
+	for _, s := range []StreamConfig{
+		{Name: "orders", Groups: []GroupConfig{{Name: "audit"}}},
+		{Name: "payments", Groups: []GroupConfig{{Name: "ledger"}}},
+	} {
+		want := fmt.Sprintf("redisstream: create group %s of stream %s: OOM", s.Groups[0].Name, s.Name)
+		if err := declare(ctx, cl, []StreamConfig{s}); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("declare of a missing group = %v, want %s", err, want)
 		}
-		if n := len(pending(t, cl)); n != 1 {
-			t.Fatalf("%d pending entries, want 1", n)
-		}
-	})
+	}
+
+	// shipping has no group.
+	if _, err := b.NewSubscriber("shipping"); err == nil || !strings.Contains(err.Error(), "redisstream: subscriber shipping: create consumer in group shipping of stream orders: OOM") {
+		t.Fatalf("NewSubscriber(shipping) = %v", err)
+	}
+	s := openSubscriber(t, b, "billing")
+	if got := consumers(t, cl); len(got) != 0 {
+		t.Fatalf("consumers = %v, want none before the first read", got)
+	}
+	msg := worker.NewMessage("order.placed", "", "orders", nil)
+	publish(t, b, msg)
+	ch, handle := deliveries()
+	consume(t, s, 1, handle)
+	if d := next(t, ch); d.Message().ID != msg.ID {
+		t.Fatalf("delivered %s, want %s", d.Message().ID, msg.ID)
+	}
+	if got := consumers(t, cl); !reflect.DeepEqual(got, map[string]int64{s.consumer: 1}) {
+		t.Fatalf("consumers = %v, want %s with the entry", got, s.consumer)
+	}
 }
 
 func TestConsumeConcurrency(t *testing.T) {
