@@ -71,7 +71,10 @@ jobs:
           RABBITMQ_DEFAULT_USER: forgo
           RABBITMQ_DEFAULT_PASS: forgo
         ports: ["5672:5672"]
+        # The health check runs as the container's user. As root, a check before the broker started
+        # creates the Erlang cookie the broker then cannot read, and the broker fails to boot.
         options: >-
+          --user rabbitmq
           --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
           --health-interval 5s
           --health-timeout 10s
