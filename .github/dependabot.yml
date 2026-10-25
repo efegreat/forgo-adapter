@@ -1,20 +1,12 @@
 version: 2
 updates:
+  # Every module has a go.mod of its own.
   - package-ecosystem: gomod
-    directory: /
+    directories: ["/", "/otel", "/pubsub", "/rabbitmq", "/redis"]
     schedule:
       interval: weekly
     groups:
       go-modules:
-        update-types: [minor, patch]
-
-  # The nested OpenTelemetry module has a go.mod of its own.
-  - package-ecosystem: gomod
-    directory: /otel
-    schedule:
-      interval: weekly
-    groups:
-      otel-modules:
         update-types: [minor, patch]
 
   - package-ecosystem: github-actions

@@ -1,0 +1,61 @@
+// Package liveconfigcache implements forgo.LiveConfigCache on Redis: the cache that every instance of an
+// application shares in front of its forgo.LiveConfigStore, such as the SQL stores of the root module's
+// liveconfig package.
+//
+// See the [liveconfigcache] section of REFERENCE.md.
+//
+// [liveconfigcache]: https://github.com/efegreat/forgo-adapter/blob/main/REFERENCE.md#liveconfigcache
+package liveconfigcache
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// KeyPrefix is prepended to the name of every live configuration cached in Redis.
+const KeyPrefix = "liveconfig:"
+
+// setScript caches a document unless the entry holds the same or a newer version, atomically. The entry is
+// a hash of version and data, without expiry. ARGV[1] is the version and ARGV[2] the document. Versions are
+// compared as Lua numbers, exact up to 2^53.
+var setScript = redis.NewScript(`
+local current = tonumber(redis.call('HGET', KEYS[1], 'version'))
+if current and current >= tonumber(ARGV[1]) then
+	return 0
+end
+redis.call('HSET', KEYS[1], 'version', ARGV[1], 'data', ARGV[2])
+return 1
+`)
+
+// Redis is a forgo.LiveConfigCache on Redis, shared by every instance of the application.
+type Redis struct {
+	cl redis.UniversalClient
+}
+
+// NewRedis returns a live config cache using cl, for forgo.WithProviders.
+func NewRedis(cl redis.UniversalClient) *Redis {
+	return &Redis{cl: cl}
+}
+
+// Get reads the document cached under KeyPrefix+name.
+func (r *Redis) Get(ctx context.Context, name string) ([]byte, bool, error) {
+	data, err := r.cl.HGet(ctx, KeyPrefix+name, "data").Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("liveconfigcache: get %q: %w", name, err)
+	}
+	return data, true, nil
+}
+
+// Set caches the document of name in one script, unless the entry holds the same or a newer version.
+func (r *Redis) Set(ctx context.Context, name string, data []byte, version uint64) error {
+	if err := setScript.Run(ctx, r.cl, []string{KeyPrefix + name}, version, data).Err(); err != nil {
+		return fmt.Errorf("liveconfigcache: set %q: %w", name, err)
+	}
+	return nil
+}

@@ -44,21 +44,24 @@ if err := app.Run(); err != nil { // logged; main picks the exit code
 
 ## What's in the box
 
-| Package | Kind | Provides | Backed by |
-| --- | --- | --- | --- |
-| `resource/sqldb` | resource | `*sql.DB` | any `database/sql` driver, with an optional query log that flags slow statements and masks arguments |
-| `resource/redisdb` | resource | `redis.UniversalClient` | go-redis v9: a server, Redis Cluster or Sentinel |
-| `resource/broker/rabbitmq` | resource | `worker.IBroker` | amqp091-go, with automatic recovery, publisher confirms, prefetch and optional dead-letter queues |
-| `resource/broker/pubsub` | resource | `worker.IBroker` | Google Cloud Pub/Sub client v2, with batched publishing, flow control, retry policies and optional dead-letter topics |
-| `resource/broker/redisstream` | resource | `worker.IBroker` | Redis Streams on go-redis v9, with consumer groups, claiming of abandoned entries, delayed retries and optional dead-letter streams |
-| `provider/sqltx` | provider | `operation.Transactor` | `database/sql`, transactions carried in the context |
-| `provider/inbox` | provider | `worker.InboxStorage` | PostgreSQL, MySQL 8 |
-| `provider/outbox` | provider | `worker.OutboxStorage` | PostgreSQL, MySQL 8 |
-| `provider/locker` | provider | `operation.ILocker` | Redis |
-| `provider/ratelimit` | provider | `ratelimit.ILimiter` | Redis, GCRA |
-| `provider/liveconfig` | provider | `forgo.LiveConfigStore`, `forgo.LiveConfigCache` | PostgreSQL, MySQL 8; Redis |
-| `otel/meter` | resource | `metric.MeterProvider` | OpenTelemetry's SDK, exporting over OTLP or to Prometheus, with Go runtime metrics. In the module `github.com/efegreat/forgo-adapter/otel`. |
-| `otel/observer` | provider | `operation.IObserver` | OpenTelemetry: the duration of every operation, labelled alike on every server, HTTP semantic conventions, message settlements, outbox batches and backlog, locks and connections |
+Each client library is a module of its own, so an app downloads and resolves only the infrastructure it uses. The root module holds the SQL adapters, which need nothing but `database/sql`.
+
+| Module | Package | Kind | Provides | Backed by |
+| --- | --- | --- | --- | --- |
+| `github.com/efegreat/forgo-adapter` | `sql/sqldb` | resource | `*sql.DB` | any `database/sql` driver, with an optional query log that flags slow statements and masks arguments |
+| | `sql/sqltx` | provider | `operation.Transactor` | `database/sql`, transactions carried in the context |
+| | `sql/inbox` | provider | `worker.InboxStorage` | PostgreSQL, MySQL 8 |
+| | `sql/outbox` | provider | `worker.OutboxStorage` | PostgreSQL, MySQL 8 |
+| | `sql/liveconfig` | provider | `forgo.LiveConfigStore` | PostgreSQL, MySQL 8 |
+| `github.com/efegreat/forgo-adapter/redis` | `redis/redisdb` | resource | `redis.UniversalClient` | go-redis v9: a server, Redis Cluster or Sentinel |
+| | `redis/redisstream` | resource | `worker.IBroker` | Redis Streams on go-redis v9, with consumer groups, claiming of abandoned entries, delayed retries and optional dead-letter streams |
+| | `redis/locker` | provider | `operation.ILocker` | Redis |
+| | `redis/ratelimit` | provider | `ratelimit.ILimiter` | Redis, GCRA |
+| | `redis/liveconfigcache` | provider | `forgo.LiveConfigCache` | Redis |
+| `github.com/efegreat/forgo-adapter/rabbitmq` | `rabbitmq` | resource | `worker.IBroker` | amqp091-go, with automatic recovery, publisher confirms, prefetch and optional dead-letter queues |
+| `github.com/efegreat/forgo-adapter/pubsub` | `pubsub` | resource | `worker.IBroker` | Google Cloud Pub/Sub client v2, with batched publishing, flow control, retry policies and optional dead-letter topics |
+| `github.com/efegreat/forgo-adapter/otel` | `otel/meter` | resource | `metric.MeterProvider` | OpenTelemetry's SDK, exporting over OTLP or to Prometheus, with Go runtime metrics |
+| | `otel/observer` | provider | `operation.IObserver` | OpenTelemetry: the duration of every operation, labelled alike on every server, HTTP semantic conventions, message settlements, outbox batches and backlog, locks and connections |
 
 - **Configure, don't wire.** Every resource is a plain config value whose zero fields mean "use the default". Every provider is a constructor that the bootstrap calls with the resources it needs.
 - **Fail at startup.** Resources connect and verify the connection in `New`. RabbitMQ declares its whole topology there too, Pub/Sub creates and checks the topics and subscriptions you list, and Redis Streams creates its consumer groups, so a bad DSN, a conflicting queue or a changed subscription stops the app before it serves anything.
@@ -70,17 +73,17 @@ if err := app.Run(); err != nil { // logged; main picks the exit code
 
 forgo-adapter requires Go 1.27 or newer.
 
+Get the modules you use, at the same version:
+
 ```sh
-go get github.com/efegreat/forgo-adapter
+go get github.com/efegreat/forgo-adapter           # SQL
+go get github.com/efegreat/forgo-adapter/redis     # Redis, Redis Streams
+go get github.com/efegreat/forgo-adapter/rabbitmq  # RabbitMQ
+go get github.com/efegreat/forgo-adapter/pubsub    # Google Cloud Pub/Sub
+go get github.com/efegreat/forgo-adapter/otel      # OpenTelemetry metrics
 ```
 
 Import the SQL driver you use in `main`, for example `_ "github.com/lib/pq"`.
-
-The metrics are in a module of their own, so that the other adapters never pull in OpenTelemetry:
-
-```sh
-go get github.com/efegreat/forgo-adapter/otel
-```
 
 ## Documentation
 
