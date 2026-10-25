@@ -94,6 +94,7 @@ Do not break these without an explicit decision from the maintainer.
 - `New` creates only the topics and subscriptions listed in the config, and never updates one. An existing subscription must equal the config in every setting `differences` compares; a dead-letter subscription only in its topic (`topicDifference`). Created subscriptions never expire.
 - `NewSubscriber` does not check that the subscription exists: `roles/pubsub.subscriber` cannot read subscriptions. `Receive` fails at once on a missing one.
 - `NewClient` receives `context.Background()`, never a context with a deadline: the client keeps it for its credentials.
+- Live tests against the emulator (`gcloud beta emulators pubsub`) cover what pstest cannot, but run outages there without a retry policy: with one, the emulator never redelivers a message nacked while a stream broke, which the official client alone reproduces, and it applies the policy's backoff only roughly. Ordering, filters and exactly-once delivery work on it.
 
 ### Redis Streams
 
