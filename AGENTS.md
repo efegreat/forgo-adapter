@@ -206,6 +206,16 @@ Versions follow semantic versioning. `go get` picks the latest tag, and pkg.go.d
 - [ ] Identity headers written on publish and read back through `worker.NewMessageFromDelivery`.
 - [ ] `Complete`/`Retry`/`Reject` semantics as in forgo's broker contracts, and `Consume` that joins its handlers.
 - [ ] A dead-letter option if the broker supports one.
+- [ ] `Consume` returns only errors that do not pass on their own, because the worker stops on any error it returns. List what the broker answers during a failover, an overload, a quota, a memory limit and a restart, and receive again after a pause through those (`redisstream`'s `transient`, `pubsub`'s `retryable`).
+- [ ] An acknowledgement handle that belongs to a connection or a channel never reaches its successor: a delivery buffered from a lost channel must not settle a message of the reopened one (`rabbitmq`'s `ackGuard` and the generation of each `stream`).
+- [ ] A dead-letter copy that fails never acknowledges its message, which waits the longest retry delay before it comes back (`rabbitmq`'s `deadLetter.park`, `redisstream`'s `longestDelay`): a destination that keeps refusing copies would otherwise loop and take every handler. The subscriber's copies wait for a recovery in progress, while the outbox's publishers fail fast, so the relay moves on.
+- [ ] Every wait on the broker in `Consume` and `Close` is bounded (`rabbitmq`'s `closeWithin`, `pubsub`'s `flushWait` and `stopWait`), so that SIGTERM during an outage stops within Kubernetes' 30 seconds, forgo's relay included.
+- [ ] A consumer that the broker ends, for a deleted queue, a consumer timeout, a lost lease or a rebalance, is subscribed again, or `Consume` returns an error: never a subscriber that receives nothing (`rabbitmq`'s `consumeAgain`).
+- [ ] `New` starts against a broker that refuses writes when the topology already exists (`redisstream`'s `hasGroup` under OOM), so a restarted replica does not fail its bootstrap.
+- [ ] Publishers do not share a connection with subscribers on a broker that throttles a publishing connection (`rabbitmq`'s `publishConn`).
+- [ ] A subscriber's work per poll does not grow with its backlog of pending or retried messages (`redisstream`'s `claim`).
+- [ ] REFERENCE.md says that a dead letter can be stored more than once, what `Message.Key` means on the broker, and how long a handler may run before the broker delivers its message again.
+- [ ] Tests for each item above, on the broker wherever they can run there. Before the broker ships, live tests on a copy of forgo-scaffold: faults that take the whole server (lost and refused connections, a hung broker, a restart, SIGTERM and SIGKILL of a replica), then a long run under them. The live tests of the three brokers found every item above in at least one of them. Prove a suspected broker or emulator bug with the official client alone before changing the adapter for it.
 
 ## Known gaps
 
