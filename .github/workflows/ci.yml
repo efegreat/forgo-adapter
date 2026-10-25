@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    # v* releases the root module, otel/v* the nested OpenTelemetry module.
-    tags: ["v*", "otel/v*"]
+    # v* releases the root module, <dir>/v* the module in that directory, such as redis/v*.
+    tags: ["v*", "*/v*"]
   pull_request:
   # Weekly, so that a vulnerability found since the last push fails the build.
   schedule:
@@ -19,12 +19,32 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Every module has a go.mod of its own and is checked on its own, with only the services its
+  # integration tests run against. Without their URLs the integration tests skip, and a service whose
+  # image is empty is not started.
   test:
+    name: test (${{ matrix.module }})
     runs-on: ubuntu-latest
-    # The integration tests run against these services. Without their URLs they skip.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The root module: the SQL adapters.
+          - module: .
+            postgres: postgres:18
+            mysql: mysql:8.4
+          # The newest Redis, and the oldest the Redis Streams broker supports.
+          - module: redis
+            redis: redis:8
+            redis-min: redis:6.2
+          - module: rabbitmq
+            rabbitmq: rabbitmq:4
+          # pstest serves Pub/Sub in process.
+          - module: pubsub
+          - module: otel
     services:
       postgres:
-        image: postgres:18
+        image: ${{ matrix.postgres || '' }}
         env:
           POSTGRES_PASSWORD: forgo
         ports: ["5432:5432"]
@@ -34,7 +54,7 @@ jobs:
           --health-timeout 5s
           --health-retries 30
       mysql:
-        image: mysql:8.4
+        image: ${{ matrix.mysql || '' }}
         env:
           MYSQL_ROOT_PASSWORD: forgo
           MYSQL_DATABASE: forgo
@@ -45,20 +65,22 @@ jobs:
           --health-timeout 5s
           --health-retries 60
       rabbitmq:
-        image: rabbitmq:4
+        image: ${{ matrix.rabbitmq || '' }}
         env:
           # guest may only connect from localhost, and the tests reach the container through a port.
           RABBITMQ_DEFAULT_USER: forgo
           RABBITMQ_DEFAULT_PASS: forgo
         ports: ["5672:5672"]
+        # The health check runs as the container's user. As root, a check before the broker started
+        # creates the Erlang cookie the broker then cannot read, and the broker fails to boot.
         options: >-
+          --user rabbitmq
           --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
           --health-interval 5s
           --health-timeout 10s
           --health-retries 30
-      # The newest Redis, and the oldest the Redis Streams broker supports.
       redis:
-        image: redis:8
+        image: ${{ matrix.redis || '' }}
         ports: ["6379:6379"]
         options: >-
           --health-cmd "redis-cli ping"
@@ -66,13 +88,14 @@ jobs:
           --health-timeout 5s
           --health-retries 30
       redis-min:
-        image: redis:6.2
+        image: ${{ matrix.redis-min || '' }}
         ports: ["6380:6379"]
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
+    # Each module's tests read only the variables of its own services.
     env:
       ADAPTER_TEST_POSTGRES_DSN: postgres://postgres:forgo@127.0.0.1:5432/postgres?sslmode=disable
       ADAPTER_TEST_MYSQL_DSN: root:forgo@tcp(127.0.0.1:3306)/forgo
@@ -80,18 +103,18 @@ jobs:
       ADAPTER_TEST_REDIS_ADDRS: 127.0.0.1:6379,127.0.0.1:6380
     defaults:
       run:
-        working-directory: forgo-adapter
+        working-directory: forgo-adapter/${{ matrix.module }}
     steps:
       - uses: actions/checkout@v7
         with:
           path: forgo-adapter
           persist-credentials: false
 
-      # Until forgo is released, go.mod replaces it with a checkout next to this one.
+      # Until forgo is released, every go.mod replaces it with a checkout next to forgo-adapter.
       - name: Check for a local forgo
         id: forgo
         run: |
-          if grep -q '=> ../forgo$' go.mod; then
+          if grep -qE '=> (\.\./)+forgo$' go.mod; then
             echo "local=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -107,8 +130,8 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: forgo-adapter/go.mod
-          cache-dependency-path: forgo-adapter/go.sum
+          go-version-file: forgo-adapter/${{ matrix.module }}/go.mod
+          cache-dependency-path: forgo-adapter/${{ matrix.module }}/go.sum
           check-latest: true
 
       - name: Verify formatting
@@ -129,8 +152,8 @@ jobs:
       - name: Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
-      # Reports only the vulnerabilities that the adapters' code can reach, in the Go release
-      # setup-go installed and in the required modules.
+      # Reports only the vulnerabilities that the module's code can reach, in the Go release setup-go
+      # installed and in the required modules.
       - name: Govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
@@ -140,71 +163,10 @@ jobs:
       - name: Test with race detector
         run: go test -race ./...
 
-  # The nested OpenTelemetry module, which has a go.mod of its own and needs none of the services.
-  otel:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: forgo-adapter/otel
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: forgo-adapter
-          persist-credentials: false
-
-      # Until forgo is released, go.mod replaces it with a checkout next to forgo-adapter.
-      - name: Check for a local forgo
-        id: forgo
-        run: |
-          if grep -q '=> ../../forgo$' go.mod; then
-            echo "local=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check out forgo
-        if: steps.forgo.outputs.local == 'true'
-        uses: actions/checkout@v7
-        with:
-          repository: efegreat/forgo
-          path: forgo
-          token: ${{ secrets.FORGO_TOKEN || github.token }}
-          persist-credentials: false
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: forgo-adapter/otel/go.mod
-          cache-dependency-path: forgo-adapter/otel/go.sum
-          check-latest: true
-
-      - name: Verify formatting
-        run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "These files are not gofmt'd:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: Verify go.mod is tidy
-        run: go mod tidy -diff
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
-
-      - name: Govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
-
-      - name: Test
-        run: go test ./...
-
-      - name: Test with race detector
-        run: go test -race ./...
-
-  # Pushing a v* tag releases it once every check passes on the tagged commit.
+  # Pushing a tag releases its module once every check passes on the tagged commit: v* the root module,
+  # and <dir>/v* the module in that directory, as version v* of github.com/efegreat/forgo-adapter/<dir>.
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [test]
     runs-on: ubuntu-latest
     permissions:
@@ -216,12 +178,31 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Find the module of the tag
+        id: module
+        run: |
+          case "$TAG" in
+            v*) dir=. path=github.com/efegreat/forgo-adapter version="$TAG" ;;
+            */v*) dir="${TAG%/v*}" path="github.com/efegreat/forgo-adapter/${TAG%/v*}" version="${TAG##*/}" ;;
+          esac
+          if [ ! -f "$dir/go.mod" ]; then
+            echo "No module in the directory of $TAG."
+            exit 1
+          fi
+          {
+            echo "dir=$dir"
+            echo "path=$path"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
       # Modules that depend on this one ignore its replace directives, so a release that replaces
       # forgo would not build for them.
       - name: Check that go.mod requires a released forgo
+        env:
+          DIR: ${{ steps.module.outputs.dir }}
         run: |
-          if grep -q '=> ../forgo$' go.mod; then
-            echo "go.mod replaces forgo with ../forgo. Require a released forgo version before tagging."
+          if grep -qE '=> (\.\./)+forgo$' "$DIR/go.mod"; then
+            echo "$DIR/go.mod replaces forgo with a checkout. Require a released forgo version before tagging."
             exit 1
           fi
 
@@ -237,38 +218,7 @@ jobs:
       # only when someone asks for it. It fetches public modules only.
       - name: Publish the version to the Go module proxy
         if: ${{ !github.event.repository.private }}
-        run: curl -fsS "https://proxy.golang.org/github.com/efegreat/forgo-adapter/@v/$TAG.info"
-
-  # Pushing an otel/v* tag releases the nested OpenTelemetry module, as version v* of
-  # github.com/efegreat/forgo-adapter/otel.
-  release-otel:
-    if: startsWith(github.ref, 'refs/tags/otel/v')
-    needs: [otel]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      TAG: ${{ github.ref_name }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Check that go.mod requires a released forgo
-        run: |
-          if grep -q '=> ../../forgo$' otel/go.mod; then
-            echo "otel/go.mod replaces forgo with ../../forgo. Require a released forgo version before tagging."
-            exit 1
-          fi
-
-      - name: Create the GitHub release
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          prerelease=
-          case "$TAG" in *-*) prerelease=--prerelease ;; esac
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $prerelease
-
-      - name: Publish the version to the Go module proxy
-        if: ${{ !github.event.repository.private }}
-        run: curl -fsS "https://proxy.golang.org/github.com/efegreat/forgo-adapter/otel/@v/${TAG#otel/}.info"
+          MODULE: ${{ steps.module.outputs.path }}
+          VERSION: ${{ steps.module.outputs.version }}
+        run: curl -fsS "https://proxy.golang.org/$MODULE/@v/$VERSION.info"
