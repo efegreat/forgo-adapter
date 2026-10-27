@@ -181,6 +181,11 @@ type recoveryTest struct {
 	pub worker.IPublisher
 }
 
+// recoveryTests numbers the recovery tests, so that their names differ: the clock of some systems,
+// such as macOS, gives the parallel ones the same time, and two tests on one queue take each
+// other's messages.
+var recoveryTests atomic.Uint64
+
 // newRecoveryTest opens a broker for cfg, which it completes with the address of the RabbitMQ, the
 // exchange and the queue of the test and a recovery that retries at once. queue configures the
 // queue and sub the subscriber named "sub". It skips without integrationEnv.
@@ -195,7 +200,7 @@ func newRecoveryTest(t *testing.T, cfg Config, queue QueueConfig, sub Subscriber
 		t.Fatal(err)
 	}
 
-	name := "forgo-recovery-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	name := fmt.Sprintf("forgo-recovery-%s-%d", strconv.FormatInt(time.Now().UnixNano(), 36), recoveryTests.Add(1))
 	cfg.Name = name
 	cfg.Addr, cfg.Port = uri.Host, strconv.Itoa(uri.Port)
 	cfg.Username, cfg.Password, cfg.VHost = uri.Username, uri.Password, uri.Vhost
