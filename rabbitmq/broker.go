@@ -112,13 +112,14 @@ func (r *broker) newPublisher(conf PublisherConfig, waitsForRecovery bool, retur
 	return p, nil
 }
 
-// NewSubscriber opens the subscriber's channel and checks that its queue exists. Consumption
-// starts in Consume, once the worker's concurrency sets the default prefetch.
-func (r *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
+// NewSubscriber opens the subscriber's channel, checks that its queue exists and opens the copier
+// of its copies, with room for opts.Concurrency of them. Consumption starts in Consume.
+func (r *broker) NewSubscriber(name string, opts worker.SubscriberOptions) (worker.ISubscriber, error) {
 	conf, ok := r.subscribers[name]
 	if !ok {
 		return nil, fmt.Errorf("rabbitmq: subscriber config not found for name: %s", name)
 	}
+	concurrency := max(opts.Concurrency, 1)
 	ch, err := r.conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq: open subscriber channel: %w", err)
@@ -132,13 +133,14 @@ func (r *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 
 	sub := newSubscription(conf, ch, func() string { return r.consumerTag(name) })
 	r.own(ch, ownedChannel{sub: sub})
-	copier, retry, deadLetter, err := r.newCopies(conf.Queue)
+	copier, retry, deadLetter, err := r.newCopies(conf.Queue, concurrency)
 	if err != nil {
 		r.disown(ch)
 		return nil, errors.Join(fmt.Errorf("rabbitmq: subscriber %s: %w", name, err), ch.Close())
 	}
 	return &subscriber{
 		subscription: sub,
+		concurrency:  concurrency,
 		copier:       copier,
 		retry:        retry,
 		deadLetter:   deadLetter,
@@ -147,10 +149,10 @@ func (r *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 }
 
 // newCopies returns the copier of the copies that the deliveries of the configured queue named
-// queue need, for its retry queues and its dead-letter exchange, with the retrier and the dead
-// letter that publish through it. The retrier is nil without Retry, the dead letter without
-// DeadLetter, and all three without either.
-func (r *broker) newCopies(queue string) (*copier, *retrier, *deadLetter, error) {
+// queue need, for its retry queues and its dead-letter exchange, with room for the copies of
+// concurrency handlers at once, and the retrier and the dead letter that publish through it. The
+// retrier is nil without Retry, the dead letter without DeadLetter, and all three without either.
+func (r *broker) newCopies(queue string, concurrency int) (*copier, *retrier, *deadLetter, error) {
 	q, ok := queueConfig(r.conf, queue)
 	if !ok || !q.Retry.enabled() && !q.DeadLetter.Enabled {
 		return nil, nil, nil, nil
@@ -160,7 +162,7 @@ func (r *broker) newCopies(queue string) (*copier, *retrier, *deadLetter, error)
 	// is down, within the acknowledgement's context: a copy that failed at once would requeue the
 	// delivery at once, and its handler would run again and again until the connection is back.
 	// Without recovery, nothing brings the connection back.
-	pub, err := r.newPublisher(PublisherConfig{Name: "copies", Mandatory: true, DeliveryMode: amqp.Persistent}, !r.conf.Recovery.Disabled, maxCopiesInFlight)
+	pub, err := r.newPublisher(PublisherConfig{Name: "copies", Mandatory: true, DeliveryMode: amqp.Persistent}, !r.conf.Recovery.Disabled, concurrency)
 	if err != nil {
 		return nil, nil, nil, err
 	}

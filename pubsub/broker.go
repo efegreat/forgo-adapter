@@ -88,10 +88,10 @@ func (b *broker) NewPublisher(string) (worker.IPublisher, error) {
 	return &publisher{topics: b.topics}, nil
 }
 
-// NewSubscriber returns the subscriber name. It does not check that its subscription exists,
-// because the subscriber role cannot read subscriptions: receiving from a missing one fails
-// instead.
-func (b *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
+// NewSubscriber returns the subscriber name, which handles opts.Concurrency messages at once. It does
+// not check that its subscription exists, because the subscriber role cannot read subscriptions:
+// receiving from a missing one fails instead.
+func (b *broker) NewSubscriber(name string, opts worker.SubscriberOptions) (worker.ISubscriber, error) {
 	conf, ok := b.subscribers[name]
 	if !ok {
 		return nil, fmt.Errorf("pubsub: subscriber config not found for name: %s", name)
@@ -99,6 +99,7 @@ func (b *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	s := &subscriber{
 		conf:         conf,
 		sub:          b.client.Subscriber(conf.Subscription),
+		concurrency:  max(opts.Concurrency, 1),
 		retryInitial: receiveRetryInitial,
 		retryMax:     receiveRetryMax,
 		flushWait:    ackFlushWait,

@@ -67,12 +67,12 @@ func TestIntegrationBroker(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pub.Close()
-	sub, err := b.NewSubscriber("billing")
+	sub, err := b.NewSubscriber("billing", worker.SubscriberOptions{Concurrency: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sub.Close()
-	if _, err := b.NewSubscriber("unknown"); err == nil {
+	if _, err := b.NewSubscriber("unknown", worker.SubscriberOptions{Concurrency: 1}); err == nil {
 		t.Fatal("NewSubscriber of an unknown name succeeded")
 	}
 
@@ -80,10 +80,7 @@ func TestIntegrationBroker(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	consumed := make(chan error, 1)
 	go func() {
-		consumed <- sub.Consume(ctx, worker.ConsumerState{
-			Concurrency: 2,
-			Handler:     func(_ context.Context, d worker.IDelivery) { deliveries <- d },
-		})
+		consumed <- sub.Consume(ctx, func(_ context.Context, d worker.IDelivery) { deliveries <- d })
 	}()
 	// next waits for the delivery of want. A retried message comes back with the routing key of its
 	// queue, so the key is not compared.

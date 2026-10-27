@@ -29,18 +29,20 @@ type consumeChannel interface {
 // and publishes the copies that retries and rejections need through copier, on another connection.
 type subscriber struct {
 	*subscription
-	copier     *copier
-	retry      *retrier
-	deadLetter *deadLetter
-	release    func()
+	// concurrency is the number of deliveries handled at once, at most.
+	concurrency int
+	copier      *copier
+	retry       *retrier
+	deadLetter  *deadLetter
+	release     func()
 }
 
-// Consume sets the prefetch, subscribes to the queue and hands every delivery to state.Handler,
-// with at most state.Concurrency in flight. It returns once ctx ends and every handler finished,
+// Consume sets the prefetch, subscribes to the queue and hands every delivery to handle, with at
+// most the subscriber's concurrency in flight. It returns once ctx ends and every handler finished,
 // or with an error once the consumer is gone: the delivery channel closed with its channel, or the
 // consumer could not subscribe again after a recovery or after the broker cancelled it.
-func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
-	if err := s.ch.Qos(prefetch(s.conf.Prefetch, state.Concurrency), 0, false); err != nil {
+func (s *subscriber) Consume(ctx context.Context, handle func(context.Context, worker.IDelivery)) error {
+	if err := s.ch.Qos(prefetch(s.conf.Prefetch, s.concurrency), 0, false); err != nil {
 		return fmt.Errorf("rabbitmq: subscriber %s: set prefetch: %w", s.conf.Name, err)
 	}
 	st, err := s.start()
@@ -49,7 +51,7 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 	}
 	defer s.stop()
 
-	runner := process.NewConcurrentRunner(process.NewChannelSemaphore(state.Concurrency))
+	runner := process.NewConcurrentRunner(process.NewChannelSemaphore(s.concurrency))
 	defer runner.Wait()
 
 	for {
@@ -75,7 +77,7 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 			}
 			d := newDelivery(msg, s.guard, st.gen, s.retry, s.deadLetter)
 			// Run waits while every slot is taken, and fails only once ctx ended.
-			if runner.Run(ctx, func() { state.Handler(ctx, d) }) != nil {
+			if runner.Run(ctx, func() { handle(ctx, d) }) != nil {
 				// The message was not handled or acknowledged: the broker redelivers it once the
 				// channel closes.
 				return nil

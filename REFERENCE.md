@@ -420,7 +420,7 @@ Without `TLSConfig`, the credentials and every message travel in clear text. Man
 The names match forgo's worker configs:
 
 - `worker.ProducerConfig.Publishers[i].Name` → `IBroker.NewPublisher(name)` → the `PublisherConfig` with that `Name`. The producer's default publisher uses `NewDefaultPublisher`, which publishes persistent messages and needs no config.
-- `worker.SubscriberConfig.Name` → `IBroker.NewSubscriber(name)` → the `SubscriberConfig` with that `Name`, which consumes `Queue`.
+- `worker.SubscriberConfig.Name` → `IBroker.NewSubscriber(name, opts)` → the `SubscriberConfig` with that `Name`, which consumes `Queue`. `opts.Concurrency`, the worker subscriber's `Concurrency`, sets its default `Prefetch` and how many of its [copies](#retry-queues) it waits for at once.
 
 An unknown name, or a subscriber whose `Queue` does not exist, fails the server at startup.
 
@@ -536,7 +536,7 @@ The worker passes the attempt that failed, as counted by its inbox, to `Retry`:
 
 To retry, the subscriber publishes a copy of the delivery to the retry queue, waits for the broker's confirm, and then acknowledges the delivery. The waiting message holds no prefetch slot and no handler. The copy keeps the body, properties and headers, with the message ID set in `message_id` and `x-msg-id`. It is persistent, and it drops `expiration` and `user_id`.
 
-- **Copies do not wait for one another.** A subscriber publishes the copies of its retries and [dead letters](#dead-letter-queues) on one channel, and waits for the confirms of up to 64 of them at once, so a burst of failures costs a confirm per handler rather than a confirm per message in turn. With 5 ms of latency to the broker, 32 handlers that all retried copied about 2,500 messages a second, and 64 handlers about 5,000. A copy beyond the 64 waits for one of them, within the `AckTimeout` of the worker's subscriber.
+- **Copies do not wait for one another.** A subscriber publishes the copies of its retries and [dead letters](#dead-letter-queues) on one channel, and waits for the confirms of as many of them at once as it has handlers, the worker subscriber's `Concurrency`, so a burst of failures costs a confirm per handler rather than a confirm per message in turn. With 5 ms of latency to the broker, 32 handlers that all retried copied about 2,500 messages a second, 64 handlers about 5,000 and 256 handlers about 18,000. A copy whose acknowledgement timed out keeps its place until the broker confirms it, and a copy that finds no place waits for one, within the `AckTimeout` of the worker's subscriber.
 - **A failed publish falls back to an immediate requeue,** and `Retry` returns `rabbitmq: delay the retry of <id> through <retry queue>, requeuing it at once`. That happens when the subscriber's channel was lost, the retry queue no longer exists (the copy is published as mandatory), or the publishing connection stayed down or blocked for the whole `AckTimeout` of the worker's subscriber. The copy waits for it meanwhile, so that the message is not requeued, and handled again, at once and again and again.
 - **A crash between the confirm and the acknowledgement** delivers the message twice: the requeued original at once, and the copy after its delay. The inbox absorbs the duplicate.
 - **Retried messages fall behind newer ones,** and come back with the routing key `billing` from the default exchange.

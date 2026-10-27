@@ -8,18 +8,14 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// maxCopiesInFlight bounds the copies a subscriber's copier waits for the confirms of at once, and
-// is the room of its return listener.
-const maxCopiesInFlight = 64
-
 // returnKey tells the copies of a copier apart, as the broker's returns tell them.
 type returnKey struct {
 	id, exchange, key string
 }
 
 // copier publishes the copies of a subscriber's deliveries, for its retry queues and its
-// dead-letter exchange, on one publisher channel, and waits for the confirms of up to
-// maxCopiesInFlight copies at once.
+// dead-letter exchange, on one publisher channel, and waits for the confirms of as many copies at
+// once as the subscriber handles deliveries.
 //
 // A publisher holds one message in flight, from publish to confirm, so that a return can be matched
 // to it. The handlers of a subscriber whose messages fail copy at once, and would wait in line for
@@ -32,14 +28,15 @@ type returnKey struct {
 // it. A copy takes, once confirmed, every return the client handed to the listener so far, keeps
 // those of the other copies for them, and claims its own by message ID, exchange and routing key:
 // copies alike in all three go the same way. The client holds the connection back while the
-// listener is full, and a broker can return every copy in flight before it confirms any, so a copy
-// keeps its room until it took the returns, also when it stopped waiting for its confirm. At most
-// maxCopiesInFlight returns are then ever held.
+// listener is full, and a broker can return every copy in flight before it confirms any, so the
+// copier lets as many copies in flight as the listener has room for, and a copy keeps its room
+// until it took the returns, also when it stopped waiting for its confirm. A handler copies one
+// delivery at a time, so a copy waits for room only behind copies whose handlers stopped waiting.
 type copier struct {
 	p *publisher
-	// returns is p's return listener, with room for maxCopiesInFlight returns.
+	// returns is p's return listener.
 	returns <-chan amqp.Return
-	// room holds a token for each copy in flight.
+	// room holds a token for each copy in flight, and has the listener's room.
 	room chan struct{}
 	// sending serializes the sends.
 	sending sync.Mutex
@@ -50,13 +47,13 @@ type copier struct {
 	returned map[returnKey][]string
 }
 
-// newCopier returns the copier of p, a mandatory publisher whose return listener has room for
-// maxCopiesInFlight returns.
+// newCopier returns the copier of p, a mandatory publisher, which lets as many copies in flight as
+// p's return listener has room for.
 func newCopier(p *publisher) *copier {
 	return &copier{
 		p:        p,
 		returns:  p.returns,
-		room:     make(chan struct{}, maxCopiesInFlight),
+		room:     make(chan struct{}, cap(p.returns)),
 		returned: make(map[returnKey][]string),
 	}
 }

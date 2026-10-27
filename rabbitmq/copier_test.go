@@ -37,7 +37,11 @@ func (c *pendingConfirmation) WaitContext(ctx context.Context) (bool, error) {
 	}
 }
 
-// testCopier returns a copier on a publisher of ch, whose returns come from returns.
+// testRoom is the room of the copiers and their return listeners in tests.
+const testRoom = 64
+
+// testCopier returns a copier on a publisher of ch, whose returns come from returns, and which lets
+// as many copies in flight as returns has room for.
 func testCopier(ch publishChannel, returns chan amqp.Return) *copier {
 	return newCopier(&publisher{ch: ch, returns: returns, gate: &gate{}})
 }
@@ -46,6 +50,16 @@ func testCopier(ch publishChannel, returns chan amqp.Return) *copier {
 func awaitCopy(c *copier, conf confirmation, k returnKey) error {
 	c.room <- struct{}{}
 	return c.await(context.Background(), conf, k, 0)
+}
+
+// A copier lets as many copies in flight as its return listener has room for, so that the listener
+// never fills up.
+func TestCopierRoom(t *testing.T) {
+	for _, n := range []int{1, 7, testRoom} {
+		if c := testCopier(nil, make(chan amqp.Return, n)); cap(c.room) != n {
+			t.Errorf("a copier whose listener has room for %d returns lets %d copies in flight", n, cap(c.room))
+		}
+	}
 }
 
 func TestCopierAwait(t *testing.T) {
@@ -86,7 +100,7 @@ func TestCopierAwait(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			returns := make(chan amqp.Return, maxCopiesInFlight)
+			returns := make(chan amqp.Return, testRoom)
 			for _, r := range tt.returns {
 				returns <- r
 			}
@@ -122,7 +136,7 @@ func TestCopierAwait(t *testing.T) {
 // A copy takes the returns of the other copies with its own, and leaves them for them. Copies alike
 // in message ID, exchange and routing key share theirs.
 func TestCopierLeavesReturnsForTheirCopies(t *testing.T) {
-	returns := make(chan amqp.Return, maxCopiesInFlight)
+	returns := make(chan amqp.Return, testRoom)
 	c := testCopier(nil, returns)
 	a := returnKey{id: "a", key: "q.retry.1s"}
 	b := returnKey{id: "b", key: "q.retry.1s"}
@@ -153,7 +167,7 @@ func TestCopierLeavesReturnsForTheirCopies(t *testing.T) {
 // A copy that stops waiting for its confirm keeps its room until the confirm comes, and then takes
 // its return, so that it holds no room in the listener and no later copy alike takes it.
 func TestCopierStoppedWaiting(t *testing.T) {
-	returns := make(chan amqp.Return, maxCopiesInFlight)
+	returns := make(chan amqp.Return, testRoom)
 	c := testCopier(nil, returns)
 	k := returnKey{id: "id", key: "q.retry.1s"}
 	conf := newPendingConfirmation()
@@ -185,12 +199,12 @@ func TestCopierStoppedWaiting(t *testing.T) {
 // could have its return handed to a listener that still holds the earlier copy's, and the client
 // holds the connection back while the listener is full.
 func TestCopierFreesRoomAfterTakingReturns(t *testing.T) {
-	c := testCopier(nil, make(chan amqp.Return, maxCopiesInFlight))
+	c := testCopier(nil, make(chan amqp.Return, testRoom))
 	first := newPendingConfirmation()
 	c.room <- struct{}{}
 	done := make(chan error, 1)
 	go func() { done <- c.await(context.Background(), first, returnKey{id: "first"}, 0) }()
-	for range maxCopiesInFlight - 1 {
+	for range testRoom - 1 {
 		c.room <- struct{}{}
 	}
 
@@ -220,8 +234,8 @@ func TestCopierFreesRoomAfterTakingReturns(t *testing.T) {
 func TestCopierPublishFailures(t *testing.T) {
 	t.Run("no room", func(t *testing.T) {
 		ch := &recordingPublishChannel{}
-		c := testCopier(ch, nil)
-		for range maxCopiesInFlight {
+		c := testCopier(ch, make(chan amqp.Return, testRoom))
+		for range testRoom {
 			c.room <- struct{}{}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -243,7 +257,7 @@ func TestCopierPublishFailures(t *testing.T) {
 		{name: "blocked", ch: &recordingPublishChannel{}, blocked: true, wantErr: errBlocked},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			c := testCopier(tt.ch, nil)
+			c := testCopier(tt.ch, make(chan amqp.Return, testRoom))
 			if tt.blocked {
 				c.p.flow = newFlow()
 				c.p.flow.block("low on memory")
@@ -267,8 +281,8 @@ func TestCopierPublishFailures(t *testing.T) {
 // batches before it confirms them. The listener never holds more returns than the copier has room
 // for, so it never fills up.
 func TestCopierConcurrentCopies(t *testing.T) {
-	const copies = 4 * maxCopiesInFlight
-	returns := make(chan amqp.Return, maxCopiesInFlight)
+	const copies = 4 * testRoom
+	returns := make(chan amqp.Return, testRoom)
 	c := testCopier(nil, returns)
 
 	type sent struct {

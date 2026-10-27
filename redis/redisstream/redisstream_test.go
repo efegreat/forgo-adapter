@@ -60,7 +60,7 @@ func topology(cfg Config, sub SubscriberConfig) Config {
 // openSubscriber returns the subscriber name of b, timed for tests.
 func openSubscriber(t *testing.T, b *broker, name string) *subscriber {
 	t.Helper()
-	s, err := b.NewSubscriber(name)
+	s, err := b.NewSubscriber(name, worker.SubscriberOptions{Concurrency: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,16 +72,17 @@ func openSubscriber(t *testing.T, b *broker, name string) *subscriber {
 // errConsumeHangs is returned by the stop function of consume when Consume does not return.
 var errConsumeHangs = errors.New("Consume did not return")
 
-// consume consumes s in the background. stop ends it and returns the error of Consume. done is
-// closed when Consume returns, also on its own.
+// consume consumes s in the background, with at most concurrency entries in flight. stop ends it
+// and returns the error of Consume. done is closed when Consume returns, also on its own.
 func consume(t *testing.T, s *subscriber, concurrency int, handle func(context.Context, worker.IDelivery)) (stop func() error, done <-chan struct{}) {
 	t.Helper()
+	s.concurrency = concurrency
 	ctx, cancel := context.WithCancel(context.Background())
 	returned := make(chan struct{})
 	var err error
 	go func() {
 		defer close(returned)
-		err = s.Consume(ctx, worker.ConsumerState{Handler: handle, Concurrency: concurrency})
+		err = s.Consume(ctx, handle)
 	}()
 	stop = func() error {
 		cancel()
@@ -334,11 +335,11 @@ func TestNewSubscriber(t *testing.T) {
 	cfg.Subscribers = append(cfg.Subscribers, SubscriberConfig{Name: "shipping", Stream: "orders"})
 	b := open(t, cfg)
 
-	if _, err := b.NewSubscriber("unknown"); err == nil || !strings.Contains(err.Error(), "redisstream: subscriber config not found for name: unknown") {
+	if _, err := b.NewSubscriber("unknown", worker.SubscriberOptions{Concurrency: 1}); err == nil || !strings.Contains(err.Error(), "redisstream: subscriber config not found for name: unknown") {
 		t.Fatalf("NewSubscriber(unknown) = %v", err)
 	}
 	// shipping has no group in Streams, and nothing created it.
-	if _, err := b.NewSubscriber("shipping"); err == nil || !strings.Contains(err.Error(), "redisstream: subscriber shipping: create consumer in group shipping of stream orders: NOGROUP") {
+	if _, err := b.NewSubscriber("shipping", worker.SubscriberOptions{Concurrency: 1}); err == nil || !strings.Contains(err.Error(), "redisstream: subscriber shipping: create consumer in group shipping of stream orders: NOGROUP") {
 		t.Fatalf("NewSubscriber(shipping) = %v", err)
 	}
 
@@ -348,6 +349,16 @@ func TestNewSubscriber(t *testing.T) {
 	}
 	if other := openSubscriber(t, b, "billing"); other.consumer == s.consumer {
 		t.Fatal("two subscribers share a consumer name")
+	}
+
+	for _, tt := range []struct{ concurrency, want int }{{4, 4}, {0, 1}} {
+		s, err := b.NewSubscriber("billing", worker.SubscriberOptions{Concurrency: tt.concurrency})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := s.(*subscriber).concurrency; got != tt.want {
+			t.Errorf("a subscriber of concurrency %d handles %d entries at once, want %d", tt.concurrency, got, tt.want)
+		}
 	}
 }
 
@@ -723,7 +734,7 @@ func TestOutOfMemory(t *testing.T) {
 	}
 
 	// shipping has no group.
-	if _, err := b.NewSubscriber("shipping"); err == nil || !strings.Contains(err.Error(), "redisstream: subscriber shipping: create consumer in group shipping of stream orders: OOM") {
+	if _, err := b.NewSubscriber("shipping", worker.SubscriberOptions{Concurrency: 1}); err == nil || !strings.Contains(err.Error(), "redisstream: subscriber shipping: create consumer in group shipping of stream orders: OOM") {
 		t.Fatalf("NewSubscriber(shipping) = %v", err)
 	}
 	s := openSubscriber(t, b, "billing")
