@@ -62,6 +62,8 @@ type subscriber struct {
 	streams *streams
 	// consumer is the name the subscriber reads and claims as.
 	consumer string
+	// concurrency is the number of entries handled at once, at most.
+	concurrency int
 	// reading is the STREAMS argument of the reads: new entries of the stream.
 	reading  []string
 	inflight inflight
@@ -79,25 +81,26 @@ type subscriber struct {
 	sweepEvery time.Duration
 }
 
-func newSubscriber(client redis.UniversalClient, streams *streams, conf SubscriberConfig, consumer string) *subscriber {
+func newSubscriber(client redis.UniversalClient, streams *streams, conf SubscriberConfig, consumer string, concurrency int) *subscriber {
 	return &subscriber{
-		conf:       conf,
-		client:     client,
-		streams:    streams,
-		consumer:   consumer,
-		reading:    []string{conf.Stream, ">"},
-		inflight:   inflight{deliveries: make(map[*delivery]struct{})},
-		staleAfter: staleIdle * conf.ClaimIdle,
-		block:      readBlock,
-		claimEvery: claimInterval,
-		beat:       conf.ClaimIdle / 3,
-		errorWait:  errorWait,
-		sweepEvery: sweepInterval,
+		conf:        conf,
+		client:      client,
+		streams:     streams,
+		consumer:    consumer,
+		concurrency: max(concurrency, 1),
+		reading:     []string{conf.Stream, ">"},
+		inflight:    inflight{deliveries: make(map[*delivery]struct{})},
+		staleAfter:  staleIdle * conf.ClaimIdle,
+		block:       readBlock,
+		claimEvery:  claimInterval,
+		beat:        conf.ClaimIdle / 3,
+		errorWait:   errorWait,
+		sweepEvery:  sweepInterval,
 	}
 }
 
-// Consume reads the group and hands every entry to state.Handler, with at most state.Concurrency in
-// flight. A read takes no more entries than there are free handler slots, so the rest of the
+// Consume reads the group and hands every entry to handle, with at most the subscriber's concurrency
+// in flight. A read takes no more entries than there are free handler slots, so the rest of the
 // backlog stays in the stream for the other consumers. Before it reads new entries, Consume claims
 // the entries that were idle for ClaimIdle: those of consumers that stopped and the retries that
 // are due. Once a scan of them reached the end, and at most every sweepInterval, it sweeps the
@@ -106,8 +109,8 @@ func newSubscriber(client redis.UniversalClient, streams *streams, conf Subscrib
 // It returns once ctx ends and every handler finished, or with the error that stopped it, such as
 // a deleted group. While Redis cannot be reached or fails over, it keeps trying, with a pause of a
 // second after every failure.
-func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
-	concurrency := max(state.Concurrency, 1)
+func (s *subscriber) Consume(ctx context.Context, handle func(context.Context, worker.IDelivery)) error {
+	concurrency := s.concurrency
 	slots := process.NewChannelSemaphore(concurrency)
 	var handlers sync.WaitGroup
 	// Deferred first, so the heartbeat refreshes the entries of the last handlers until they end.
@@ -159,7 +162,7 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 			handlers.Go(func() {
 				defer slots.Release()
 				defer s.inflight.remove(d)
-				state.Handler(ctx, d)
+				handle(ctx, d)
 			})
 		}
 	}

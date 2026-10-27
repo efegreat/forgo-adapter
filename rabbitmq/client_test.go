@@ -149,15 +149,17 @@ func tagsOf(name string) func() string {
 }
 
 func newTestSubscriber(ch *fakeConsumeChannel) *subscriber {
-	return &subscriber{subscription: newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s"))}
+	return &subscriber{subscription: newSubscription(SubscriberConfig{Name: "s", Queue: "q"}, ch, tagsOf("s")), concurrency: 1}
 }
 
-// consume runs s.Consume in the background with the handler, and returns its result.
+// consume runs s.Consume in the background with the handler, with at most concurrency in flight,
+// and returns its result.
 func consume(s *subscriber, concurrency int, handler func(context.Context, worker.IDelivery)) (context.CancelFunc, <-chan error) {
+	s.concurrency = concurrency
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Consume(ctx, worker.ConsumerState{Concurrency: concurrency, Handler: handler})
+		done <- s.Consume(ctx, handler)
 	}()
 	return cancel, done
 }
@@ -353,7 +355,7 @@ func TestSubscriberConsumeErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := newTestSubscriber(tt.ch).Consume(context.Background(), worker.ConsumerState{Concurrency: 1, Handler: func(context.Context, worker.IDelivery) {}})
+			err := newTestSubscriber(tt.ch).Consume(context.Background(), func(context.Context, worker.IDelivery) {})
 			if err == nil || !strings.Contains(err.Error(), tt.wantMsg) {
 				t.Fatalf("Consume = %v, want one containing %q", err, tt.wantMsg)
 			}

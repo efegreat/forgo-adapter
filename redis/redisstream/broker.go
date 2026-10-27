@@ -68,15 +68,15 @@ func (b *broker) NewPublisher(string) (worker.IPublisher, error) {
 	return &publisher{streams: b.streams}, nil
 }
 
-// NewSubscriber returns the subscriber name, which reads as a consumer of its own. Creating the
-// consumer checks that the stream and the group exist, so a missing one fails the server at
-// startup.
-func (b *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
+// NewSubscriber returns the subscriber name, which reads as a consumer of its own and handles
+// opts.Concurrency entries at once. Creating the consumer checks that the stream and the group
+// exist, so a missing one fails the server at startup.
+func (b *broker) NewSubscriber(name string, opts worker.SubscriberOptions) (worker.ISubscriber, error) {
 	conf, ok := b.subscribers[name]
 	if !ok {
 		return nil, fmt.Errorf("redisstream: subscriber config not found for name: %s", name)
 	}
-	s := newSubscriber(b.client, b.streams, conf, consumerName())
+	s := newSubscriber(b.client, b.streams, conf, consumerName(), opts.Concurrency)
 	ctx := context.Background()
 	// Out of memory, Redis refuses to create the consumer, which the subscriber's first read creates.
 	err := b.client.XGroupCreateConsumer(ctx, conf.Stream, conf.Group, s.consumer).Err()

@@ -107,7 +107,7 @@ func waitQueued(t *testing.T, url, queue string, n int) {
 // settlements took from the moment the last handler started, and their errors.
 func (r *recoveryTest) burst(t *testing.T, n int, settle func(context.Context, worker.IDelivery) error) (time.Duration, []error) {
 	t.Helper()
-	s, err := r.broker.NewSubscriber("sub")
+	s, err := r.broker.NewSubscriber("sub", worker.SubscriberOptions{Concurrency: n})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func (r *recoveryTest) burst(t *testing.T, n int, settle func(context.Context, w
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Consume(ctx, worker.ConsumerState{Concurrency: n, Handler: func(ctx context.Context, d worker.IDelivery) {
+		done <- s.Consume(ctx, func(ctx context.Context, d worker.IDelivery) {
 			if started.Add(1) == int32(n) {
 				allStarted = time.Now()
 				close(all)
@@ -127,7 +127,7 @@ func (r *recoveryTest) burst(t *testing.T, n int, settle func(context.Context, w
 			sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			results <- settle(sctx, d)
-		}})
+		})
 	}()
 	t.Cleanup(func() {
 		stop()
@@ -221,13 +221,13 @@ func checkIdle(t *testing.T, c *copier) {
 }
 
 // The broker returns, and then confirms, the copies no queue takes. With twice as many copies at once
-// as the copier lets in flight, half of them to a queue that does not exist, every copy learns
-// whether a queue took it, the copier's returns never fill up and hold the connection back, and
-// the connection goes on.
+// as the copier lets in flight, the copies of its subscriber's handlers, half of them to a queue
+// that does not exist, every copy learns whether a queue took it, the copier's returns never fill
+// up and hold the connection back, and the connection goes on.
 func TestIntegrationUnroutableCopies(t *testing.T) {
-	const copies = 2 * maxCopiesInFlight
+	const copies = 128
 	r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true, Retry: RetryConfig{Initial: time.Minute, Max: time.Minute}}, SubscriberConfig{})
-	s, err := r.broker.NewSubscriber("sub")
+	s, err := r.broker.NewSubscriber("sub", worker.SubscriberOptions{Concurrency: copies / 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,8 +235,8 @@ func TestIntegrationUnroutableCopies(t *testing.T) {
 	c := s.(*subscriber).copier
 	// The broker can return every copy in flight before it confirms one, which this broker does
 	// not do on demand: the listener must have room for all of them.
-	if cap(c.returns) < maxCopiesInFlight {
-		t.Fatalf("the copier's return listener has room for %d returns, fewer than the %d copies in flight", cap(c.returns), maxCopiesInFlight)
+	if cap(c.room) != copies/2 || cap(c.returns) != cap(c.room) {
+		t.Fatalf("the copier lets %d copies in flight with room for %d returns, want the %d of the subscriber's handlers for both", cap(c.room), cap(c.returns), copies/2)
 	}
 	q, _ := queueConfig(r.broker.conf, r.name)
 	retryQueue := q.Retry.queues(q.Name)[0].name
@@ -292,7 +292,7 @@ func TestIntegrationCopierRecovery(t *testing.T) {
 		rounds = 4
 	)
 	r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true, Retry: RetryConfig{Initial: time.Minute, Max: time.Minute}}, SubscriberConfig{})
-	s, err := r.broker.NewSubscriber("sub")
+	s, err := r.broker.NewSubscriber("sub", worker.SubscriberOptions{Concurrency: copies})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +302,7 @@ func TestIntegrationCopierRecovery(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Consume(ctx, worker.ConsumerState{Concurrency: copies, Handler: func(ctx context.Context, d worker.IDelivery) {
+		done <- s.Consume(ctx, func(ctx context.Context, d worker.IDelivery) {
 			rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			if d.Retry(rctx, 1) == nil {
@@ -310,7 +310,7 @@ func TestIntegrationCopierRecovery(t *testing.T) {
 				retried[d.Message().ID]++
 				mu.Unlock()
 			}
-		}})
+		})
 	}()
 	t.Cleanup(func() {
 		stop()

@@ -78,20 +78,20 @@ var errConsumeHangs = errors.New("Consume did not return")
 // error of Consume.
 func consume(t *testing.T, b *broker, name string, concurrency int, handle func(context.Context, worker.IDelivery)) (stop func() error) {
 	t.Helper()
-	s, err := b.NewSubscriber(name)
+	s, err := b.NewSubscriber(name, worker.SubscriberOptions{Concurrency: concurrency})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return consumeWith(t, s, concurrency, handle)
+	return consumeWith(t, s, handle)
 }
 
 // consumeWith is consume for a subscriber of the test's own.
-func consumeWith(t *testing.T, s worker.ISubscriber, concurrency int, handle func(context.Context, worker.IDelivery)) (stop func() error) {
+func consumeWith(t *testing.T, s worker.ISubscriber, handle func(context.Context, worker.IDelivery)) (stop func() error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Consume(ctx, worker.ConsumerState{Handler: handle, Concurrency: concurrency})
+		done <- s.Consume(ctx, handle)
 	}()
 	var once sync.Once
 	var err2 error
@@ -400,7 +400,7 @@ func TestNewFails(t *testing.T) {
 func TestNewSubscriberUnknown(t *testing.T) {
 	_, cfg := fake(t)
 	b := open(t, cfg)
-	if _, err := b.NewSubscriber("billing"); err == nil || !strings.Contains(err.Error(), "subscriber config not found") {
+	if _, err := b.NewSubscriber("billing", worker.SubscriberOptions{Concurrency: 1}); err == nil || !strings.Contains(err.Error(), "subscriber config not found") {
 		t.Fatalf("NewSubscriber() = %v", err)
 	}
 }
@@ -598,11 +598,11 @@ func TestConsumeConcurrency(t *testing.T) {
 
 	var running, peak, handled atomic.Int32
 	gate := make(chan struct{})
-	s, err := b.NewSubscriber("billing")
+	s, err := b.NewSubscriber("billing", worker.SubscriberOptions{Concurrency: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumeWith(t, s, 2, func(ctx context.Context, d worker.IDelivery) {
+	consumeWith(t, s, func(ctx context.Context, d worker.IDelivery) {
 		n := running.Add(1)
 		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
 		}
@@ -665,13 +665,13 @@ func TestConsumeMissingSubscription(t *testing.T) {
 	_, cfg := fake(t)
 	cfg.Subscribers = []SubscriberConfig{{Name: "billing", Subscription: "billing"}}
 	b := open(t, cfg)
-	s, err := b.NewSubscriber("billing")
+	s, err := b.NewSubscriber("billing", worker.SubscriberOptions{Concurrency: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Consume(context.Background(), worker.ConsumerState{Handler: func(context.Context, worker.IDelivery) {}, Concurrency: 1})
+		done <- s.Consume(context.Background(), func(context.Context, worker.IDelivery) {})
 	}()
 	select {
 	case err := <-done:
@@ -720,10 +720,11 @@ func endingStreams(t *testing.T, n int32, err error) (*pstest.Server, Config, *a
 	return srv, Config{Name: "events", ProjectID: project, Options: []option.ClientOption{option.WithGRPCConn(conn)}}, streams
 }
 
-// quickRetries returns the subscriber name of b, which pauses briefly before receiving again.
+// quickRetries returns the subscriber name of b, which handles a message at a time and pauses
+// briefly before receiving again.
 func quickRetries(t *testing.T, b *broker, name string) *subscriber {
 	t.Helper()
-	s, err := b.NewSubscriber(name)
+	s, err := b.NewSubscriber(name, worker.SubscriberOptions{Concurrency: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +744,7 @@ func TestConsumeReceivesAgain(t *testing.T) {
 			srv, cfg, streams := endingStreams(t, 3, err)
 			b := open(t, topology(cfg, SubscriptionConfig{}))
 			ch, handle := deliveries()
-			stop := consumeWith(t, quickRetries(t, b, "billing"), 1, handle)
+			stop := consumeWith(t, quickRetries(t, b, "billing"), handle)
 			eventually(t, "a stream that stays open", func() bool { return streams.Load() > 3 })
 
 			msg := worker.NewMessage("order.placed", "", "orders", nil)
@@ -766,7 +767,7 @@ func TestConsumeReceivesAgain(t *testing.T) {
 		_, cfg, streams := endingStreams(t, 100, status.Error(codes.PermissionDenied, "User not authorized to perform this action."))
 		b := open(t, topology(cfg, SubscriptionConfig{}))
 		_, handle := deliveries()
-		stop := consumeWith(t, quickRetries(t, b, "billing"), 1, handle)
+		stop := consumeWith(t, quickRetries(t, b, "billing"), handle)
 		eventually(t, "the stream", func() bool { return streams.Load() == 1 })
 		err := stop()
 		if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "pubsub: subscriber billing: receive from projects/proj/subscriptions/billing") {
@@ -783,7 +784,7 @@ func TestConsumeReceivesAgain(t *testing.T) {
 		s := quickRetries(t, b, "billing")
 		s.retryInitial, s.retryMax = time.Minute, time.Minute
 		_, handle := deliveries()
-		stop := consumeWith(t, s, 1, handle)
+		stop := consumeWith(t, s, handle)
 		eventually(t, "the stream", func() bool { return streams.Load() == 1 })
 		if err := stop(); err != nil {
 			t.Fatalf("Consume() = %v", err)
@@ -822,7 +823,7 @@ func TestConsumeStopsWhileAcksHang(t *testing.T) {
 	s := quickRetries(t, b, "billing")
 	s.flushWait = 200 * time.Millisecond
 	started, finish := make(chan struct{}), make(chan struct{})
-	stop := consumeWith(t, s, 1, func(ctx context.Context, d worker.IDelivery) {
+	stop := consumeWith(t, s, func(ctx context.Context, d worker.IDelivery) {
 		close(started)
 		<-finish
 		_ = d.Complete(context.WithoutCancel(ctx))

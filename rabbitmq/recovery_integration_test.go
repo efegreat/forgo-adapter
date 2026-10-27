@@ -301,7 +301,7 @@ type consumption struct {
 // complete their delivery.
 func (r *recoveryTest) consume(t *testing.T, concurrency int, handle time.Duration) *consumption {
 	t.Helper()
-	s, err := r.broker.NewSubscriber("sub")
+	s, err := r.broker.NewSubscriber("sub", worker.SubscriberOptions{Concurrency: concurrency})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +323,7 @@ func (r *recoveryTest) consume(t *testing.T, concurrency int, handle time.Durati
 		}
 	}()
 	go func() {
-		c.done <- s.Consume(ctx, worker.ConsumerState{Concurrency: concurrency, Handler: func(ctx context.Context, d worker.IDelivery) {
+		c.done <- s.Consume(ctx, func(ctx context.Context, d worker.IDelivery) {
 			time.Sleep(handle)
 			err := d.Complete(ctx)
 			id := d.Message().ID
@@ -339,7 +339,7 @@ func (r *recoveryTest) consume(t *testing.T, concurrency int, handle time.Durati
 			default:
 				c.lost++
 			}
-		}})
+		})
 	}()
 	t.Cleanup(func() {
 		stop()
@@ -547,7 +547,7 @@ func TestIntegrationPublishingConnectionLost(t *testing.T) {
 func TestIntegrationRetryWaitsForPublishingConnection(t *testing.T) {
 	r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true, Retry: RetryConfig{Initial: 100 * time.Millisecond, Max: 100 * time.Millisecond}}, SubscriberConfig{})
 	r.publish(t, "msg", 1)
-	s, err := r.broker.NewSubscriber("sub")
+	s, err := r.broker.NewSubscriber("sub", worker.SubscriberOptions{Concurrency: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +560,7 @@ func TestIntegrationRetryWaitsForPublishingConnection(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Consume(ctx, worker.ConsumerState{Concurrency: 1, Handler: func(ctx context.Context, d worker.IDelivery) {
+		done <- s.Consume(ctx, func(ctx context.Context, d worker.IDelivery) {
 			_, retried := d.Message().Headers.Get("x-death")
 			if runs.Add(1) > 1 {
 				results <- handled{retried: retried, err: d.Complete(ctx)}
@@ -575,7 +575,7 @@ func TestIntegrationRetryWaitsForPublishingConnection(t *testing.T) {
 			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			results <- handled{err: d.Retry(rctx, 1)}
-		}})
+		})
 	}()
 	t.Cleanup(func() {
 		stop()
@@ -666,14 +666,14 @@ func TestIntegrationDeadLetterNotStored(t *testing.T) {
 			}
 
 			var failed, rejected, completed, parked atomic.Int32
-			s, err := r.broker.NewSubscriber("sub")
+			s, err := r.broker.NewSubscriber("sub", worker.SubscriberOptions{Concurrency: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
 			ctx, stop := context.WithCancel(context.Background())
 			done := make(chan error, 1)
 			go func() {
-				done <- s.Consume(ctx, worker.ConsumerState{Concurrency: 1, Handler: func(ctx context.Context, d worker.IDelivery) {
+				done <- s.Consume(ctx, func(ctx context.Context, d worker.IDelivery) {
 					if strings.HasPrefix(d.Message().ID, "other-") {
 						if d.Complete(ctx) == nil {
 							completed.Add(1)
@@ -688,7 +688,7 @@ func TestIntegrationDeadLetterNotStored(t *testing.T) {
 						return
 					}
 					rejected.Add(1)
-				}})
+				})
 			}()
 			t.Cleanup(func() {
 				stop()
@@ -757,7 +757,7 @@ func TestIntegrationCloseWhileUnreachable(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			r := newRecoveryTest(t, Config{}, QueueConfig{Durable: true}, SubscriberConfig{})
-			s, err := r.broker.NewSubscriber("sub")
+			s, err := r.broker.NewSubscriber("sub", worker.SubscriberOptions{Concurrency: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -765,10 +765,10 @@ func TestIntegrationCloseWhileUnreachable(t *testing.T) {
 			ctx, stop := context.WithCancel(context.Background())
 			done := make(chan error, 1)
 			go func() {
-				done <- s.Consume(ctx, worker.ConsumerState{Concurrency: 1, Handler: func(ctx context.Context, d worker.IDelivery) {
+				done <- s.Consume(ctx, func(ctx context.Context, d worker.IDelivery) {
 					_ = d.Complete(ctx)
 					handled <- struct{}{}
-				}})
+				})
 			}()
 			r.publish(t, "msg", 1)
 			<-handled
@@ -846,7 +846,7 @@ func TestIntegrationConsumerTimeout(t *testing.T) {
 		t.Skipf("RabbitMQ %s closes the channel of a consumer that timed out, which the channel's recovery covers", version)
 	}
 
-	s, err := r.broker.NewSubscriber("sub")
+	s, err := r.broker.NewSubscriber("sub", worker.SubscriberOptions{Concurrency: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -864,7 +864,7 @@ func TestIntegrationConsumerTimeout(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Consume(ctx, worker.ConsumerState{Concurrency: 3, Handler: func(ctx context.Context, d worker.IDelivery) {
+		done <- s.Consume(ctx, func(ctx context.Context, d worker.IDelivery) {
 			id := d.Message().ID
 			switch {
 			case id == "slow-0" && slowRuns.Add(1) == 1:
@@ -874,7 +874,7 @@ func TestIntegrationConsumerTimeout(t *testing.T) {
 				<-cancelled
 			}
 			results <- handled{id: id, err: d.Complete(ctx)}
-		}})
+		})
 	}()
 	// release lets the handlers waiting for c go on. Only the test closes these channels.
 	release := func(c chan struct{}) {

@@ -33,6 +33,8 @@ var errReceiveStopped = errors.New("pubsub: receiving stopped before the subscri
 type subscriber struct {
 	conf SubscriberConfig
 	sub  *gpubsub.Subscriber
+	// concurrency is the number of messages handled at once, at most.
+	concurrency int
 	// deadLetter publishes the messages Reject drops. Nil acknowledges them instead.
 	deadLetter *deadLetter
 
@@ -41,34 +43,34 @@ type subscriber struct {
 	retryInitial, retryMax, flushWait time.Duration
 }
 
-// Consume receives from the subscription and hands every message to state.Handler, with at most
-// state.Concurrency in flight. It returns once ctx ends, every handler finished and the client sent
-// their acknowledgements, for up to five seconds, or with the error that stopped receiving, such as a
-// missing subscription or missing permissions.
+// Consume receives from the subscription and hands every message to handle, with at most the
+// subscriber's concurrency in flight. It returns once ctx ends, every handler finished and the
+// client sent their acknowledgements, for up to five seconds, or with the error that stopped
+// receiving, such as a missing subscription or missing permissions.
 //
 // The client opens its stream again after most failures, but gives up on some that pass when a
 // stream ends with them: an exceeded quota (RESOURCE_EXHAUSTED), an error a proxy or load balancer
 // sent (UNKNOWN), or a server that shut down. Consume receives again after those, with a pause
 // that doubles from a second up to a minute.
-func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) error {
-	concurrency := max(state.Concurrency, 1)
+func (s *subscriber) Consume(ctx context.Context, handle func(context.Context, worker.IDelivery)) error {
+	concurrency := s.concurrency
 	s.sub.ReceiveSettings.MaxOutstandingMessages = maxOutstanding(s.conf.MaxOutstandingMessages, concurrency)
 
 	// Receive runs callbacks up to MaxOutstandingMessages at once, which may exceed the concurrency.
 	slots := process.NewChannelSemaphore(concurrency)
-	handle := func(_ context.Context, m *gpubsub.Message) {
+	callback := func(_ context.Context, m *gpubsub.Message) {
 		if err := slots.WaitAcquire(ctx); err != nil {
 			m.Nack()
 			return
 		}
 		defer slots.Release()
-		state.Handler(ctx, newDelivery(m, s.deadLetter))
+		handle(ctx, newDelivery(m, s.deadLetter))
 	}
 
 	wait := s.retryInitial
 	for {
 		started := time.Now()
-		err := s.receive(ctx, slots, concurrency, handle)
+		err := s.receive(ctx, slots, concurrency, callback)
 		if err == nil {
 			if ctx.Err() == nil {
 				return errReceiveStopped
