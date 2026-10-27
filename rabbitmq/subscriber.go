@@ -29,7 +29,7 @@ type consumeChannel interface {
 // and publishes the copies that retries and rejections need through copier, on another connection.
 type subscriber struct {
 	*subscription
-	copier     *publisher
+	copier     *copier
 	retry      *retrier
 	deadLetter *deadLetter
 	release    func()

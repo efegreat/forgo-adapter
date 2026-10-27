@@ -23,7 +23,9 @@ import (
 // connection it made and cutPublishing those of the publishing connection, while it refuses, dials
 // fail, while it hangs up, dials of the subscribers' connection succeed and the other end closes
 // the connection at once, and once it stalls, nothing gets through either way, as with a broker
-// that hangs or a network that drops every packet.
+// that hangs or a network that drops every packet. While it slows the publishing connection, each
+// read of that connection waits first, so a round trip takes at least as long, and the confirms
+// of the publishes in flight then arrive together.
 type faultyNetwork struct {
 	mu     sync.Mutex
 	conns  []dialedConn
@@ -33,6 +35,8 @@ type faultyNetwork struct {
 	// dialed counts the connections made.
 	dialed  int
 	stalled atomic.Bool
+	// publishDelay is how long a read of the publishing connection waits, in nanoseconds.
+	publishDelay atomic.Int64
 }
 
 // dialedConn is a connection the network made, for the publishing connection or the other one.
@@ -59,6 +63,9 @@ func (n *faultyNetwork) dial(publishing bool, network, addr string) (net.Conn, e
 		return nil, err
 	}
 	conn := &stallableConn{Conn: tcp, stalled: &n.stalled}
+	if publishing {
+		conn.delay = &n.publishDelay
+	}
 	n.conns = append(n.conns, dialedConn{Conn: conn, publishing: publishing})
 	n.dialed++
 	return conn, nil
@@ -85,14 +92,24 @@ func (n *faultyNetwork) stall() {
 	n.stalled.Store(true)
 }
 
+// slowPublishing makes every read of the publishing connections, made so far and later, wait for
+// delay first.
+func (n *faultyNetwork) slowPublishing(delay time.Duration) {
+	n.publishDelay.Store(int64(delay))
+}
+
 // stallableConn drops what is written to it and what it reads while its network stalls. A read
-// still ends with the connection's deadline or close.
+// still ends with the connection's deadline or close. A read waits for delay first, when set.
 type stallableConn struct {
 	net.Conn
 	stalled *atomic.Bool
+	delay   *atomic.Int64
 }
 
 func (c *stallableConn) Read(b []byte) (int, error) {
+	if c.delay != nil {
+		time.Sleep(time.Duration(c.delay.Load()))
+	}
 	for {
 		n, err := c.Conn.Read(b)
 		if err != nil || !c.stalled.Load() {
