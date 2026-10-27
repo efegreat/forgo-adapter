@@ -110,6 +110,8 @@ func TestPrometheusRoute(t *testing.T) {
 		`forgo_operation_duration_seconds_count{forgo_operation_name="ping",forgo_operation_status="ok",forgo_operation_type="http_handler"`,
 		`forgo_operation_status="not_found"`,
 		`http_server_request_duration_seconds_count{http_request_method="GET",http_response_status_code="200",http_route="/ping"`,
+		`process_cpu_time_seconds_total{cpu_mode="user",otel_scope_name="github.com/efegreat/forgo-adapter/otel/meter"`,
+		`process_cpu_time_seconds_total{cpu_mode="system",otel_scope_name="github.com/efegreat/forgo-adapter/otel/meter"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics lack %s:\n%s", want, body)

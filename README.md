@@ -60,7 +60,7 @@ Each client library is a module of its own, so an app downloads and resolves onl
 | | `redis/liveconfigcache` | provider | `forgo.LiveConfigCache` | Redis |
 | `github.com/efegreat/forgo-adapter/rabbitmq` | `rabbitmq` | resource | `worker.IBroker` | amqp091-go, with automatic recovery, publisher confirms, prefetch and optional dead-letter queues |
 | `github.com/efegreat/forgo-adapter/pubsub` | `pubsub` | resource | `worker.IBroker` | Google Cloud Pub/Sub client v2, with batched publishing, flow control, retry policies and optional dead-letter topics |
-| `github.com/efegreat/forgo-adapter/otel` | `otel/meter` | resource | `metric.MeterProvider` | OpenTelemetry's SDK, exporting over OTLP or to Prometheus, with Go runtime metrics |
+| `github.com/efegreat/forgo-adapter/otel` | `otel/meter` | resource | `metric.MeterProvider` | OpenTelemetry's SDK, exporting over OTLP or to Prometheus, with Go runtime metrics and the CPU time of the process |
 | | `otel/observer` | provider | `operation.IObserver` | OpenTelemetry: the duration of every operation, labelled alike on every server, HTTP semantic conventions, message settlements, outbox batches and backlog, locks and connections |
 
 - **Configure, don't wire.** Every resource is a plain config value whose zero fields mean "use the default". Every provider is a constructor that the bootstrap calls with the resources it needs.

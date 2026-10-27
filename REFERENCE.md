@@ -1158,6 +1158,7 @@ app := forgo.NewApp(
 | `OTLP.Interval` | `OTEL_METRIC_EXPORT_INTERVAL`, else 1 minute | The time between two exports. |
 | `Readers` | | Readers besides the exporter's, such as an `sdkmetric.ManualReader` in tests, or an exporter of your own with `ExporterNone`. |
 | `DisableRuntime` | `false` | Leaves out the Go runtime metrics (`go.memory.used`, `go.goroutine.count`, …) of OpenTelemetry's runtime instrumentation. |
+| `DisableProcess` | `false` | Leaves out `process.cpu.time`, the CPU time of the process (see [CPU and memory usage](#cpu-and-memory-usage)). Set it when something else records it, such as OpenTelemetry's host instrumentation. |
 | `Global` | `false` | Makes the provider OpenTelemetry's global `MeterProvider`, for libraries that take it from there, such as otelgrpc's stats handler in the `StatsHandlers` of the gRPC server's config. |
 | `ShutdownTimeout` | 5 seconds | Bounds the last export of `Close`. |
 
@@ -1182,6 +1183,26 @@ forgo.WithServers(config.API, Admin),
 Both servers are HTTP servers, which forgo names `http` by default. `ServerConfig.Name` names the admin server apart, so that its logs, its connection metrics (`forgo.server.name`) and forgo's `forgotest` tell it from the API's.
 
 Metric names follow Prometheus's conventions: `forgo.operation.duration` is served as `forgo_operation_duration_seconds`, and attributes as labels with underscores.
+
+#### CPU and memory usage
+
+Besides the Go runtime metrics, the provider records the semantic conventions' `process.cpu.time`: the CPU time the process used, by `cpu.mode` (`user` and `system`), as the operating system reports it (`getrusage` on Unix, `GetProcessTimes` on Windows), read once per export or scrape. The runtime instrumentation records no CPU time: the Go runtime only estimates its own, which is not comparable with the operating system's.
+
+With the runtime's limits, both become a share of what the process may use. In PromQL, sum each side by target before dividing, since the two come from different instrumentation scopes (the `otel_scope_name` label):
+
+```promql
+# CPU: the share of GOMAXPROCS in use
+sum by (job, instance) (rate(process_cpu_time_seconds_total[5m]))
+  / sum by (job, instance) (go_processor_limit)
+
+# Memory: the share of GOMEMLIMIT in use
+sum by (job, instance) (go_memory_used_bytes)
+  / sum by (job, instance) (go_memory_limit_bytes)
+```
+
+- **CPU is a share of `GOMAXPROCS`.** On Linux, Go sets it from the container's CPU limit, rounded up and at least 2, unless the `GOMAXPROCS` variable sets it: under a limit of 1.5 CPUs it is 2, so a container that uses all of its limit shows 75%. Without a limit, it is the machine's CPU count.
+- **Memory needs `GOMEMLIMIT`.** `go.memory.limit` is recorded only when `GOMEMLIMIT` is set, and Go does not set it from the container's memory limit. Set it below that limit, about 90% of it, which also makes the garbage collector work harder before the container runs out of memory. `go.memory.used` is the memory of the Go runtime, without what C code allocates through cgo.
+- **The container's limits are the container's metrics.** For a share of the container's own limits, and its CPU throttling, use the metrics of the container runtime, such as cAdvisor's `container_cpu_usage_seconds_total` and `container_cpu_cfs_throttled_seconds_total` on Kubernetes.
 
 #### Business metrics
 
@@ -1325,5 +1346,5 @@ Every error is prefixed with its package and wraps its cause, so `errors.Is` and
 | `locker:` | A TTL that is not positive, and Redis errors. `locker.ErrNotHeld` from `Unlock`. |
 | `ratelimit:` | An invalid `Rate` and Redis errors. |
 | `liveconfigcache:` | Redis errors of `Get` and `Set`. |
-| `meter:` | Validation (an unknown exporter or OTLP protocol, `ExporterNone` without `Readers`, negative durations), building the exporter or the runtime metrics, `PrometheusRoute` without `ExporterPrometheus`, and the last export of `Close`. |
+| `meter:` | Validation (an unknown exporter or OTLP protocol, `ExporterNone` without `Readers`, negative durations), building the exporter, the runtime metrics or the process metrics, `PrometheusRoute` without `ExporterPrometheus`, and the last export of `Close`. |
 | `observer:` | Boundaries that do not increase, a nil `MeterProvider`, and creating the instruments. |
