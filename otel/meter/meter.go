@@ -55,7 +55,7 @@ const (
 
 // Config is an OpenTelemetry MeterProvider resource. The zero value pushes over OTLP/HTTP to the collector
 // that the standard OTEL_EXPORTER_OTLP_* environment variables name, localhost:4318 without them, every
-// minute, with Go runtime metrics.
+// minute, with the metrics of the Go runtime and the CPU time of the process.
 //
 // Its Value is a *Provider. Providers request it as metric.MeterProvider, and PrometheusRoute as *Provider.
 // Its Close shuts the provider down, which exports what is left: the app closes resources once every
@@ -76,6 +76,10 @@ type Config struct {
 	// DisableRuntime leaves out the Go runtime metrics of OpenTelemetry's runtime instrumentation: memory,
 	// allocations, the garbage collection goal, goroutines and processors.
 	DisableRuntime bool
+	// DisableProcess leaves out process.cpu.time, the user and the system CPU time of the process, which
+	// the operating system reports. Set it when something else records it, such as OpenTelemetry's host
+	// instrumentation.
+	DisableProcess bool
 	// Global makes the provider OpenTelemetry's global MeterProvider, for libraries that take it from there,
 	// such as otelgrpc's stats handler in the StatsHandlers of the gRPC server's config. Leave it off when
 	// something else sets the global provider. After Close, the global provider records nothing.
@@ -154,9 +158,10 @@ func (c Config) validate() error {
 	return nil
 }
 
-// New builds the MeterProvider, with the reader of the exporter, the Readers and, unless DisableRuntime,
-// the Go runtime metrics. The OTLP exporter connects lazily, so an unreachable collector does not stop the
-// application: its failed exports go to OpenTelemetry's error handler (otel.SetErrorHandler).
+// New builds the MeterProvider, with the reader of the exporter, the Readers, the Go runtime metrics unless
+// DisableRuntime, and the CPU time of the process unless DisableProcess. The OTLP exporter connects lazily,
+// so an unreachable collector does not stop the application: its failed exports go to OpenTelemetry's error
+// handler (otel.SetErrorHandler).
 func (c Config) New() (forgo.Resource, error) {
 	cfg := c.Sanitize()
 	if err := cfg.validate(); err != nil {
@@ -196,6 +201,11 @@ func (c Config) New() (forgo.Resource, error) {
 	if !cfg.DisableRuntime {
 		if err := runtime.Start(runtime.WithMeterProvider(p)); err != nil {
 			return nil, errors.Join(fmt.Errorf("meter: runtime metrics: %w", err), p.Shutdown(context.Background()))
+		}
+	}
+	if !cfg.DisableProcess {
+		if err := startProcess(p); err != nil {
+			return nil, errors.Join(fmt.Errorf("meter: process metrics: %w", err), p.Shutdown(context.Background()))
 		}
 	}
 	if cfg.Global {
