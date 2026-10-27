@@ -231,6 +231,116 @@ func TestSubscriberConsume(t *testing.T) {
 	}
 }
 
+// A delivery that arrives while every slot is taken waits for one, and Consume goes on once a
+// handler returns.
+func TestSubscriberWaitsForAFreeSlot(t *testing.T) {
+	ch := &fakeConsumeChannel{}
+	s := newTestSubscriber(ch)
+
+	ack := &fakeAcknowledger{}
+	release := make(chan struct{})
+	started := make(chan string, 3)
+	cancel, done := consume(s, 1, func(ctx context.Context, d worker.IDelivery) {
+		started <- d.Message().ID
+		if d.Message().ID == "a" {
+			<-release
+		}
+		_ = d.Complete(ctx)
+	})
+	defer cancel()
+
+	stream := ch.stream(t, 0)
+	stream <- amqp.Delivery{MessageId: "a", Acknowledger: ack, DeliveryTag: 1}
+	stream <- amqp.Delivery{MessageId: "b", Acknowledger: ack, DeliveryTag: 2}
+	waitStarted(t, started, "a")
+	waitReceived(t, stream)
+	select {
+	case id := <-started:
+		t.Fatalf("handler of %s started while the only slot was taken", id)
+	case err := <-done:
+		t.Fatalf("Consume = %v while every slot was taken, want it to wait for one", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	waitStarted(t, started, "b")
+	stream <- amqp.Delivery{MessageId: "c", Acknowledger: ack, DeliveryTag: 3}
+	waitStarted(t, started, "c")
+
+	cancel()
+	if err := waitConsume(t, done); err != nil {
+		t.Fatalf("Consume = %v", err)
+	}
+	if got, want := strings.Join(ack.calls, ", "), "ack 1 multiple=false, ack 2 multiple=false, ack 3 multiple=false"; got != want {
+		t.Fatalf("acknowledgements %q, want %q", got, want)
+	}
+}
+
+// Once ctx ends while Consume waits for a slot, Consume leaves the waiting delivery unsettled, for
+// the broker to redeliver, and returns nil once the running handlers returned.
+func TestSubscriberStopsWhileWaitingForASlot(t *testing.T) {
+	ch := &fakeConsumeChannel{}
+	s := newTestSubscriber(ch)
+
+	ack := &fakeAcknowledger{}
+	release := make(chan struct{})
+	started := make(chan string, 2)
+	cancel, done := consume(s, 1, func(ctx context.Context, d worker.IDelivery) {
+		started <- d.Message().ID
+		<-release
+		_ = d.Complete(ctx)
+	})
+
+	stream := ch.stream(t, 0)
+	stream <- amqp.Delivery{MessageId: "a", Acknowledger: ack, DeliveryTag: 1}
+	stream <- amqp.Delivery{MessageId: "b", Acknowledger: ack, DeliveryTag: 2}
+	waitStarted(t, started, "a")
+	waitReceived(t, stream)
+
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("Consume = %v before the running handler returned", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := waitConsume(t, done); err != nil {
+		t.Fatalf("Consume = %v, want nil", err)
+	}
+
+	select {
+	case id := <-started:
+		t.Fatalf("handler of %s started after ctx ended", id)
+	default:
+	}
+	if got, want := strings.Join(ack.calls, ", "), "ack 1 multiple=false"; got != want {
+		t.Fatalf("acknowledgements %q, want %q", got, want)
+	}
+}
+
+// waitStarted waits for the next handler to start, and checks that it handles the message id.
+func waitStarted(t *testing.T, started <-chan string, id string) {
+	t.Helper()
+	select {
+	case got := <-started:
+		if got != id {
+			t.Fatalf("handler of %s started, want %s", got, id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("handler of %s did not start", id)
+	}
+}
+
+// waitReceived waits until Consume received every delivery the test sent on stream.
+func waitReceived(t *testing.T, stream chan amqp.Delivery) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); len(stream) > 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("Consume left %d deliveries on the stream", len(stream))
+		}
+	}
+}
+
 func TestSubscriberConsumeErrors(t *testing.T) {
 	tests := []struct {
 		name    string

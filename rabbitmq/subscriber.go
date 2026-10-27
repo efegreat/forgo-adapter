@@ -74,16 +74,11 @@ func (s *subscriber) Consume(ctx context.Context, state worker.ConsumerState) er
 				continue
 			}
 			d := newDelivery(msg, s.guard, st.gen, s.retry, s.deadLetter)
-			err := runner.Run(ctx, func() {
-				state.Handler(ctx, d)
-			})
-			if err != nil {
+			// Run waits while every slot is taken, and fails only once ctx ended.
+			if runner.Run(ctx, func() { state.Handler(ctx, d) }) != nil {
 				// The message was not handled or acknowledged: the broker redelivers it once the
 				// channel closes.
-				if errors.Is(err, process.ErrNoSlot) {
-					return nil
-				}
-				return err
+				return nil
 			}
 		}
 	}
