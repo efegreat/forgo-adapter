@@ -78,7 +78,7 @@ func (r *broker) Name() string {
 
 // NewDefaultPublisher returns a publisher of persistent messages that needs no PublisherConfig.
 func (r *broker) NewDefaultPublisher() (worker.IPublisher, error) {
-	return r.newPublisher(PublisherConfig{Name: defaultPublisherName}.Sanitize(), false)
+	return r.newPublisher(PublisherConfig{Name: defaultPublisherName}.Sanitize(), false, returnBuffer)
 }
 
 // NewPublisher returns a publisher with the PublisherConfig named name.
@@ -87,13 +87,14 @@ func (r *broker) NewPublisher(name string) (worker.IPublisher, error) {
 	if !ok {
 		return nil, fmt.Errorf("rabbitmq: publisher config not found for name: %s", name)
 	}
-	return r.newPublisher(conf, false)
+	return r.newPublisher(conf, false, returnBuffer)
 }
 
 // newPublisher opens a channel in confirm mode on publishConn, so Publish returns once the broker
 // has the message. A publisher that waits for recovery waits while the connection is down, as it
-// does while the client reopens the channel, instead of failing at once.
-func (r *broker) newPublisher(conf PublisherConfig, waitsForRecovery bool) (*publisher, error) {
+// does while the client reopens the channel, instead of failing at once. A mandatory publisher's
+// return listener has room for returns.
+func (r *broker) newPublisher(conf PublisherConfig, waitsForRecovery bool, returns int) (*publisher, error) {
 	ch, err := r.publishConn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq: open publisher channel: %w", err)
@@ -104,7 +105,7 @@ func (r *broker) newPublisher(conf PublisherConfig, waitsForRecovery bool) (*pub
 
 	p := &publisher{conf: conf, ch: ch, gate: &gate{}, flow: r.flow, waitsForRecovery: waitsForRecovery}
 	if conf.Mandatory {
-		p.returns = ch.NotifyReturn(make(chan amqp.Return, returnBuffer))
+		p.returns = ch.NotifyReturn(make(chan amqp.Return, returns))
 	}
 	r.own(ch, ownedChannel{gate: p.gate})
 	p.release = func() { r.disown(ch) }
@@ -131,7 +132,7 @@ func (r *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 
 	sub := newSubscription(conf, ch, func() string { return r.consumerTag(name) })
 	r.own(ch, ownedChannel{sub: sub})
-	copier, retry, deadLetter, err := r.newCopier(conf.Queue)
+	copier, retry, deadLetter, err := r.newCopies(conf.Queue)
 	if err != nil {
 		r.disown(ch)
 		return nil, errors.Join(fmt.Errorf("rabbitmq: subscriber %s: %w", name, err), ch.Close())
@@ -145,11 +146,11 @@ func (r *broker) NewSubscriber(name string) (worker.ISubscriber, error) {
 	}, nil
 }
 
-// newCopier returns the publisher of the copies that the deliveries of the configured queue named
+// newCopies returns the copier of the copies that the deliveries of the configured queue named
 // queue need, for its retry queues and its dead-letter exchange, with the retrier and the dead
 // letter that publish through it. The retrier is nil without Retry, the dead letter without
 // DeadLetter, and all three without either.
-func (r *broker) newCopier(queue string) (*publisher, *retrier, *deadLetter, error) {
+func (r *broker) newCopies(queue string) (*copier, *retrier, *deadLetter, error) {
 	q, ok := queueConfig(r.conf, queue)
 	if !ok || !q.Retry.enabled() && !q.DeadLetter.Enabled {
 		return nil, nil, nil, nil
@@ -159,19 +160,20 @@ func (r *broker) newCopier(queue string) (*publisher, *retrier, *deadLetter, err
 	// is down, within the acknowledgement's context: a copy that failed at once would requeue the
 	// delivery at once, and its handler would run again and again until the connection is back.
 	// Without recovery, nothing brings the connection back.
-	pub, err := r.newPublisher(PublisherConfig{Name: "copies", Mandatory: true, DeliveryMode: amqp.Persistent}, !r.conf.Recovery.Disabled)
+	pub, err := r.newPublisher(PublisherConfig{Name: "copies", Mandatory: true, DeliveryMode: amqp.Persistent}, !r.conf.Recovery.Disabled, maxCopiesInFlight)
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	c := newCopier(pub)
 	var retry *retrier
 	if queues := q.Retry.queues(q.Name); len(queues) > 0 {
-		retry = &retrier{pub: pub, queues: queues}
+		retry = &retrier{pub: c, queues: queues}
 	}
 	var dl *deadLetter
 	if q.DeadLetter.Enabled {
-		dl = &deadLetter{pub: pub, exchange: q.DeadLetter.Exchange, key: q.DeadLetter.RoutingKey, retry: retry}
+		dl = &deadLetter{pub: c, exchange: q.DeadLetter.Exchange, key: q.DeadLetter.RoutingKey, retry: retry}
 	}
-	return pub, retry, dl, nil
+	return c, retry, dl, nil
 }
 
 // queueConfig returns the configured queue named queue.
