@@ -210,7 +210,7 @@ Every module is released at each release, under the same version, so that applic
    done
    ```
 
-   CI runs on each tag, then creates its GitHub release with generated notes and asks the module proxy for the version, such as `github.com/efegreat/forgo-adapter/redis@v1.2.3`, so that pkg.go.dev lists it. Never create a release on GitHub yourself, as its form also creates the tag: the release job then fails, since the release exists. A tag whose push started no workflow is released by running CI on it: `gh workflow run ci.yml --ref redis/v1.2.3`.
+   CI runs on each tag, then creates its GitHub release with generated notes and asks the module proxy for the version, such as `github.com/efegreat/forgo-adapter/redis@v1.2.3`, so that pkg.go.dev lists it. A release that exists already, such as one published on GitHub, is kept with its notes. A tag whose push started no workflow is released by running CI on it: `gh workflow run ci.yml --ref redis/v1.2.3`. Do not ask the proxy for a version before its tag exists: it remembers the miss for up to half an hour, and the release job's request then fails.
 
 ### Checklists
 
