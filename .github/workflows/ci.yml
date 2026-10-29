@@ -187,10 +187,16 @@ jobs:
             exit 1
           fi
 
+      # A release published on GitHub, or by an earlier run of this job, is kept with its notes, so that
+      # the job can run again on the tag.
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "The release of $TAG exists, keeping it."
+            exit 0
+          fi
           prerelease=
           case "$TAG" in *-*) prerelease=--prerelease ;; esac
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $prerelease
