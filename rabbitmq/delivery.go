@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/efegreat/forgo/safemap"
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -36,7 +36,7 @@ type delivery struct {
 // headers, for example by another producer, take their ID from the message_id property and their
 // name from the type property.
 func newDelivery(raw amqp.Delivery, guard *ackGuard, gen uint64, retry *retrier, deadLetter *deadLetter) *delivery {
-	headers := types.NewJSONMap[string]()
+	headers := safemap.NewJSONMap[string]()
 	for k, v := range raw.Headers {
 		headers.Set(k, headerValue(v))
 	}

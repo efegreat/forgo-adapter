@@ -7,8 +7,8 @@ import (
 	"maps"
 	"strconv"
 
+	"github.com/efegreat/forgo/safemap"
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
 
 	gpubsub "cloud.google.com/go/pubsub/v2"
 )
@@ -26,7 +26,7 @@ type delivery struct {
 // their ID from the message ID Pub/Sub assigned and their creation time from the time Pub/Sub
 // received them.
 func newDelivery(m *gpubsub.Message, deadLetter *deadLetter) *delivery {
-	headers := types.NewJSONMapWithData(m.Attributes)
+	headers := safemap.NewJSONMapWithData(m.Attributes)
 	if _, ok := headers.Get(worker.MessageIDHeader); !ok && m.ID != "" {
 		headers.Set(worker.MessageIDHeader, m.ID)
 	}

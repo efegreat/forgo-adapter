@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/efegreat/forgo/safemap"
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -110,7 +110,7 @@ func message(stream string, e redis.XMessage) worker.Message {
 			headers[worker.MessageTimestampHeader] = strconv.FormatInt(ms*1e6, 10)
 		}
 	}
-	return worker.NewMessageFromDelivery(key, stream, payload, types.NewJSONMapWithData(headers))
+	return worker.NewMessageFromDelivery(key, stream, payload, safemap.NewJSONMapWithData(headers))
 }
 
 // entryMillis returns the Unix time in milliseconds that starts the entry ID id.
