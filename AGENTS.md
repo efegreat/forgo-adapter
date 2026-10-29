@@ -201,16 +201,16 @@ Every module is released at each release, under the same version, so that applic
 
 1. In every module, require the same released forgo (`go get github.com/efegreat/forgo@v1.2.3`), never a commit of its `main`, so that applications of the release get a forgo that pkg.go.dev documents. The release job of CI refuses the tag of a module that replaces forgo.
 2. Check that CI passes on `main`.
-3. Tag the commit once per module, the nested modules with their directory as a prefix, and push the tags:
+3. Tag the commit once per module, the nested modules with their directory as a prefix, and push each tag on its own: GitHub starts no workflow for a push of more than three tags, so pushing them together releases nothing. The loop lists the tags itself, since zsh does not split a variable into words:
 
    ```sh
    v=v1.2.3
-   tags="$v otel/$v pubsub/$v rabbitmq/$v redis/$v"
-   for t in $tags; do git tag "$t"; done
-   git push origin $tags
+   for t in $v otel/$v pubsub/$v rabbitmq/$v redis/$v; do
+     git tag "$t" && git push origin "$t"
+   done
    ```
 
-   CI runs on each tag, then creates its GitHub release with generated notes and asks the module proxy for the version, such as `github.com/efegreat/forgo-adapter/redis@v1.2.3`, so that pkg.go.dev lists it.
+   CI runs on each tag, then creates its GitHub release with generated notes and asks the module proxy for the version, such as `github.com/efegreat/forgo-adapter/redis@v1.2.3`, so that pkg.go.dev lists it. Never create a release on GitHub yourself, as its form also creates the tag: the release job then fails, since the release exists. A tag whose push started no workflow is released by running CI on it: `gh workflow run ci.yml --ref redis/v1.2.3`.
 
 ### Checklists
 
