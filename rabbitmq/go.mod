@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/efegreat/forgo v1.0.0
-	github.com/rabbitmq/amqp091-go v1.15.0
+	github.com/rabbitmq/amqp091-go v1.16.0
 )
 
 require (
