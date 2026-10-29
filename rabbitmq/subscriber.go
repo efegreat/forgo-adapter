@@ -51,8 +51,8 @@ func (s *subscriber) Consume(ctx context.Context, handle func(context.Context, w
 	}
 	defer s.stop()
 
-	runner := process.NewConcurrentRunner(process.NewChannelSemaphore(s.concurrency))
-	defer runner.Wait()
+	handlers := process.NewGroup(process.NewChannelSemaphore(s.concurrency))
+	defer handlers.Wait()
 
 	for {
 		select {
@@ -76,8 +76,8 @@ func (s *subscriber) Consume(ctx context.Context, handle func(context.Context, w
 				continue
 			}
 			d := newDelivery(msg, s.guard, st.gen, s.retry, s.deadLetter)
-			// Run waits while every slot is taken, and fails only once ctx ended.
-			if runner.Run(ctx, func() { handle(ctx, d) }) != nil {
+			// Go waits while every slot is taken, and fails only once ctx ended.
+			if handlers.Go(ctx, func() { handle(ctx, d) }) != nil {
 				// The message was not handled or acknowledged: the broker redelivers it once the
 				// channel closes.
 				return nil
