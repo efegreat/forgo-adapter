@@ -4,7 +4,7 @@ Everyone who takes part in forgo-adapter's issues, pull requests and discussions
 
 - **Bugs:** open an issue with the smallest program or test that shows the problem, and the version of the database, broker or Redis it runs against. For a security issue, follow [SECURITY.md](SECURITY.md) instead.
 - **New adapters and changes of behavior:** open an issue to discuss them before you send a pull request. A new adapter wraps one client library and implements a forgo contract. It goes in the module of that library, or in a new module of its own.
-- **Contracts** such as `worker.IBroker` or `operation.ILocker` belong to [forgo](https://github.com/efegreat/forgo). A change to one needs pull requests in both repositories.
+- **Contracts** such as `worker.IBroker` or `operation.ILocker` belong to [forgo](https://github.com/efegreat/forgo). A change to one needs pull requests in both repositories. Build them together with an uncommitted `go.work` (`go work init . ./redis ./rabbitmq ./pubsub ./otel ../forgo` at the root, with forgo cloned next to this repository), and once the forgo pull request is merged, require its commit in this one (`go get github.com/efegreat/forgo@<commit>`).
 
 ## Making a change
 

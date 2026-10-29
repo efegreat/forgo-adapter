@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
-	github.com/efegreat/forgo v0.0.0
+	github.com/efegreat/forgo v1.0.0
 	github.com/redis/go-redis/v9 v9.23.0
 )
 
@@ -29,5 +29,3 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
-
-replace github.com/efegreat/forgo => ../../forgo

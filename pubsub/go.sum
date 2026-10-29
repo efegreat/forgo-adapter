@@ -23,6 +23,8 @@ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSs
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/efegreat/bingo v1.0.0 h1:No/aMT1sv6fkLS/VMBhhuAhZjpRLnaOz9YCj7FqfU2E=
 github.com/efegreat/bingo v1.0.0/go.mod h1:R8IkiO9UDv9evH38fp8Lq6ntvSF4IhlWknoPOCerR/E=
+github.com/efegreat/forgo v1.0.0 h1:2Pl+SxBsM1osHTDUa/DolAabdztZaFCo4bS5BFEHWbI=
+github.com/efegreat/forgo v1.0.0/go.mod h1:+CzVY0RbRu8DPBEg4UqJ3lHo8LokoXxE0b3VaqU5Uts=
 github.com/envoyproxy/go-control-plane v0.9.0/go.mod h1:YTl/9mNaCwkRvm6d1a2C3ymFceY/DCBVvsKhRF0iEA4=
 github.com/envoyproxy/go-control-plane v0.9.1-0.20191026205805-5f8ba28d4473/go.mod h1:YTl/9mNaCwkRvm6d1a2C3ymFceY/DCBVvsKhRF0iEA4=
 github.com/envoyproxy/go-control-plane v0.9.4/go.mod h1:6rpuAdCZL397s3pYoYcLgu1mIlRU8Am5FuJP05cCM98=

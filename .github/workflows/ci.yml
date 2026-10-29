@@ -103,35 +103,16 @@ jobs:
       ADAPTER_TEST_REDIS_ADDRS: 127.0.0.1:6379,127.0.0.1:6380
     defaults:
       run:
-        working-directory: forgo-adapter/${{ matrix.module }}
+        working-directory: ${{ matrix.module }}
     steps:
       - uses: actions/checkout@v7
         with:
-          path: forgo-adapter
-          persist-credentials: false
-
-      # Until forgo is released, every go.mod replaces it with a checkout next to forgo-adapter.
-      - name: Check for a local forgo
-        id: forgo
-        run: |
-          if grep -qE '=> (\.\./)+forgo$' go.mod; then
-            echo "local=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check out forgo
-        if: steps.forgo.outputs.local == 'true'
-        uses: actions/checkout@v7
-        with:
-          repository: efegreat/forgo
-          path: forgo
-          # Reading a private forgo needs a FORGO_TOKEN secret with read access to it.
-          token: ${{ secrets.FORGO_TOKEN || github.token }}
           persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: forgo-adapter/${{ matrix.module }}/go.mod
-          cache-dependency-path: forgo-adapter/${{ matrix.module }}/go.sum
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
           check-latest: true
 
       - name: Verify formatting

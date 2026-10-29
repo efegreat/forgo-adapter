@@ -4,7 +4,7 @@ Guide for coding agents and contributors working **on forgo-adapter itself**. Fo
 
 ## What forgo-adapter is
 
-The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ, Google Cloud Pub/Sub, Redis Streams) and providers (a SQL transactor, inbox/outbox storages, live config stores and a live config cache, a Redis locker, a Redis rate limiter) that implement forgo's interfaces, and the OpenTelemetry metrics of forgo applications. Each client library is a module of its own (see [Modules](#modules)): the root module, `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)), holds the SQL adapters, and `github.com/efegreat/forgo-adapter/redis`, `…/rabbitmq`, `…/pubsub` and `…/otel` the others. Go 1.27. Both repositories are private and untagged before the first release, so every `go.mod` requires `github.com/efegreat/forgo v0.0.0` and replaces it with a sibling forgo checkout (`../forgo` at the root, `../../forgo` in the nested modules): a forgo checkout next to this one is required to build. At release, require a tagged forgo version and remove the `replace` directives.
+The concrete infrastructure for [forgo](https://github.com/efegreat/forgo): resources (SQL, Redis, RabbitMQ, Google Cloud Pub/Sub, Redis Streams) and providers (a SQL transactor, inbox/outbox storages, live config stores and a live config cache, a Redis locker, a Redis rate limiter) that implement forgo's interfaces, and the OpenTelemetry metrics of forgo applications. Each client library is a module of its own (see [Modules](#modules)): the root module, `github.com/efegreat/forgo-adapter` ([repository](https://github.com/efegreat/forgo-adapter)), holds the SQL adapters, and `github.com/efegreat/forgo-adapter/redis`, `…/rabbitmq`, `…/pubsub` and `…/otel` the others. Go 1.27. Every `go.mod` requires a released forgo, and never replaces it: modules that depend on this one ignore its `replace` directives, so a module that replaces forgo does not build for them, and the release job of CI refuses its tag. To work on a change of both repositories, use an uncommitted `go.work` (`go work init . ./redis ./rabbitmq ./pubsub ./otel ../forgo` at the root, which `.gitignore` keeps out), and once the forgo change is on its `main`, require that commit (`go get github.com/efegreat/forgo@<commit>`) until forgo releases it.
 
 The dependency points one way. **Adapters import forgo; forgo never imports adapters.** Anything a server needs from an adapter is an interface declared in forgo. When a forgo contract changes (`worker.IBroker`, `worker.InboxStorage`, `operation.ILocker`, `ratelimit.ILimiter`, `forgo.LiveConfigStore`, `forgo.LiveConfigCache`, `operation.IObserver` and its extension interfaces, …), update the adapters here in the same change set.
 
@@ -184,7 +184,7 @@ gofmt -l .        # must print nothing
 go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 ```
 
-CI (`.github/workflows/ci.yml`) runs these on every push and pull request, in a job per module with the service containers of its integration tests (PostgreSQL and MySQL for the root module, Redis 8 and 6.2 for `redis`, RabbitMQ for `rabbitmq`), plus `go mod tidy -diff`, govulncheck and `go test` without the race detector. A service whose image is empty in the job's matrix row is not started. While the `go.mod` files replace forgo with a checkout, CI checks out forgo's `main` next to this repository, so a change that needs an unmerged forgo change passes once that change is merged.
+CI (`.github/workflows/ci.yml`) runs these on every push and pull request, in a job per module with the service containers of its integration tests (PostgreSQL and MySQL for the root module, Redis 8 and 6.2 for `redis`, RabbitMQ for `rabbitmq`), plus `go mod tidy -diff`, govulncheck and `go test` without the race detector. A service whose image is empty in the job's matrix row is not started. Each module builds against the forgo version its `go.mod` requires, so a change that needs an unreleased forgo change passes once its `go.mod` requires the forgo commit that holds it.
 
 When you change behavior:
 
@@ -199,7 +199,7 @@ Versions follow semantic versioning. `go get` picks the latest tag, and pkg.go.d
 
 Every module is released at each release, under the same version, so that applications have one rule to follow: the same version of every module. A forgo contract change usually touches several modules anyway.
 
-1. In every module, require the same released forgo (`go get github.com/efegreat/forgo@v1.2.3`) and remove the `replace` directive: modules that depend on this one ignore it, so a release that replaces forgo does not build for them. The release job of CI refuses such a tag.
+1. In every module, require the same released forgo (`go get github.com/efegreat/forgo@v1.2.3`), never a commit of its `main`, so that applications of the release get a forgo that pkg.go.dev documents. The release job of CI refuses the tag of a module that replaces forgo.
 2. Check that CI passes on `main`.
 3. Tag the commit once per module, the nested modules with their directory as a prefix, and push the tags:
 
@@ -227,7 +227,7 @@ Every module is released at each release, under the same version, so that applic
 - [ ] REFERENCE.md section, plus rows in the overview table and README.
 
 **New module**
-- [ ] Only for a client library that no module wraps yet. A top-level directory named after it, with a `go.mod` (`module github.com/efegreat/forgo-adapter/<dir>`, forgo's `replace` to `../../forgo` until it is released) that requires forgo and the library, and no other module of this repository.
+- [ ] Only for a client library that no module wraps yet. A top-level directory named after it, with a `go.mod` (`module github.com/efegreat/forgo-adapter/<dir>`) that requires the forgo version the other modules require and the library, and no other module of this repository.
 - [ ] A row in the CI matrix with the services of its integration tests, its directory in Dependabot's `directories`, its tag in the release loop of [Releasing](#releasing), and in the module lists of AGENTS.md, CONTRIBUTING.md, README.md and REFERENCE.md's Installation.
 
 **New broker**

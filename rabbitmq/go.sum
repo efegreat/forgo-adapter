@@ -1,5 +1,7 @@
 github.com/efegreat/bingo v1.0.0 h1:No/aMT1sv6fkLS/VMBhhuAhZjpRLnaOz9YCj7FqfU2E=
 github.com/efegreat/bingo v1.0.0/go.mod h1:R8IkiO9UDv9evH38fp8Lq6ntvSF4IhlWknoPOCerR/E=
+github.com/efegreat/forgo v1.0.0 h1:2Pl+SxBsM1osHTDUa/DolAabdztZaFCo4bS5BFEHWbI=
+github.com/efegreat/forgo v1.0.0/go.mod h1:+CzVY0RbRu8DPBEg4UqJ3lHo8LokoXxE0b3VaqU5Uts=
 github.com/gabriel-vasile/mimetype v1.4.15 h1:05iP/CYtZ/w455R/KZM6rZ5ieAdh99UPtd+d3YzLmaI=
 github.com/gabriel-vasile/mimetype v1.4.15/go.mod h1:azpTcoLcDZRNgFou5j+APrqQx9HqVPWa6ijYQIIVswQ=
 github.com/go-playground/assert/v2 v2.2.0 h1:JvknZsQTYeFEAhQwI4qEt9cyV5ONwRHC+lYKSsYSR8s=
