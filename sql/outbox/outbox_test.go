@@ -11,8 +11,8 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
+	"github.com/efegreat/forgo/safemap"
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
 
 	"github.com/efegreat/forgo-adapter/sql/sqltx"
 )
@@ -413,7 +413,7 @@ func TestSave(t *testing.T) {
 		Key:         "order.placed",
 		Destination: "orders",
 		Payload:     []byte(`{"id":1}`),
-		Headers:     types.NewJSONMapWithData(map[string]string{"tenant": "acme"}),
+		Headers:     safemap.NewJSONMapWithData(map[string]string{"tenant": "acme"}),
 		CreatedAt:   created.Add(1500 * time.Nanosecond),
 	}
 	bare := worker.Message{ID: "m2", Name: "order.placed", Payload: []byte(`{}`)}

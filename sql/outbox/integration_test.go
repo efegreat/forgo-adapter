@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/efegreat/forgo/safemap"
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
 
 	"github.com/efegreat/forgo-adapter/sql/internal/sqltest"
 	"github.com/efegreat/forgo-adapter/sql/sqltx"
@@ -75,7 +75,7 @@ func TestIntegrationRelay(t *testing.T) {
 					Key:         fmt.Sprintf("order-%d", i),
 					Destination: "orders",
 					Payload:     []byte(fmt.Sprintf(`{"id": %d}`, i)),
-					Headers:     types.NewJSONMapWithData(map[string]string{"tenant": "acme"}),
+					Headers:     safemap.NewJSONMapWithData(map[string]string{"tenant": "acme"}),
 					CreatedAt:   created,
 				}
 				write(t, d, db, msg)
@@ -210,7 +210,7 @@ func TestIntegrationClaimWithoutExpiry(t *testing.T) {
 			d.Reset(t, db, "outbox_events")
 			s := storage(d, db)
 			for _, id := range []string{"m1", "m2", "m3"} {
-				write(t, d, db, worker.Message{ID: id, Name: "n", Payload: []byte(`{}`), Headers: types.NewJSONMap[string](), CreatedAt: time.Now()})
+				write(t, d, db, worker.Message{ID: id, Name: "n", Payload: []byte(`{}`), Headers: safemap.NewJSONMap[string](), CreatedAt: time.Now()})
 			}
 
 			if got := claimIDs(t, s, "c1", time.Time{}, 2); !reflect.DeepEqual(got, []string{"m1", "m2"}) {
@@ -247,7 +247,7 @@ func TestIntegrationCompleteReleasesFailures(t *testing.T) {
 			d.Reset(t, db, "outbox_events")
 			s := storage(d, db)
 			for _, id := range []string{"m1", "m2"} {
-				write(t, d, db, worker.Message{ID: id, Name: "n", Payload: []byte(`{}`), Headers: types.NewJSONMap[string](), CreatedAt: time.Now()})
+				write(t, d, db, worker.Message{ID: id, Name: "n", Payload: []byte(`{}`), Headers: safemap.NewJSONMap[string](), CreatedAt: time.Now()})
 			}
 			fresh := time.Now().Add(-time.Minute)
 
@@ -276,7 +276,7 @@ func TestIntegrationCompleteDoesNotBlockInserts(t *testing.T) {
 	ctx := context.Background()
 	for i := 1; i <= 20; i++ {
 		write(t, sqltest.MySQL, db, worker.Message{ID: fmt.Sprintf("m%02d", i), Name: "n", Payload: []byte(`{}`),
-			Headers: types.NewJSONMap[string](), CreatedAt: time.Now()})
+			Headers: safemap.NewJSONMap[string](), CreatedAt: time.Now()})
 	}
 	if got := claimIDs(t, s, "c1", time.Now().Add(-time.Minute), 3); !reflect.DeepEqual(got, []string{"m01", "m02", "m03"}) {
 		t.Fatalf("Claim = %v", got)
@@ -373,7 +373,7 @@ func TestIntegrationBacklog(t *testing.T) {
 			for i := 1; i <= 3; i++ {
 				write(t, d, db, worker.Message{
 					ID: fmt.Sprintf("m%d", i), Name: "order.placed", Payload: []byte(`{}`),
-					Headers: types.NewJSONMap[string](), CreatedAt: base.Add(time.Duration(i) * time.Minute),
+					Headers: safemap.NewJSONMap[string](), CreatedAt: base.Add(time.Duration(i) * time.Minute),
 				})
 			}
 			b, err := s.Backlog(ctx, 10)

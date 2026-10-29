@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/efegreat/forgo/operation"
+	"github.com/efegreat/forgo/safemap"
 	fhttp "github.com/efegreat/forgo/server/http"
 	"github.com/efegreat/forgo/server/worker"
 	"github.com/efegreat/forgo/transport"
-	"github.com/efegreat/forgo/types"
 
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -102,7 +102,7 @@ func mustFind(t testing.TB, m metricdata.Metrics, attrs ...attribute.KeyValue) i
 }
 
 func newOp(typ, name string, state any) *operation.Context {
-	return &operation.Context{Context: context.Background(), Type: typ, Name: name, Args: new(types.Map[any, any]), State: state}
+	return &operation.Context{Context: context.Background(), Type: typ, Name: name, Args: new(safemap.Map[any, any]), State: state}
 }
 
 // TestOperationDuration checks that the same error gets the same labels on every transport.

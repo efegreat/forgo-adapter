@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/efegreat/forgo/safemap"
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -332,7 +332,7 @@ func TestPublishingRoundTrip(t *testing.T) {
 		ID:        "0199-id",
 		Name:      "order.placed",
 		Payload:   []byte(`{"id":1}`),
-		Headers:   types.NewJSONMapWithData(map[string]string{"tenant": "acme", worker.MessageIDHeader: "stale"}),
+		Headers:   safemap.NewJSONMapWithData(map[string]string{"tenant": "acme", worker.MessageIDHeader: "stale"}),
 		CreatedAt: created,
 		Key:       "order.placed",
 	}

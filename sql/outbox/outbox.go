@@ -13,8 +13,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/efegreat/forgo/safemap"
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
 
 	"github.com/efegreat/forgo-adapter/sql/internal/sqllog"
 	"github.com/efegreat/forgo-adapter/sql/sqltx"
@@ -111,7 +111,7 @@ func scanMessages(rows *sql.Rows, limit int) ([]worker.Message, error) {
 	messages := make([]worker.Message, 0, limit)
 	for rows.Next() {
 		message := worker.Message{
-			Headers: types.NewJSONMap[string](),
+			Headers: safemap.NewJSONMap[string](),
 		}
 		if err := rows.Scan(
 			&message.ID,

@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/efegreat/forgo-adapter/redis/redisdb"
+	"github.com/efegreat/forgo/safemap"
 	"github.com/efegreat/forgo/server/worker"
-	"github.com/efegreat/forgo/types"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -451,7 +451,7 @@ func TestFields(t *testing.T) {
 	}{
 		{
 			name: "complete",
-			msg:  worker.Message{ID: "id-1", Name: "order.placed", Payload: []byte("{}"), Headers: types.NewJSONMapWithData(headers), CreatedAt: created, Key: "order-1"},
+			msg:  worker.Message{ID: "id-1", Name: "order.placed", Payload: []byte("{}"), Headers: safemap.NewJSONMapWithData(headers), CreatedAt: created, Key: "order-1"},
 			want: map[string]any{
 				worker.MessageIDHeader:        "id-1",
 				worker.MessageNameHeader:      "order.placed",
@@ -464,7 +464,7 @@ func TestFields(t *testing.T) {
 		{
 			// Without CreatedAt, a timestamp header is kept. Without Key, there is no key field.
 			name: "without CreatedAt and Key",
-			msg:  worker.Message{ID: "id-1", Name: "order.placed", Headers: types.NewJSONMapWithData(headers)},
+			msg:  worker.Message{ID: "id-1", Name: "order.placed", Headers: safemap.NewJSONMapWithData(headers)},
 			want: map[string]any{
 				worker.MessageIDHeader:        "id-1",
 				worker.MessageNameHeader:      "order.placed",
