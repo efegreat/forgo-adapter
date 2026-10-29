@@ -3,7 +3,7 @@ module github.com/efegreat/forgo-adapter/rabbitmq
 go 1.27
 
 require (
-	github.com/efegreat/forgo v0.0.0
+	github.com/efegreat/forgo v1.0.0
 	github.com/rabbitmq/amqp091-go v1.15.0
 )
 
@@ -24,5 +24,3 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
-
-replace github.com/efegreat/forgo => ../../forgo

@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	cloud.google.com/go/pubsub/v2 v2.7.0
-	github.com/efegreat/forgo v0.0.0
+	github.com/efegreat/forgo v1.0.0
 	google.golang.org/api v0.304.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
@@ -55,5 +55,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261005182115-fad411399dd8 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
-
-replace github.com/efegreat/forgo => ../../forgo

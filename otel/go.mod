@@ -3,7 +3,7 @@ module github.com/efegreat/forgo-adapter/otel
 go 1.27
 
 require (
-	github.com/efegreat/forgo v0.0.0
+	github.com/efegreat/forgo v1.0.0
 	github.com/prometheus/client_golang v1.25.0
 	go.opentelemetry.io/contrib/instrumentation/runtime v0.72.0
 	go.opentelemetry.io/otel v1.47.0
@@ -53,5 +53,3 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
-
-replace github.com/efegreat/forgo => ../../forgo
